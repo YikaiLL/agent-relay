@@ -46,6 +46,30 @@ fn merge_task_seat_agents(input: &TaskSeatAgentsView) -> TaskSeatAgentsView {
     merged
 }
 
+/// Resolve the tool's RELATIVE minutes to an absolute unix second.
+///
+/// Relative because the orchestrator's prompt never states the current time, so
+/// an absolute timestamp from the model would be a guess. Pure in `now`: there
+/// is no injectable clock, so the decision has to be callable with one.
+fn resolve_scheduled_start_at(
+    now: u64,
+    start_in_minutes: Option<i64>,
+) -> Result<Option<u64>, String> {
+    let Some(minutes) = start_in_minutes else {
+        return Ok(None);
+    };
+    if minutes <= 0 {
+        return Err("start_in_minutes must be a whole number of minutes in the future".to_string());
+    }
+    // Checked, not saturating: clamping to u64::MAX would stage a card that
+    // reads as scheduled and can never come due.
+    (minutes as u64)
+        .checked_mul(60)
+        .and_then(|seconds| now.checked_add(seconds))
+        .map(Some)
+        .ok_or_else(|| "start_in_minutes is too far in the future".to_string())
+}
+
 impl AppState {
     /// Hold a task spec for confirmation. Does not start a run.
     pub async fn propose_orchestrator_task(
@@ -55,7 +79,8 @@ impl AppState {
         if !self.beta_features_enabled().await {
             return Err(super::team::TASKS_LOCKED_MESSAGE.to_string());
         }
-        let _device_id = require_device_id(input.device_id)?;
+        let device_id = require_device_id(input.device_id)?;
+        let scheduled_start_at = resolve_scheduled_start_at(unix_now(), input.start_in_minutes)?;
         let title = truncate_chars(
             non_empty(Some(input.title)).ok_or_else(|| "title is required".to_string())?,
             MAX_PROPOSAL_TITLE_CHARS,
@@ -99,6 +124,10 @@ impl AppState {
             spec_updates: Default::default(),
             agents: merge_task_seat_agents(&input.agents),
             created_at: unix_now(),
+            auto_start: input.auto_start.unwrap_or(false),
+            scheduled_start_at,
+            proposed_by_device_id: device_id,
+            schedule_error: None,
         };
 
         {
@@ -133,6 +162,8 @@ impl AppState {
         }
         let _device_id = require_device_id(input.device_id)?;
 
+        let scheduled_start_at = resolve_scheduled_start_at(unix_now(), input.start_in_minutes)?;
+
         // Resolve team before the write lock (catalog has its own lock).
         let requested_team: Option<String> =
             input.team_id.clone().and_then(|id| non_empty(Some(id)));
@@ -160,6 +191,12 @@ impl AppState {
         if let Some(why) = input.why {
             proposal.why =
                 non_empty(Some(why)).map(|value| truncate_chars(value, MAX_PROPOSAL_FIELD_CHARS));
+        }
+        if let Some(auto_start) = input.auto_start {
+            proposal.auto_start = auto_start;
+        }
+        if scheduled_start_at.is_some() {
+            proposal.scheduled_start_at = scheduled_start_at;
         }
         // Field-by-field: revising one seat's effort must leave the model that
         // seat was already staged with alone.
@@ -194,7 +231,7 @@ impl AppState {
         if !self.beta_features_enabled().await {
             return Err(super::team::TASKS_LOCKED_MESSAGE.to_string());
         }
-        let _device_id = require_device_id(device_id.clone())?;
+        let device_id = require_device_id(device_id.clone())?;
         let instruction = non_empty(Some(instruction.to_string()))
             .ok_or_else(|| "say what the team should do now".to_string())?;
 
@@ -228,6 +265,11 @@ impl AppState {
             spec_updates: updates.clone(),
             agents: merge_task_seat_agents(&Default::default()),
             created_at: unix_now(),
+            // A reopen card carries no schedule; only `propose_task` stages one.
+            auto_start: false,
+            scheduled_start_at: None,
+            proposed_by_device_id: device_id,
+            schedule_error: None,
         };
 
         {
@@ -411,6 +453,7 @@ mod tests {
                 why: Some("Touches the CLI surface.".to_string()),
                 agents: Default::default(),
                 device_id: Some("device-1".to_string()),
+                ..Default::default()
             })
             .await
             .expect("propose");
@@ -466,6 +509,7 @@ mod tests {
                 why: None,
                 agents: Default::default(),
                 device_id: Some("device-1".to_string()),
+                ..Default::default()
             })
             .await
             .expect("propose");
@@ -595,6 +639,210 @@ mod tests {
         assert_eq!(revised.title, "Add a parser");
     }
 
+    /// Pure in `now` on purpose: there is no injectable clock, so this is the
+    /// only way the resolution itself can be tested rather than inferred.
+    #[test]
+    fn a_resolved_start_time_is_always_in_the_future() {
+        assert_eq!(resolve_scheduled_start_at(1_000, None), Ok(None));
+        assert_eq!(
+            resolve_scheduled_start_at(1_000, Some(30)),
+            Ok(Some(1_000 + 30 * 60))
+        );
+        // "Now" and "five minutes ago" are not start times a card can wait for.
+        assert!(resolve_scheduled_start_at(1_000, Some(0)).is_err());
+        assert!(resolve_scheduled_start_at(1_000, Some(-5)).is_err());
+        // An offset too large to represent must be REFUSED, not saturated: a
+        // card pinned at u64::MAX reads as scheduled but can never come due.
+        for absurd in [i64::MAX, (u64::MAX / 60) as i64 + 1] {
+            assert!(
+                resolve_scheduled_start_at(1_000, Some(absurd)).is_err(),
+                "{absurd} minutes must be refused, not clamped to a date nobody reaches"
+            );
+        }
+        // The overflow can come from `now` rather than the offset.
+        assert!(resolve_scheduled_start_at(u64::MAX - 10, Some(1)).is_err());
+        // Large but representable still resolves: the guard is about arithmetic
+        // that cannot land, not a policy on how far ahead a user may schedule.
+        assert_eq!(
+            resolve_scheduled_start_at(1_000, Some(60 * 24 * 365)),
+            Ok(Some(1_000 + 60 * 24 * 365 * 60))
+        );
+    }
+
+    /// Acceptance criterion 3: scheduling is OFF unless asked for. A card that
+    /// says nothing about a schedule must be indistinguishable from every card
+    /// staged before the feature existed.
+    #[tokio::test]
+    async fn a_proposal_with_no_schedule_arguments_is_not_scheduled() {
+        let project = TempDir::new().expect("project");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = beta_app(&cwd).await;
+
+        let staged = app
+            .propose_orchestrator_task(ProposeOrchestratorTaskInput {
+                title: "Add a parser".to_string(),
+                device_id: Some("device-1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("propose")
+            .proposal;
+
+        assert!(!staged.auto_start, "auto-start defaults off");
+        assert_eq!(staged.scheduled_start_at, None, "and carries no start time");
+        assert_eq!(staged.schedule_error, None);
+        assert_eq!(
+            staged.proposed_by_device_id, "device-1",
+            "a timer has no device of its own, so the card remembers the staging one"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_in_minutes_resolves_to_an_absolute_time_in_the_future() {
+        let project = TempDir::new().expect("project");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = beta_app(&cwd).await;
+
+        let before = unix_now();
+        let staged = app
+            .propose_orchestrator_task(ProposeOrchestratorTaskInput {
+                title: "Add a parser".to_string(),
+                device_id: Some("device-1".to_string()),
+                auto_start: Some(true),
+                start_in_minutes: Some(30),
+                ..Default::default()
+            })
+            .await
+            .expect("propose")
+            .proposal;
+
+        assert!(staged.auto_start);
+        let at = staged.scheduled_start_at.expect("a resolved start time");
+        // The model sends minutes because its prompt never states the clock; the
+        // server is what turns that into an absolute time.
+        assert!(
+            at >= before + 30 * 60 && at <= unix_now() + 30 * 60,
+            "30 minutes from now, got {at} against a now of {before}"
+        );
+        assert!(
+            app.teams().await.teams.is_empty(),
+            "staging a schedule must not start anything — only a confirm does"
+        );
+    }
+
+    #[tokio::test]
+    async fn revise_turns_auto_start_on_and_off_without_disturbing_the_title() {
+        let project = TempDir::new().expect("project");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = beta_app(&cwd).await;
+
+        let staged = app
+            .propose_orchestrator_task(ProposeOrchestratorTaskInput {
+                title: "Add a parser".to_string(),
+                device_id: Some("device-1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("propose")
+            .proposal;
+
+        let on = app
+            .revise_orchestrator_proposal(
+                &staged.id,
+                ReviseOrchestratorProposalInput {
+                    auto_start: Some(true),
+                    start_in_minutes: Some(15),
+                    device_id: Some("device-1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("revise on")
+            .proposal;
+        assert!(on.auto_start);
+        assert!(on.scheduled_start_at.is_some());
+        assert_eq!(on.title, "Add a parser", "an absent field leaves it alone");
+
+        let off = app
+            .revise_orchestrator_proposal(
+                &staged.id,
+                ReviseOrchestratorProposalInput {
+                    auto_start: Some(false),
+                    device_id: Some("device-1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("revise off")
+            .proposal;
+        assert!(!off.auto_start, "turning it back off must stick");
+        assert_eq!(
+            off.scheduled_start_at, on.scheduled_start_at,
+            "an absent start_in_minutes leaves the staged time alone"
+        );
+        assert_eq!(off.title, "Add a parser");
+        assert!(app.teams().await.teams.is_empty(), "still nothing running");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_card_survives_a_restart() {
+        let project = TempDir::new().expect("project");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = beta_app(&cwd).await;
+
+        let staged = app
+            .propose_orchestrator_task(ProposeOrchestratorTaskInput {
+                title: "Add a parser".to_string(),
+                device_id: Some("device-1".to_string()),
+                auto_start: Some(true),
+                start_in_minutes: Some(45),
+                ..Default::default()
+            })
+            .await
+            .expect("propose")
+            .proposal;
+
+        // Stamp the one field no route writes yet, standing in for the watchdog.
+        // A `None` here would round-trip to `None` even if serde dropped the
+        // field outright, so the assertion below would pass on a lost value.
+        {
+            let mut relay = app.relay.write().await;
+            relay.orchestrator_proposals[0].schedule_error =
+                Some("the workspace was not trusted".to_string());
+        }
+
+        // Through the on-disk shape, not just a clone: these fields are
+        // `#[serde(default)]`, so a decode is the half that can silently drop them.
+        let persisted = {
+            let relay = app.relay.read().await;
+            crate::state::persistence::PersistedRelayState::from_relay(&relay)
+        };
+        let encoded = serde_json::to_string(&persisted).expect("encode");
+        let decoded: crate::state::persistence::PersistedRelayState =
+            serde_json::from_str(&encoded).expect("decode");
+
+        let (change_tx, _change_rx) = tokio::sync::watch::channel(0_u64);
+        let mut restored = crate::state::RelayState::new(
+            cwd.clone(),
+            change_tx,
+            crate::state::security::SecurityProfile::private(),
+        );
+        restored.apply_persisted(&decoded);
+
+        let card = restored
+            .orchestrator_proposals
+            .first()
+            .expect("the card survives the restart");
+        assert!(card.auto_start);
+        assert_eq!(card.scheduled_start_at, staged.scheduled_start_at);
+        assert_eq!(card.proposed_by_device_id, "device-1");
+        assert_eq!(
+            card.schedule_error.as_deref(),
+            Some("the workspace was not trusted"),
+            "a schedule error must outlive the restart that follows it"
+        );
+    }
+
     #[tokio::test]
     async fn propose_requires_a_title() {
         let project = TempDir::new().expect("project");
@@ -611,6 +859,7 @@ mod tests {
                 why: None,
                 agents: Default::default(),
                 device_id: Some("device-1".to_string()),
+                ..Default::default()
             })
             .await
             .expect_err("blank title");
