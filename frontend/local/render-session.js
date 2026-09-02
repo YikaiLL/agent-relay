@@ -2522,24 +2522,28 @@ export function createSessionRenderer({
   }
 
   async function loadOrchestratorTranscript(threadId, { terminal = false, repair = false } = {}) {
-    if (!threadId || typeof fetchTranscriptPage !== "function") {
-      state.orchestratorEntries = [];
-      state.orchestratorEntriesThreadId = threadId || null;
-      return;
-    }
-    if (state.session?.active_thread_id === threadId) {
-      state.orchestratorEntries = state.session.transcript || [];
-      state.orchestratorEntriesThreadId = threadId;
-      return;
-    }
-    // Past both early returns, so this load will reach the `finally` that
-    // releases what it takes here.
+    // Taken here and released in the `finally`, with every answer inside the
+    // `try` — including the two that need no fetch. A load that returned before
+    // the `finally` settled nothing, and since a tail gap is retried on the very
+    // next render with no throttle, an unsettled one is repaired forever.
     const generation = beginOrchestratorLoad(state, { repair });
-    const prior =
-      state.orchestratorEntriesThreadId === threadId
-        ? { threadId, entries: state.orchestratorEntries || [], olderCursor: state.orchestratorOlderCursor ?? null }
-        : null;
     try {
+      if (!threadId || typeof fetchTranscriptPage !== "function") {
+        state.orchestratorEntries = [];
+        state.orchestratorEntriesThreadId = threadId || null;
+        return;
+      }
+      if (state.session?.active_thread_id === threadId) {
+        // The Orchestrator is the live thread, so its own transcript is the
+        // authoritative answer and the gap is closed by reading it.
+        state.orchestratorEntries = state.session.transcript || [];
+        state.orchestratorEntriesThreadId = threadId;
+        return;
+      }
+      const prior =
+        state.orchestratorEntriesThreadId === threadId
+          ? { threadId, entries: state.orchestratorEntries || [], olderCursor: state.orchestratorOlderCursor ?? null }
+          : null;
       const page = await fetchTranscriptPage(threadId, {});
       if (generation !== state.orchestratorLoadGeneration) {
         return;

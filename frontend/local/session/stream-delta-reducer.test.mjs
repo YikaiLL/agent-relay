@@ -381,19 +381,51 @@ function maybeRefreshOrchestrator(state, session, loads) {
   }
 }
 
-// The other half of that call site: render-session.js:2526-2546. Only the early
-// returns and the flags are modelled -- a load that answers without fetching
-// never reaches the `finally`, so nothing it left set is ever cleared.
-function loadOrchestratorTranscript(state, threadId, { repair = false } = {}) {
-  if (!threadId) {
+// The other half of that call site: render-session.js:2524-2545. Both answers
+// that need no fetch are modelled, because both used to leave the loader without
+// reaching the settle. There the two share one `finally`; here the fetch is only
+// started rather than awaited, so the settle is written out on each.
+function loadOrchestratorTranscript(
+  state,
+  threadId,
+  { terminal = false, repair = false, canFetch = true } = {}
+) {
+  const generation = beginOrchestratorLoad(state, { repair });
+  if (!threadId || !canFetch) {
+    state.orchestratorEntries = [];
+    state.orchestratorEntriesThreadId = threadId || null;
+    applyOrchestratorLoadFinally(state, generation, threadId, state.session, { terminal });
     return null;
   }
   if (state.session?.active_thread_id === threadId) {
     state.orchestratorEntries = state.session.transcript || [];
     state.orchestratorEntriesThreadId = threadId;
+    applyOrchestratorLoadFinally(state, generation, threadId, state.session, { terminal });
     return null;
   }
-  return beginOrchestratorLoad(state, { repair });
+  return generation;
+}
+
+// render-session.js:2238-2250 again, this time including the tail of it: the
+// load's promise re-renders the pane when it settles, so a decision the load
+// does not answer is simply retaken on the next frame. Bounded, so a policy
+// that never converges fails with a count instead of hanging the run.
+function renderUntilQuiet(state, session, { canFetch = true, maxRenders = 6 } = {}) {
+  const loads = [];
+  for (let render = 0; render < maxRenders; render += 1) {
+    const before = loads.length;
+    maybeRefreshOrchestrator(state, session, loads);
+    if (loads.length === before) {
+      break;
+    }
+    const scheduled = loads[loads.length - 1];
+    loadOrchestratorTranscript(state, scheduled.threadId, {
+      terminal: scheduled.terminal,
+      repair: scheduled.repair,
+      canFetch,
+    });
+  }
+  return loads;
 }
 
 test("orchestrator idle refresh fires when thread_activity clears after a delta", () => {
@@ -507,17 +539,60 @@ test("a repair that answered without fetching must not disable repair forever", 
 
   // `state.session` says the Orchestrator is the active thread, so the loader
   // answers from the live transcript and never fetches.
-  h.state.session = { ...h.state.session, active_thread_id: ORCH_THREAD };
+  h.state.session = {
+    ...h.state.session,
+    active_thread_id: ORCH_THREAD,
+    transcript: h.state.orchestratorEntries,
+  };
   const generation = loadOrchestratorTranscript(h.state, ORCH_THREAD, { repair: true });
   assert.equal(generation, null, "no fetch began, so there is no settle coming");
 
-  // It stops being the active thread again; the hole is still there.
+  // It goes back to the background and the next delta is refused: a fresh hole,
+  // which must be repairable no matter how the previous one was answered.
   h.state.session = { ...h.state.session, active_thread_id: LIVE_THREAD };
+  h.deliver({ thread_id: ORCH_THREAD, delta: "tail", text_offset: 99 });
+  assert.equal(h.state.orchestratorTailGap, true);
+
   const later = [];
   maybeRefreshOrchestrator(h.state, orchSession(), later);
 
-  assert.equal(later.length, 1, "the gap must still be repairable");
+  assert.equal(later.length, 1, "the new gap must still be repairable");
   assert.equal(later[0].repair, true);
+});
+
+// Nothing throttles tail-gap repair -- `shouldRefreshViewedThread` returns true
+// on `needsRepair` before it looks at anything else, and the poll that used to
+// pace this was deliberately removed. So "settled" is the only thing that ends a
+// repair, and a load that answers without fetching has to settle too. Left
+// unsettled, the load's promise re-renders, the gap is still there, and the pane
+// schedules another repair on every frame for the life of the page.
+test("a repair with no fetcher settles instead of re-arming on every render", () => {
+  const h = orchHarness();
+  h.state.orchestratorTailGap = true;
+
+  const loads = renderUntilQuiet(h.state, orchSession(), { canFetch: false });
+
+  assert.equal(loads.length, 1, "one attempt, then quiet");
+  assert.equal(h.state.orchestratorTailGap, false, "a gap nothing can fetch must not stay armed");
+});
+
+test("a repair the live transcript answers settles instead of re-arming", () => {
+  const h = orchHarness();
+  h.state.orchestratorTailGap = true;
+  // The disagreement that makes this reachable: the decision reads the session
+  // renderTaskTeam was handed, which still has the Orchestrator in the
+  // background, while the loader reads `state.session`, where it is already the
+  // active thread.
+  h.state.session = {
+    ...h.state.session,
+    active_thread_id: ORCH_THREAD,
+    transcript: h.state.orchestratorEntries,
+  };
+
+  const loads = renderUntilQuiet(h.state, orchSession());
+
+  assert.equal(loads.length, 1, "one attempt, then quiet");
+  assert.equal(h.state.orchestratorTailGap, false, "the live transcript is the answer");
 });
 
 test("a superseded orchestrator load must not clear tail-gap repair flags", () => {
