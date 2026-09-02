@@ -347,10 +347,29 @@ export function teamAttention(run, seenAt = {}) {
       text: "The team asked you a question.",
     };
   }
+  if (run.status === "paused" && run.pause_kind === "provider") {
+    // Same `reason` as the branch below (so the banner keeps the neutral
+    // `.is-paused` styling instead of falling back to the urgent default) —
+    // only the text differs. Still not `needs_input`, since a limit resets on
+    // its own, but this one is NOT the user's doing, so it must not read like
+    // the assumption the branch below is written for. `pause_reason` supplies
+    // the specifics; this only supplies the framing prose is not trusted to
+    // carry (see the module docs: branch on `pause_kind`, never match prose).
+    return {
+      kind: "paused",
+      reason: "paused",
+      text: run.pause_reason
+        ? `The provider stopped the work. ${run.pause_reason}. You can resume once that clears.`
+        : "The provider stopped the work. You can resume once that clears.",
+    };
+  }
   if (run.status === "paused" && run.pause_reason) {
     // Not `needs_input`: you did this, and you already know. Surfacing your own
     // pause with the same weight as a question the team cannot proceed without
-    // would make the badge mean "tasks I have touched".
+    // would make the badge mean "tasks I have touched". Covers `pause_kind`
+    // `"user"` and `"boundary"` alike (both are the user's own request taking
+    // effect, just not synchronously) and an older record with no `pause_kind`
+    // at all.
     return { kind: "paused", reason: "paused", text: run.pause_reason };
   }
   return null;

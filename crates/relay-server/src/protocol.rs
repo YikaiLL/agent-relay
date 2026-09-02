@@ -3208,6 +3208,11 @@ pub struct TeamRunView {
     pub unresolved: Vec<String>,
     pub head_commit: Option<String>,
     pub pause_reason: Option<String>,
+    /// Machine-readable companion to `pause_reason`: `"user"` / `"provider"` /
+    /// `"boundary"` (see `relay_api::team::TeamPauseKind`), or `None` before this
+    /// run's first pause. A `String`, not the enum, so it stays plain-Hash-able
+    /// like every other view field `teams_revision` hashes.
+    pub pause_kind: Option<String>,
     pub error: Option<String>,
     pub requested_at: u64,
     pub updated_at: u64,

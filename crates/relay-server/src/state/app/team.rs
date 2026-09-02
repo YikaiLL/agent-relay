@@ -36,7 +36,9 @@ use crate::protocol::{
     StartTeamInput, StartTeamReceipt, TeamActionInput, TeamActionReceipt, TeamAwaitingView,
     TeamRunView, TeamSubTaskView, TeamsResponse,
 };
-use crate::state::{TaskSpec, TeamRun, TeamRunStatus, TeamThreadSlot};
+use crate::state::{
+    TaskSpec, TeamPauseKind, TeamRun, TeamRunStatus, TeamThreadSlot, TURN_FAILURE_KIND_USAGE_LIMIT,
+};
 use relay_api::team::{TeamRole, TeamTurnOutcome};
 use relay_api::TeamPortError;
 
@@ -933,8 +935,13 @@ over on resume"
             );
         }
 
-        self.settle_team_run(&run_id, kind.settled_status(), kind.reason())
-            .await;
+        self.settle_team_run(
+            &run_id,
+            kind.settled_status(),
+            kind.reason(),
+            TeamPauseKind::User,
+        )
+        .await;
         stop_guard.disarm();
         self.team_run_snapshot(&run_id)
             .await
@@ -999,7 +1006,10 @@ over on resume"
         {
             let mut relay = self.relay.write().await;
             relay.update_team_run(&run_id, |run| {
-                run.resolve_as_paused("recovered by stopping every owned turn");
+                run.resolve_as_paused(
+                    "recovered by stopping every owned turn",
+                    TeamPauseKind::User,
+                );
             });
             relay.push_log(
                 "info",
@@ -1115,7 +1125,14 @@ over on resume"
     ///
     /// `reason` is recorded only by the settlements that keep one (`Paused`,
     /// `Cancelled`); the sticky and terminal statuses carry their own already.
-    async fn settle_team_run(&self, run_id: &str, status: TeamRunStatus, reason: &str) {
+    /// `kind` is likewise only meaningful for `Paused` — see [`TeamPauseKind`].
+    async fn settle_team_run(
+        &self,
+        run_id: &str,
+        status: TeamRunStatus,
+        reason: &str,
+        kind: TeamPauseKind,
+    ) {
         // Already there. The driver and a user action both reach this, and the
         // loser must not re-run the quiescence check against a run it no longer
         // drives — its own next turn would look like a reason to block.
@@ -1145,7 +1162,7 @@ over on resume"
         let mut relay = self.relay.write().await;
         relay.update_team_run(run_id, |run| match status {
             TeamRunStatus::Paused => {
-                run.settle_paused(reason);
+                run.settle_paused(reason, kind);
             }
             TeamRunStatus::Cancelled => {
                 run.cancel(reason);
@@ -1463,6 +1480,50 @@ over on resume"
         Ok(thread_id)
     }
 
+    /// Whether a reviewer turn on `slot` must be refused right now, and the
+    /// settle-first reason/kind to use if so. `None` for any non-reviewer slot,
+    /// or a reviewer slot that may proceed.
+    ///
+    /// Refuses if the sub-task's dev work has not landed, or the run is already
+    /// on its way to pausing (`pause_requested`/`stopping`). `base_commit`/diff
+    /// emptiness are NOT used here: only the private driver writes
+    /// `base_commit`, and a public gate must not depend on a private invariant.
+    ///
+    /// Called TWICE by `team_turn` — once before resolving anything, and again
+    /// under `team_drive_gate` — because a stop can land in the awaits between
+    /// those two points; see the second call site for why the gate closes it.
+    async fn reviewer_turn_refusal(
+        &self,
+        run_id: &str,
+        slot: TeamThreadSlot,
+    ) -> Option<(String, TeamPauseKind)> {
+        let TeamThreadSlot::SubTaskReviewer(index) = slot else {
+            return None;
+        };
+        let relay = self.relay.read().await;
+        let run = relay.team_run(run_id);
+        let halting = run.is_some_and(|run| run.pause_requested || run.stopping);
+        let landed = run
+            .and_then(|run| run.sub_tasks.get(index))
+            .map(|task| task.dev_turns_landed)
+            .unwrap_or(0);
+        if halting {
+            Some((
+                "the task is pausing; refusing to start a new reviewer turn".to_string(),
+                TeamPauseKind::Boundary,
+            ))
+        } else if landed == 0 {
+            Some((
+                format!(
+                    "refusing to start a reviewer turn: sub-task {index} has no landed dev turn to review"
+                ),
+                TeamPauseKind::Boundary,
+            ))
+        } else {
+            None
+        }
+    }
+
     /// Run one turn on a team thread and return its fresh reply.
     ///
     /// `thread_ref` names where the run records this thread's id, because the id
@@ -1477,6 +1538,17 @@ over on resume"
         role: TeamRole,
         prompt: &str,
     ) -> TeamTurnOutcome {
+        // Cheap early-out: refuse a reviewer turn before resolving anything at
+        // all when it is already obviously refusable. NOT sufficient by itself —
+        // see the repeated call under `team_drive_gate` below, which closes the
+        // race a stop landing in the awaits between here and there would
+        // otherwise exploit.
+        if let Some((reason, kind)) = self.reviewer_turn_refusal(run_id, slot).await {
+            self.settle_team_run(run_id, TeamRunStatus::Paused, &reason, kind)
+                .await;
+            return TeamTurnOutcome::Failed(reason);
+        }
+
         let Some(mut thread_id) = self.resolve_team_slot(run_id, slot).await else {
             return TeamTurnOutcome::Failed(format!("task run {run_id} has no thread in {slot:?}"));
         };
@@ -1508,8 +1580,27 @@ over on resume"
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(self.team_turn_barrier.lock().await);
         }
+        // The id `send_message_to_thread` returns for THIS turn — not `thread_id`,
+        // which promotion can change. Matching a later failure against this (not
+        // merely its presence) is what stops a stale failure left over from an
+        // earlier turn on the same thread from poisoning this one. Assigned exactly
+        // once below; every other path returns before it would be read.
+        let sent_turn_id: Option<String>;
         {
             let _gate = self.team_drive_gate.lock().await;
+            // Repeated under the gate: a stop can land in the awaits between the
+            // early check above and here (`request_stop` sets its flags before
+            // ever taking this same gate) — `team_turn_preflight` below does NOT
+            // catch it, because a graceful/draining stop leaves the run
+            // `PausePending`, which is neither terminal nor settled-without-driver.
+            // Once we hold the gate a concurrent stop either already landed its
+            // flags (so this sees them) or is queued behind us and will drain the
+            // turn we are about to start — either way settle-first still applies.
+            if let Some((reason, kind)) = self.reviewer_turn_refusal(run_id, slot).await {
+                self.settle_team_run(run_id, TeamRunStatus::Paused, &reason, kind)
+                    .await;
+                return TeamTurnOutcome::Failed(reason);
+            }
             if let Err(error) = self.team_turn_preflight(run_id, &thread_id).await {
                 return TeamTurnOutcome::Failed(error);
             }
@@ -1542,6 +1633,10 @@ over on resume"
                     // placeholder by this very (first) turn, and the wait below would
                     // otherwise read the removed runtime as "already finished".
                     thread_id = dispatched.thread_id.clone();
+                    // Kept past the wait below: it is what lets a failed terminal be
+                    // told apart from a stale failure left over from an earlier turn
+                    // on the same thread (see the `last_turn_failure` check below).
+                    sent_turn_id = dispatched.turn_id.clone();
                 }
                 // Both are uncertain starts: `Ok(None)` returned no turn id, and a
                 // provider can begin work before returning `Err`. Drain either way,
@@ -1611,12 +1706,72 @@ over on resume"
         }
 
         self.set_in_flight_thread(run_id, None).await;
-        match self.latest_assistant_entry(&thread_id).await {
+
+        // The turn started, ran, and the thread simply went idle — no stall, no
+        // approval error, so `wait_for_team_step` returned `None`. That is exactly
+        // what a FAILED provider terminal also looks like: the failure landed as a
+        // transcript `Error` entry, not an `AgentText` one, so it is invisible to
+        // `latest_assistant_entry` below and would otherwise read as `Silent`. Ask
+        // the bridge's own record instead of guessing from the transcript, and
+        // match it against the turn WE sent — never mere presence — or a stale
+        // failure from an earlier turn on this thread would poison this one.
+        if let Some(turn_id) = sent_turn_id.as_deref() {
+            // Scoped so the read guard drops before `settle_team_run` below takes
+            // its own write lock — held across that await, it would deadlock.
+            let matched_failure = {
+                let relay = self.relay.read().await;
+                relay.last_turn_failure(&thread_id).and_then(|failure| {
+                    (failure.turn_id == turn_id).then(|| {
+                        (
+                            failure.reason.clone(),
+                            failure.kind.as_deref() == Some(TURN_FAILURE_KIND_USAGE_LIMIT),
+                        )
+                    })
+                })
+            };
+            if let Some((reason, halts_the_run)) = matched_failure {
+                // A limit resets on a clock, not on user action — settle FIRST,
+                // then return Failed. `TeamRun::fail` returns early once the run
+                // is settled-without-driver, so the driver's own `fail_run` becomes
+                // a no-op and the run stays `Paused`/resumable; reversed, the
+                // driver would win the race and end the run terminal-`Failed`.
+                if halts_the_run {
+                    self.settle_team_run(
+                        run_id,
+                        TeamRunStatus::Paused,
+                        &reason,
+                        TeamPauseKind::Provider,
+                    )
+                    .await;
+                }
+                return TeamTurnOutcome::Failed(reason);
+            }
+        }
+
+        let outcome = match self.latest_assistant_entry(&thread_id).await {
             Some((id, text)) if baseline.as_deref() != Some(id.as_str()) => {
                 TeamTurnOutcome::Replied(text)
             }
             _ => TeamTurnOutcome::Silent,
+        };
+        // The independent review gate's other half: count a Dev turn as "landed"
+        // only when it actually REPLIED. `Silent` means the turn completed but
+        // said nothing a reviewer could act on (the `emit_assistant = false`
+        // shape) — that must not license a reviewer turn any more than a failed
+        // or uncertain (`Blocked`) one does, which is why this sits after every
+        // early `Failed`/`Blocked` return above and matches on `Replied` alone
+        // rather than "non-failed".
+        if role == TeamRole::Dev && matches!(outcome, TeamTurnOutcome::Replied(_)) {
+            if let TeamThreadSlot::SubTaskDev(index) = slot {
+                let mut relay = self.relay.write().await;
+                relay.update_team_run(run_id, |run| {
+                    if let Some(task) = run.sub_tasks.get_mut(index) {
+                        task.dev_turns_landed = task.dev_turns_landed.saturating_add(1);
+                    }
+                });
+            }
         }
+        outcome
     }
 
     async fn set_in_flight_thread(&self, run_id: &str, thread_id: Option<String>) {
@@ -2316,7 +2471,13 @@ impl relay_api::TeamPort for AppState {
     }
 
     async fn settle_run(&self, run_id: &str, status: TeamRunStatus, reason: &str) {
-        self.settle_team_run(run_id, status, reason).await;
+        // Reached only through this generic seam: the driver's own per-step
+        // boundary check, never a direct synchronous user action (those settle
+        // via `stop_team_run`/`resolve_blocked_team_run` with `TeamPauseKind::User`
+        // instead) and never a provider failure (`team_turn` settles those itself
+        // with `TeamPauseKind::Provider`).
+        self.settle_team_run(run_id, status, reason, TeamPauseKind::Boundary)
+            .await;
     }
 
     async fn tl_reseed_reason(&self, run_id: &str) -> Option<String> {
@@ -2461,6 +2622,7 @@ pub(crate) fn team_run_view(run: &TeamRun) -> TeamRunView {
         unresolved: run.unresolved.clone(),
         head_commit: run.head_commit.clone(),
         pause_reason: run.pause_reason.clone(),
+        pause_kind: run.pause_kind.map(|kind| kind.as_str().to_string()),
         error: run.error.clone(),
         requested_at: run.requested_at,
         updated_at: run.updated_at,
