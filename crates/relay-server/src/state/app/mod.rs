@@ -76,6 +76,10 @@ fn spawn_push_attention_task(relay: Arc<RwLock<RelayState>>, mut receiver: watch
     });
 }
 
+/// Scheduled-proposal watchdog tick. Matches the stale-turn watchdog beside it;
+/// it is the worst-case lateness of a start, not a deadline.
+const SCHEDULED_PROPOSAL_TICK_MS: u64 = 15_000;
+
 /// Error returned when a user op targets a thread that a non-terminal review
 /// currently owns (its parent or reviewer thread). Such a thread is frozen for
 /// send/stop while the review runs in the background; every OTHER thread stays
@@ -151,6 +155,9 @@ pub struct AppState {
     /// every scrap of progress and FREEZES entirely while a turn is parked on a
     /// user's question. Overridable in tests.
     team_step_stall_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// How often the scheduled-proposal watchdog looks for a due card. 15s in
+    /// production; shrunk by tests, which cannot wait on the real one.
+    scheduled_proposal_tick_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Serializes the two things that must never interleave for a task team:
     /// STARTING a turn on one of its threads, and CHANGING whether the run may be
     /// driven at all.
@@ -391,6 +398,9 @@ impl AppState {
             #[cfg(test)]
             workspace_resolve_writeback_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
+            scheduled_proposal_tick_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                SCHEDULED_PROPOSAL_TICK_MS,
+            )),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -553,6 +563,9 @@ impl AppState {
             #[cfg(test)]
             workspace_resolve_writeback_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
+            scheduled_proposal_tick_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                SCHEDULED_PROPOSAL_TICK_MS,
+            )),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -683,23 +696,53 @@ impl AppState {
         });
     }
 
+    /// Start the background loops that must not run until the state is fully
+    /// configured, and the ONLY place that decides when those loops begin.
+    ///
+    /// `AppState::new` must not spawn them. `with_team_driver` is a builder
+    /// that consumes and returns `Self`, so the driver lands on a value the
+    /// constructor never sees; a loop spawned there holds a clone with
+    /// `team_driver: None` for the process's whole life, and the scheduled-
+    /// proposal sweep declines every card when there is no driver. Scheduling
+    /// would simply never fire, with nothing on screen to say so.
+    ///
+    /// This exists as its own step so `main` and the tests compose startup the
+    /// same way. Move a spawn out of here and into a constructor and
+    /// `the_watchdog_spawned_the_way_main_spawns_it_starts_a_due_card` fails,
+    /// which is the entire point of routing both callers through one seam.
+    pub(crate) fn spawn_configured_watchdogs(&self) {
+        self.spawn_scheduled_proposal_watchdog();
+    }
+
     /// Fires scheduled proposal cards. The due decision lives in
     /// `start_due_scheduled_proposals_at`, which takes `now` so tests can
     /// choose it — this loop only supplies the wall clock.
     ///
-    /// Call AFTER `with_team_driver`, never from `AppState::new`. The driver is
-    /// a plain field, so the clone this takes would keep the `None` it was
-    /// built with and disarm every card it ever found.
-    pub(crate) fn spawn_scheduled_proposal_watchdog(&self) {
+    /// Reached only through [`AppState::spawn_configured_watchdogs`], which is
+    /// what owns the "not before configuration" rule.
+    fn spawn_scheduled_proposal_watchdog(&self) {
         let app = self.clone();
+        // Read once, at spawn: a test shrinks it before spawning, and an
+        // interval's period is fixed when it is built.
+        let period = Duration::from_millis(
+            app.scheduled_proposal_tick_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1),
+        );
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            let mut interval = tokio::time::interval(period);
             interval.tick().await;
             loop {
                 interval.tick().await;
                 app.start_due_scheduled_proposals_at(unix_now()).await;
             }
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_scheduled_proposal_tick_ms(&self, ms: u64) {
+        self.scheduled_proposal_tick_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn stop_stale_turns_at(&self, now: u64) {

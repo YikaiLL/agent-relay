@@ -1056,6 +1056,132 @@ mod tests {
         assert_eq!(app.teams().await.teams.len(), 1, "two ticks, one run");
     }
 
+    /// Bring a staged card's start time into the past.
+    ///
+    /// The spawned loop reads the real wall clock, so a card staged 30 minutes
+    /// out never comes due inside a test. Only the stored time moves.
+    async fn make_due_now(app: &AppState, proposal_id: &str) {
+        let mut relay = app.relay.write().await;
+        let card = relay
+            .orchestrator_proposals
+            .iter_mut()
+            .find(|entry| entry.id == proposal_id)
+            .expect("the staged card");
+        card.scheduled_start_at = Some(unix_now() - 1);
+    }
+
+    /// Wait for the watchdog to do something, bounded. Polls an outcome rather
+    /// than sleeping a fixed span, so it is as fast as the shrunk tick allows.
+    async fn wait_for_a_run(app: &AppState) -> bool {
+        for _ in 0..200 {
+            if !app.teams().await.teams.is_empty() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// The watchdog's SPAWN SITE, proven through the real loop.
+    ///
+    /// Composed the way `main` composes it, and — the part that makes this a
+    /// regression test rather than a demo — spawned through the same
+    /// `spawn_configured_watchdogs` seam `main` calls, never by reaching for
+    /// the loop directly. Move that spawn into a constructor and this test
+    /// stops seeing a watchdog at all, because the state under test is built
+    /// by `from_parts` and no test can run `AppState::new`.
+    #[tokio::test]
+    async fn the_watchdog_spawned_the_way_main_spawns_it_starts_a_due_card() {
+        let (_repo, cwd) = init_repo().await;
+        // main's order, step for step.
+        let (built, _project, _outside) = build_app(&cwd).await;
+        pair_device(&built, "device-1", Vec::new()).await;
+        let app = built.with_team_driver(std::sync::Arc::new(IdleTeamDriver));
+        app.relay.write().await.trusted_workspaces.push(cwd.clone());
+        app.set_beta_features_enabled(true).await;
+
+        let staged = schedule_a_card(&app, 30).await;
+        make_due_now(&app, &staged.id).await;
+
+        app.set_scheduled_proposal_tick_ms(20);
+        app.spawn_configured_watchdogs();
+
+        assert!(
+            wait_for_a_run(&app).await,
+            "the spawned loop must start a due card with nobody calling the sweep"
+        );
+    }
+
+    /// The same card, driver and beta flag — only the spawn site differs. This
+    /// is the value `AppState::new` would have captured, and it fires nothing,
+    /// which is exactly why the spawn lives in `main` instead.
+    #[tokio::test]
+    async fn a_watchdog_spawned_before_the_driver_lands_never_fires() {
+        let (_repo, cwd) = init_repo().await;
+        let (built, _project, _outside) = build_app(&cwd).await;
+        pair_device(&built, "device-1", Vec::new()).await;
+        // The clone an `AppState::new` spawn would hold: driverless, forever.
+        let spawned_too_early = built.clone();
+        let app = built.with_team_driver(std::sync::Arc::new(IdleTeamDriver));
+        app.relay.write().await.trusted_workspaces.push(cwd.clone());
+        app.set_beta_features_enabled(true).await;
+
+        let staged = schedule_a_card(&app, 30).await;
+        make_due_now(&app, &staged.id).await;
+
+        // Same `Arc`, so the early clone's loop really does tick this fast.
+        app.set_scheduled_proposal_tick_ms(20);
+        spawned_too_early.spawn_configured_watchdogs();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            app.teams().await.teams.is_empty(),
+            "a watchdog holding a driverless clone cannot start anything"
+        );
+        assert!(
+            app.snapshot().await.orchestrator_proposals[0].auto_start,
+            "and must leave the card armed for a relay that spawned correctly"
+        );
+    }
+
+    /// Both halves of criterion 4 in one run: the schedule survives the restart
+    /// AND the outage that made the restart necessary. The fortnight test never
+    /// restarts, and the restart tests are never overdue.
+    #[tokio::test]
+    async fn a_card_restored_from_disk_still_starts_a_fortnight_late() {
+        let (_repo, cwd) = init_repo().await;
+        let before = startable_app(&cwd).await;
+        let staged = schedule_a_card(&before, 30).await;
+        let due_at = staged.scheduled_start_at.expect("a start time");
+
+        let encoded = {
+            let relay = before.relay.read().await;
+            serde_json::to_string(&crate::state::persistence::PersistedRelayState::from_relay(
+                &relay,
+            ))
+            .expect("encode")
+        };
+        let decoded: crate::state::persistence::PersistedRelayState =
+            serde_json::from_str(&encoded).expect("decode");
+
+        let after = startable_app(&cwd).await;
+        after.relay.write().await.apply_persisted(&decoded);
+
+        after
+            .start_due_scheduled_proposals_at(due_at + 14 * 24 * 60 * 60)
+            .await;
+
+        assert_eq!(
+            after.teams().await.teams.len(),
+            1,
+            "a fortnight of downtime delays a restored schedule; it does not cancel it"
+        );
+        assert!(
+            after.snapshot().await.orchestrator_proposals.is_empty(),
+            "a started card is spent"
+        );
+    }
+
     /// Acceptance criteria 2 and 4: how late the machine was is not the card's
     /// fault. A restart after a long outage must still honour the schedule.
     #[tokio::test]
