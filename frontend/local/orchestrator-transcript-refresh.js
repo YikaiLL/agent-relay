@@ -181,6 +181,9 @@ export function applyOlderOrchestratorPage(state, threadId, page) {
       threadId,
       entries: state.orchestratorEntries || [],
       olderCursor: state.orchestratorOlderCursor,
+      // A page the merge declines comes back as this object verbatim, so a field
+      // left off here is a field the ignored page silently clears.
+      historyExtended: Boolean(state.orchestratorHistoryExtended),
     },
     page
   );

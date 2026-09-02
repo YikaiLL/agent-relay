@@ -23,6 +23,16 @@ function paneShowing(entries, olderCursor) {
   };
 }
 
+function scrolledUp() {
+  const state = paneShowing([{ item_id: "newest", entry_seq: 2 }], "cursor-1");
+  applyOlderOrchestratorPage(state, THREAD, {
+    thread_id: THREAD,
+    entries: [{ item_id: "older", entry_seq: 1 }],
+    prev_cursor: "cursor-2",
+  });
+  return state;
+}
+
 // The tail page the server keeps answering with: it covers the newest entry
 // only, so everything the reader paged in above it is outside its window.
 const TAIL_PAGE = {
@@ -36,16 +46,7 @@ function refresh(state) {
   applyRefreshedOrchestratorPage(state, prior, TAIL_PAGE, THREAD);
 }
 
-test("a refresh right after an older page keeps what the reader paged in", () => {
-  const state = paneShowing([{ item_id: "newest", entry_seq: 2 }], "cursor-1");
-
-  applyOlderOrchestratorPage(state, THREAD, {
-    thread_id: THREAD,
-    entries: [{ item_id: "older", entry_seq: 1 }],
-    prev_cursor: "cursor-2",
-  });
-  refresh(state);
-
+function assertHistoryKept(state) {
   assert.deepEqual(
     state.orchestratorEntries.map((entry) => entry.item_id),
     ["older", "newest"]
@@ -55,25 +56,37 @@ test("a refresh right after an older page keeps what the reader paged in", () =>
     "cursor-2",
     "a rewound cursor refetches the page the reader just loaded"
   );
+}
+
+test("a refresh right after an older page keeps what the reader paged in", () => {
+  const state = scrolledUp();
+  refresh(state);
+  assertHistoryKept(state);
 });
 
 // The refresh that discards it need not be the first one: while the Orchestrator
 // is working its tail is refetched repeatedly, so the flag has to survive each
 // merge, not just be present going into one.
 test("and keeps it across a second refresh", () => {
-  const state = paneShowing([{ item_id: "newest", entry_seq: 2 }], "cursor-1");
+  const state = scrolledUp();
+  refresh(state);
+  refresh(state);
+  assertHistoryKept(state);
+});
+
+// An older page the merge declines — a stale response from before a thread
+// switch, or the bare-array shape the endpoint also answers with — is meant to
+// leave the pane exactly as it was, so it must not cost the reader the history
+// they already loaded one refresh later.
+test("an ignored older page leaves the paged-in history alone", () => {
+  const state = scrolledUp();
 
   applyOlderOrchestratorPage(state, THREAD, {
-    thread_id: THREAD,
-    entries: [{ item_id: "older", entry_seq: 1 }],
-    prev_cursor: "cursor-2",
+    thread_id: "another-thread",
+    entries: [{ item_id: "someone-elses", entry_seq: 9 }],
+    prev_cursor: "cursor-9",
   });
   refresh(state);
-  refresh(state);
 
-  assert.deepEqual(
-    state.orchestratorEntries.map((entry) => entry.item_id),
-    ["older", "newest"]
-  );
-  assert.equal(state.orchestratorOlderCursor, "cursor-2");
+  assertHistoryKept(state);
 });
