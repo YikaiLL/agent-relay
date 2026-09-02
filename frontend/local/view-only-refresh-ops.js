@@ -136,7 +136,10 @@ export function createViewOnlyRefreshOps({
         }),
         historyExtended: refreshed.historyExtended,
       });
-      state.viewOnlyThread = livePin?.tailGap ? { ...built, tailGap: true } : built;
+      state.viewOnlyThread =
+        livePin?.tailGap && livePin?.deltaDuringFetch
+          ? { ...built, tailGap: true }
+          : built;
     } catch (error) {
       if (generation !== state.viewOnlyGeneration) return;
       const livePin = pinForGeneration(state, threadId, generation, prior);
@@ -171,7 +174,10 @@ export function createViewOnlyRefreshOps({
         historyExtended: Boolean(livePin?.historyExtended),
         error: true,
       });
-      state.viewOnlyThread = livePin?.tailGap ? { ...built, tailGap: true } : built;
+      state.viewOnlyThread =
+        livePin?.tailGap && livePin?.deltaDuringFetch
+          ? { ...built, tailGap: true }
+          : built;
       logLine(`Couldn't load the read-only session view: ${error.message}`);
     }
     if (state.session) renderSession(state.session);

@@ -188,6 +188,40 @@ test("tailGap survives fetch start on the loading pin", async () => {
   assert.equal(h.state.viewOnlyThread.tailGap, true);
 });
 
+test("pre-fetch tailGap clears after repair fetch completes", async () => {
+  const h = createHarness();
+  h.state.viewOnlyThread = {
+    threadId: BG_THREAD,
+    entries: [{ item_id: "item-1", kind: "agent_text", text: "Hello", status: "running" }],
+    tailGap: true,
+    lastRefreshAt: Date.now(),
+    loading: false,
+  };
+
+  void h.ops.loadViewOnlyTranscript(BG_THREAD);
+  await h.flush();
+  assert.equal(h.state.viewOnlyThread.loading, true);
+  assert.equal(h.state.viewOnlyThread.tailGap, true);
+
+  h.completePendingFetch();
+  await h.flush();
+
+  assert.ok(
+    !h.state.viewOnlyThread.tailGap,
+    "a repair fetch that answered the pre-fetch gap must clear tailGap"
+  );
+
+  const loadsBefore = h.loads.length;
+  h.ops.maybeRefreshViewOnly(h.state.session);
+  await h.flush();
+
+  assert.equal(
+    h.loads.length,
+    loadsBefore,
+    "maybeRefreshViewOnly must not re-arm fetch after the gap was repaired"
+  );
+});
+
 test("tailGap raised during an in-flight fetch survives fetch completion", async () => {
   const h = createHarness();
   h.state.viewOnlyThread = {
