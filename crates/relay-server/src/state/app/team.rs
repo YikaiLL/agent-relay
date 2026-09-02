@@ -39,7 +39,7 @@ use crate::protocol::{
 use crate::state::{
     TaskSpec, TeamPauseKind, TeamRun, TeamRunStatus, TeamThreadSlot, TurnFailureKind,
 };
-use relay_api::team::{TeamRole, TeamTurnOutcome};
+use relay_api::team::{SubTaskStatus, TeamRole, TeamTurnOutcome};
 use relay_api::TeamPortError;
 
 use super::review::{
@@ -1516,6 +1516,17 @@ over on resume"
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_reviewer_refusal_barrier(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.reviewer_refusal_barrier.clone().lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reviewer_refusal_arrivals(&self) -> u64 {
+        self.reviewer_refusal_arrivals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Which of the run's own threads are observably mid-turn right now.
     async fn working_team_threads(&self, run_id: &str) -> Vec<String> {
         let owned = self.team_owned_threads(run_id).await;
@@ -1792,48 +1803,118 @@ over on resume"
         Ok(thread_id)
     }
 
-    /// Whether a reviewer turn on `slot` must be refused right now, and the
-    /// settle-first reason/kind to use if so. `None` for any non-reviewer slot,
+    /// Refuse the reviewer turn on `slot` right now, if it must be — deciding
+    /// AND acting under ONE write-lock hold. `None` for any non-reviewer slot,
     /// or a reviewer slot that may proceed.
     ///
-    /// Refuses if the sub-task's dev work has not landed, or the run is already
-    /// on its way to pausing (`pause_requested`/`stopping`). `base_commit`/diff
-    /// emptiness are NOT used here: only the private driver writes
-    /// `base_commit`, and a public gate must not depend on a private invariant.
+    /// Refuses if the run is pausing/stopping, or the sub-task's dev work has
+    /// not landed. `base_commit`/diff emptiness are NOT used here: only the
+    /// private driver writes `base_commit`, and a public gate must not depend
+    /// on a private invariant.
+    ///
+    /// Deciding and acting used to be two steps — a read here, then a separate
+    /// reset/settle after. That gap is exactly what a concurrent `request_stop`/
+    /// `request_pause` can land in: it needs this SAME write lock, so a decision
+    /// made and applied in one unbroken hold can never go stale against it —
+    /// there is no `.await` between "read" and "commit" for anything else to
+    /// land inside. `#[cfg(test)]` proves this: the checkpoint below is reached
+    /// only after the decision, still holding the lock, so a concurrent stop
+    /// provably cannot complete until this commits.
     ///
     /// Called TWICE by `team_turn` — once before resolving anything, and again
     /// under `team_drive_gate` — because a stop can land in the awaits between
-    /// those two points; see the second call site for why the gate closes it.
-    async fn reviewer_turn_refusal(
-        &self,
-        run_id: &str,
-        slot: TeamThreadSlot,
-    ) -> Option<(String, TeamPauseKind)> {
+    /// those two CALLS (not within either one); see the second call site.
+    async fn reviewer_turn_refusal(&self, run_id: &str, slot: TeamThreadSlot) -> Option<String> {
         let TeamThreadSlot::SubTaskReviewer(index) = slot else {
             return None;
         };
-        let relay = self.relay.read().await;
-        let run = relay.team_run(run_id);
-        let halting = run.is_some_and(|run| run.pause_requested || run.stopping);
-        let landed = run
-            .and_then(|run| run.sub_tasks.get(index))
-            .map(|task| task.dev_turns_landed)
-            .unwrap_or(0);
-        if halting {
-            Some((
+
+        let mut relay = self.relay.write().await;
+        let run = relay.team_run(run_id)?;
+
+        if run.stopping {
+            // A draining stop settles this run itself once quiescent; settling
+            // here too would race it and can discard the user's own reason.
+            return Some("the task is pausing; refusing to start a new reviewer turn".to_string());
+        }
+
+        let (reason, kind, reset_sub_task) = if run.pause_requested {
+            // Nothing else will settle a graceful pause, so this must — as the
+            // user's own pause, not the gate's.
+            (
                 "the task is pausing; refusing to start a new reviewer turn".to_string(),
-                TeamPauseKind::Boundary,
-            ))
-        } else if landed == 0 {
-            Some((
+                TeamPauseKind::User,
+                false,
+            )
+        } else {
+            let landed = run
+                .sub_tasks
+                .get(index)
+                .map(|task| task.dev_turns_landed)
+                .unwrap_or(0);
+            if landed != 0 {
+                return None;
+            }
+            (
                 format!(
                     "refusing to start a reviewer turn: sub-task {index} has no landed dev turn to review"
                 ),
                 TeamPauseKind::Boundary,
-            ))
-        } else {
-            None
+                true,
+            )
+        };
+
+        // The same quiescence guard `settle_team_run` applies for `Paused`,
+        // done here instead of through it so the whole decide-then-commit
+        // sequence stays inside one lock hold rather than two.
+        let working: Vec<String> = run
+            .owned_thread_ids()
+            .into_iter()
+            .filter(|id| {
+                relay
+                    .runtime_for_thread(id)
+                    .is_some_and(|rt| rt.is_working())
+            })
+            .collect();
+
+        #[cfg(test)]
+        {
+            self.reviewer_refusal_arrivals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            drop(self.reviewer_refusal_barrier.lock().await);
         }
+
+        let mut blocked = None;
+        relay.update_team_run(run_id, |run| {
+            // Only the landed-dev-work branch resets: a user pause must
+            // preserve where the work had got to, not send it back to square
+            // one.
+            if reset_sub_task {
+                if let Some(task) = run.sub_tasks.get_mut(index) {
+                    task.status = SubTaskStatus::Pending;
+                }
+            }
+            if working.is_empty() {
+                run.settle_paused(&reason, kind);
+            } else {
+                // Mirrors `settle_team_run`'s own guard: a run that cannot
+                // prove quiescence is Blocked instead of a lie the user acts on.
+                let message = format!(
+                    "cannot settle this task as paused: {} still has a turn in flight",
+                    working.join(", ")
+                );
+                let before = run.status;
+                run.block(message.clone());
+                if run.status != before {
+                    blocked = Some(message);
+                }
+            }
+        });
+        if let Some(message) = blocked {
+            relay.push_log("warn", format!("Task {run_id} blocked: {message}"));
+        }
+        relay.notify();
+        Some(reason)
     }
 
     /// Run one turn on a team thread and return its fresh reply.
@@ -1855,9 +1936,7 @@ over on resume"
         // see the repeated call under `team_drive_gate` below, which closes the
         // race a stop landing in the awaits between here and there would
         // otherwise exploit.
-        if let Some((reason, kind)) = self.reviewer_turn_refusal(run_id, slot).await {
-            self.settle_team_run(run_id, TeamRunStatus::Paused, &reason, kind)
-                .await;
+        if let Some(reason) = self.reviewer_turn_refusal(run_id, slot).await {
             return TeamTurnOutcome::Failed(reason);
         }
 
@@ -1906,11 +1985,9 @@ over on resume"
             // catch it, because a graceful/draining stop leaves the run
             // `PausePending`, which is neither terminal nor settled-without-driver.
             // Once we hold the gate a concurrent stop either already landed its
-            // flags (so this sees them) or is queued behind us and will drain the
-            // turn we are about to start — either way settle-first still applies.
-            if let Some((reason, kind)) = self.reviewer_turn_refusal(run_id, slot).await {
-                self.settle_team_run(run_id, TeamRunStatus::Paused, &reason, kind)
-                    .await;
+            // flags (so this sees them) or is queued behind us — either way this
+            // refusal is what closes the race, whether or not it settles here.
+            if let Some(reason) = self.reviewer_turn_refusal(run_id, slot).await {
                 return TeamTurnOutcome::Failed(reason);
             }
             if let Err(error) = self.team_turn_preflight(run_id, &thread_id).await {

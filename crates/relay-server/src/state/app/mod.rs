@@ -197,6 +197,14 @@ pub struct AppState {
     team_commit_barrier: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     team_commit_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// Held INSIDE the reviewer gate's own write-lock hold, between deciding a
+    /// refusal and committing it — proving that gap cannot be exploited: a
+    /// concurrent `request_stop`/`request_pause` needs the very same lock, so
+    /// it provably cannot land until this refusal has already committed.
+    #[cfg(test)]
+    reviewer_refusal_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    reviewer_refusal_arrivals: Arc<std::sync::atomic::AtomicU64>,
     /// Test-only latch after git listing and before workspace write-back, so a cwd
     /// observation can land in that window deterministically.
     #[cfg(test)]
@@ -391,6 +399,10 @@ impl AppState {
             #[cfg(test)]
             team_commit_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
+            reviewer_refusal_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            reviewer_refusal_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
             workspace_resolve_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             workspace_resolve_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -555,6 +567,10 @@ impl AppState {
             team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             team_commit_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            reviewer_refusal_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            reviewer_refusal_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             workspace_resolve_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]

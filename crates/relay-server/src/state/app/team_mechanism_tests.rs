@@ -1313,6 +1313,21 @@ impl relay_api::TeamDriver for DevThenReviewDriver {
                 let refused = matches!(outcome, relay_api::team::TeamTurnOutcome::Failed(_));
                 self.reviewer_outcomes.lock().await.push(outcome);
                 if refused {
+                    // The refusal may not have settled the run itself (F2: a
+                    // draining stop settles it instead) — give that a moment
+                    // to land before the wrap-up below treats an unsettled run
+                    // as this driver's own to report. `boundary_status` is NOT
+                    // this check: it returns `Some` the instant a pause is
+                    // merely REQUESTED, before anyone has actually settled it.
+                    for _ in 0..100 {
+                        let settled = port.run_snapshot(&run_id).await.is_some_and(|run| {
+                            run.status.is_terminal() || run.status.is_settled_without_driver()
+                        });
+                        if settled {
+                            break;
+                        }
+                        sleep(Duration::from_millis(5)).await;
+                    }
                     break;
                 }
                 // A NEEDS_CHANGES verdict every round, exactly the shape that
@@ -1332,17 +1347,9 @@ impl relay_api::TeamDriver for DevThenReviewDriver {
             }
         }
 
-        // Wrap up like `OneDevTurnDriver` does. A no-op when this run already
-        // settled itself (the provider halt, or a gate refusal) — every
-        // `TeamRun` mutator refuses once `is_settled_without_driver()` is true —
-        // and otherwise leaves a clean terminal instead of falling to the crash
-        // net's `Interrupted`.
-        port.settle_run(
-            &run_id,
-            crate::state::TeamRunStatus::Failed,
-            "test driver done",
-        )
-        .await;
+        // `fail_run`, not `settle_run`: `TeamRun::fail` no-ops while `stopping`,
+        // so a refusal raced by a real stop's own settle cannot clobber it.
+        port.fail_run(&run_id, "test driver done".to_string()).await;
     }
 }
 
@@ -1769,6 +1776,27 @@ async fn a_stop_mid_run_refuses_the_next_reviewer_turn() {
     }));
 
     let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    // The driver's `request_stop` only sets the flags, same as the window a
+    // real stop's drain briefly leaves the run in. Under the fix this refusal
+    // does not settle the run itself (F2), so wait on the refusal directly
+    // rather than on a status this step no longer reaches.
+    for _ in 0..600 {
+        if reviewer_outcomes.lock().await.len() == 1 {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        reviewer_outcomes.lock().await.len(),
+        1,
+        "the reviewer turn should have been attempted and refused by now"
+    );
+
+    // Finish the stop for real — this is what must settle the run, carrying
+    // the user's own reason rather than whatever the gate refused it with.
+    app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect("a stopping run can still be stopped for real");
     let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
 
     assert!(
@@ -1801,6 +1829,13 @@ the stop is refused"
         run.sub_tasks[0].status,
         crate::state::SubTaskStatus::Escalated
     );
+    assert_eq!(
+        run.pause_kind,
+        Some(relay_api::team::TeamPauseKind::User),
+        "the real stop's own reason must land, not the gate's internal wording \
+it refused the turn with"
+    );
+    assert_eq!(run.pause_reason.as_deref(), Some("stopped by the user"));
 }
 
 /// Drives a landed Dev turn, then waits to be released before attempting the
@@ -1872,13 +1907,27 @@ impl relay_api::TeamDriver for RaceWindowDriver {
                 "review it",
             )
             .await;
+        let refused = matches!(reviewer_outcome, relay_api::team::TeamTurnOutcome::Failed(_));
         *self.reviewer_outcome.lock().await = Some(reviewer_outcome);
-        port.settle_run(
-            &run_id,
-            crate::state::TeamRunStatus::Failed,
-            "test driver done",
-        )
-        .await;
+        if refused {
+            // The refusal may not have settled the run itself (F2: a draining
+            // stop settles it instead) — give that a moment to land before the
+            // wrap-up below treats an unsettled run as this driver's own.
+            // `boundary_status` is NOT this check: it returns `Some` the
+            // instant a pause is merely REQUESTED, before anyone settles it.
+            for _ in 0..100 {
+                let settled = port.run_snapshot(&run_id).await.is_some_and(|run| {
+                    run.status.is_terminal() || run.status.is_settled_without_driver()
+                });
+                if settled {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        }
+        // `fail_run`, not `settle_run`: `TeamRun::fail` no-ops while `stopping`,
+        // so a refusal raced by a real stop's own settle cannot clobber it.
+        port.fail_run(&run_id, "test driver done".to_string()).await;
     }
 }
 
@@ -1940,6 +1989,22 @@ async fn a_stop_landing_between_the_reviewer_gates_early_check_and_the_drive_gat
         .update_team_run(&run_id, |run| run.request_stop("device-stop"));
     drop(latch);
 
+    // Under the fix this refusal does not settle the run itself while
+    // `stopping` (F2) — wait on the refusal directly, then finish the stop for
+    // real, the same as any actual drain would.
+    for _ in 0..600 {
+        if reviewer_outcome.lock().await.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        reviewer_outcome.lock().await.is_some(),
+        "the reviewer turn should have been attempted and refused by now"
+    );
+    app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect("a stopping run can still be stopped for real");
     let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
 
     assert!(
@@ -1964,6 +2029,116 @@ early check runs at all: {other:?}"
     assert_ne!(
         run.sub_tasks[0].status,
         crate::state::SubTaskStatus::Escalated
+    );
+}
+
+/// [P1 fix] `reviewer_turn_refusal` used to read the run's flags, return a
+/// decision, and let the CALLER reset the sub-task and settle separately —
+/// two lock acquisitions with a gap between them. A `request_stop` landing in
+/// that gap left a stale `Boundary` decision to settle `Paused` anyway, and
+/// the real stop's own later settle (with the user's reason) then no-op'd
+/// against it — the exact bug F2 fixes, reopened through a different window.
+///
+/// The fix folds decide-and-commit into ONE write-lock hold, so nothing can
+/// land between them. This proves it directly: park the refusal on a latch
+/// AFTER it has decided but BEFORE it commits — still holding the write lock
+/// `request_stop` also needs — and show a concurrent stop cannot even start
+/// until the refusal releases it, so it can only ever observe an already-
+/// consistent outcome, never corrupt one mid-flight.
+#[tokio::test]
+async fn a_stop_racing_the_atomic_refusal_cannot_land_between_its_decision_and_its_commit() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    // Silent, so `dev_turns_landed` stays 0 and the reviewer gate's `landed ==
+    // 0` branch is the one being raced — the branch that both decides AND
+    // mutates (the sub-task reset), making it the sharpest test of atomicity.
+    providers
+        .get("codex")
+        .unwrap()
+        .emit_assistant
+        .store(false, Ordering::Relaxed);
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let before = app.reviewer_refusal_arrivals();
+    let latch = app.hold_reviewer_refusal_barrier().await;
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+    // The refusal has now decided (fresh flags: nothing pausing, landed == 0)
+    // and is parked on our latch — still holding the SAME write lock a stop
+    // needs for its very first step, `request_stop`.
+    for _ in 0..2_000 {
+        if app.reviewer_refusal_arrivals() > before {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        app.reviewer_refusal_arrivals() > before,
+        "the refusal should have reached its decided-but-not-committed latch by now"
+    );
+
+    let stop_task = {
+        let app = app.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            app.force_stop_team_run(Some(run_id), Some("device-1".to_string()))
+                .await
+        })
+    };
+    // Give the spawned stop every chance to run if it somehow could; it must
+    // not, because it cannot even acquire the lock the parked refusal holds.
+    sleep(Duration::from_millis(50)).await;
+    assert!(
+        !stop_task.is_finished(),
+        "a stop cannot complete while the refusal it raced still holds the \
+write lock its own first step (`request_stop`) requires"
+    );
+
+    drop(latch);
+
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+    let stop_result = stop_task.await.expect("the stop task must not panic");
+    assert!(
+        stop_result.is_ok(),
+        "a stop that only gets to run after the refusal already committed \
+must be a graceful no-op, not an error: {stop_result:?}"
+    );
+
+    // The refusal's own decision — made and committed atomically before the
+    // stop could interleave — is what must have stuck: `Boundary`, not
+    // corrupted, and not silently overwritten by the stop that arrived after.
+    assert_eq!(
+        run.pause_kind,
+        Some(relay_api::team::TeamPauseKind::Boundary),
+        "the refusal committed before the stop could ever run; its own \
+decision must be the one that stuck"
+    );
+    assert!(
+        run.pause_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no landed dev turn")),
+        "got {:?}",
+        run.pause_reason
+    );
+    assert_eq!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Pending,
+        "F1's reset must still land atomically with the settle, even though a \
+stop was racing to apply right after"
+    );
+    assert_eq!(
+        reviewer_outcomes.lock().await.len(),
+        1,
+        "the driver's own reviewer attempt is the one that got refused"
     );
 }
 
@@ -2159,4 +2334,239 @@ async fn reopen_rollback_does_not_clobber_a_concurrent_mark() {
 
     let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
     assert_eq!(run.status, crate::state::TeamRunStatus::Cancelled);
+}
+
+/// Mimics the private driver's action table just enough to prove F1: at the
+/// top of every loop pass — including a resume, which is a fresh `drive()`
+/// call with no memory of the last one — it reads the sub-task's PERSISTED
+/// `status` and runs whatever that status maps to: `Pending` a dev turn,
+/// `Implementing` a reviewer turn. It never special-cases "this is a resume";
+/// the whole point of F1 is that the record alone must steer it correctly.
+struct ActionTableDriver {
+    dev_outcomes: std::sync::Arc<Mutex<Vec<relay_api::team::TeamTurnOutcome>>>,
+    reviewer_outcomes: std::sync::Arc<Mutex<Vec<relay_api::team::TeamTurnOutcome>>>,
+}
+
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for ActionTableDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, port: std::sync::Arc<dyn relay_api::TeamPort>, run_id: String) {
+        let existing = port.run_snapshot(&run_id).await.expect("run exists");
+        if existing.sub_tasks.is_empty() {
+            let dev_thread = port
+                .start_thread(&run_id, relay_api::team::TeamRole::Dev)
+                .await
+                .expect("dev seat thread");
+            let reviewer_thread = port
+                .start_thread(&run_id, relay_api::team::TeamRole::Reviewer)
+                .await
+                .expect("reviewer seat thread");
+            port.update_run(
+                &run_id,
+                Box::new(move |run| {
+                    run.sub_tasks.push(crate::state::SubTask {
+                        id: "st-1".to_string(),
+                        dev_thread_id: Some(dev_thread),
+                        reviewer_thread_id: Some(reviewer_thread),
+                        ..Default::default()
+                    });
+                }),
+            )
+            .await;
+        }
+
+        loop {
+            // The pause boundary is the top of the loop and nowhere else (see
+            // `team.rs` module docs): a settled run means someone else already
+            // decided this run's fate, so there is nothing left to drive.
+            if port.boundary_status(&run_id).await.is_some() {
+                return;
+            }
+            let run = port.run_snapshot(&run_id).await.expect("run exists");
+            match run.sub_tasks[0].status {
+                crate::state::SubTaskStatus::Pending => {
+                    let outcome = port
+                        .turn(
+                            &run_id,
+                            relay_api::team::TeamThreadSlot::SubTaskDev(0),
+                            relay_api::team::TeamRole::Dev,
+                            "write the parser",
+                        )
+                        .await;
+                    let progressed = !matches!(
+                        outcome,
+                        relay_api::team::TeamTurnOutcome::Failed(_)
+                            | relay_api::team::TeamTurnOutcome::Blocked(_)
+                    );
+                    self.dev_outcomes.lock().await.push(outcome);
+                    if !progressed {
+                        port.fail_run(&run_id, "dev turn failed".to_string()).await;
+                        return;
+                    }
+                    port.update_run(
+                        &run_id,
+                        Box::new(|run| {
+                            if let Some(task) = run.sub_tasks.get_mut(0) {
+                                task.status = crate::state::SubTaskStatus::Implementing;
+                            }
+                        }),
+                    )
+                    .await;
+                }
+                crate::state::SubTaskStatus::Implementing => {
+                    let outcome = port
+                        .turn(
+                            &run_id,
+                            relay_api::team::TeamThreadSlot::SubTaskReviewer(0),
+                            relay_api::team::TeamRole::Reviewer,
+                            "review it",
+                        )
+                        .await;
+                    let refused = matches!(outcome, relay_api::team::TeamTurnOutcome::Failed(_));
+                    self.reviewer_outcomes.lock().await.push(outcome);
+                    if !refused {
+                        port.settle_run(&run_id, crate::state::TeamRunStatus::Done, "test driver done")
+                            .await;
+                        return;
+                    }
+                    // A refused reviewer turn already settled (or is deferring
+                    // to a real stop) itself; loop back to the boundary check.
+                }
+                other => panic!("test driver hit an unmodelled sub-task status: {other:?}"),
+            }
+        }
+    }
+}
+
+/// The root-cause regression F1 fixes: a refused reviewer turn used to leave
+/// the sub-task at `Implementing`, which the private driver's action table
+/// maps straight back to a review action — so a resume re-entered review,
+/// got refused again, and re-paused forever. The fix puts the sub-task back
+/// to `Pending` on that refusal, so a resume redrives the DEV turn instead.
+#[tokio::test]
+async fn a_refused_review_resets_the_sub_task_so_a_resume_drives_dev_not_review() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let codex = providers.get("codex").unwrap().clone();
+    // Round one's dev turn completes but emits no assistant text (Silent) —
+    // the shape `dev_turns_landed` must not count — so the reviewer gate
+    // refuses it.
+    codex.emit_assistant.store(false, Ordering::Relaxed);
+
+    let dev_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(ActionTableDriver {
+        dev_outcomes: dev_outcomes.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    assert_eq!(dev_outcomes.lock().await.len(), 1);
+    assert_eq!(reviewer_outcomes.lock().await.len(), 1);
+    assert_eq!(run.sub_tasks[0].dev_turns_landed, 0);
+    assert_eq!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Pending,
+        "a refused review must not leave the sub-task where the action table \
+sends straight back into another refused review on resume"
+    );
+
+    // The resumed dev turn actually lands this time.
+    codex.emit_assistant.store(true, Ordering::Relaxed);
+    app.resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect("a paused task can be resumed");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Done).await;
+
+    let dev_outcomes = dev_outcomes.lock().await.clone();
+    assert_eq!(
+        dev_outcomes.len(),
+        2,
+        "the resume must drive a second DEV turn, not another refused review: {dev_outcomes:?}"
+    );
+    assert!(
+        matches!(dev_outcomes[1], relay_api::team::TeamTurnOutcome::Replied(_)),
+        "the resumed dev turn must actually land, proving real progress: {:?}",
+        dev_outcomes[1]
+    );
+    assert_eq!(run.sub_tasks[0].dev_turns_landed, 1);
+    let reviewer_outcomes = reviewer_outcomes.lock().await.clone();
+    assert_eq!(
+        reviewer_outcomes.len(),
+        2,
+        "the dev turn landing must unlock a real review this time: {reviewer_outcomes:?}"
+    );
+    assert!(
+        !matches!(reviewer_outcomes[1], relay_api::team::TeamTurnOutcome::Failed(_)),
+        "the second review must not be refused now that dev work landed: {:?}",
+        reviewer_outcomes[1]
+    );
+}
+
+/// F2's other branch: a GRACEFUL pause (`request_pause`, `stopping` stays
+/// false) never drains anything, so nothing besides this refusal will ever
+/// settle the run — it must settle `Paused` with the user's own `pause_kind`,
+/// and must never fall through to `Failed`.
+#[tokio::test]
+async fn a_graceful_pause_that_refuses_a_reviewer_turn_settles_paused_not_failed() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcome = std::sync::Arc::new(Mutex::new(None));
+    let dev_landed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let proceed_to_reviewer = std::sync::Arc::new(tokio::sync::Notify::new());
+    let app = app.with_team_driver(std::sync::Arc::new(RaceWindowDriver {
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcome: reviewer_outcome.clone(),
+        dev_landed: dev_landed.clone(),
+        proceed_to_reviewer: proceed_to_reviewer.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    dev_landed.notified().await;
+
+    app.pause_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect("a running task can be paused");
+    proceed_to_reviewer.notify_one();
+
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    assert!(
+        matches!(
+            dev_outcome.lock().await.clone(),
+            Some(relay_api::team::TeamTurnOutcome::Replied(_))
+        ),
+        "the dev turn itself must land normally"
+    );
+    match reviewer_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(_)) => {}
+        other => panic!(
+            "a reviewer turn requested during a graceful pause must be refused: {other:?}"
+        ),
+    }
+    assert_eq!(
+        run.pause_kind,
+        Some(relay_api::team::TeamPauseKind::User),
+        "a graceful pause is the user's own request taking effect, not the gate's"
+    );
+    assert!(
+        run.pause_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("pausing")),
+        "pause_reason should say the task is pausing: {:?}",
+        run.pause_reason
+    );
+
+    // `fail()` is not suppressed for a graceful pause, so a bare refusal here
+    // would have let the run fall through to `Failed`; confirm it did not.
+    sleep(Duration::from_millis(50)).await;
+    let still = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+    assert_eq!(still.status, crate::state::TeamRunStatus::Paused);
 }
