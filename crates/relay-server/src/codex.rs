@@ -25,7 +25,7 @@ use crate::{
         user_message_transcript_text, ProviderBridge, ProviderForkCapability, ProviderForkRequest,
         ProviderImage, StartThreadRequest, StartThreadResult, ThreadSyncData,
     },
-    state::{ApprovalKind, PendingApproval, RelayState},
+    state::{ApprovalKind, PendingApproval, RelayState, TurnFailureKind},
 };
 
 mod rpc;
@@ -990,6 +990,29 @@ pub(crate) fn codex_turn_failure_reason(turn: &Value) -> Option<String> {
         .and_then(|error| value_at(error, &["codexErrorInfo"]))
         .and_then(codex_error_info_label);
     Some(label.unwrap_or_else(|| "The turn ended with an error.".to_string()))
+}
+
+/// Map codex's `codexErrorInfo` onto the shared [`TurnFailureKind`]. Codex's two
+/// session limits classify; every other variant — `serverOverloaded` included —
+/// yields `None` and stays an ordinary failure. The enum's table says why each
+/// omission is deliberate.
+pub(crate) fn codex_error_info_kind(info: &Value) -> Option<TurnFailureKind> {
+    let variant = match info {
+        Value::String(variant) => variant.as_str(),
+        Value::Object(map) => map.keys().next()?.as_str(),
+        _ => return None,
+    };
+    match variant {
+        "usageLimitExceeded" | "sessionBudgetExceeded" => Some(TurnFailureKind::UsageLimit),
+        _ => None,
+    }
+}
+
+/// Companion to `codex_turn_failure_reason`: the same `turn` object's closed
+/// failure kind, or `None` if unfailed/unclassified.
+pub(crate) fn codex_turn_failure_kind(turn: &Value) -> Option<TurnFailureKind> {
+    let error = value_at(turn, &["error"]).filter(|error| !error.is_null())?;
+    value_at(error, &["codexErrorInfo"]).and_then(codex_error_info_kind)
 }
 
 fn parse_transcript(thread: &Value) -> Vec<TranscriptEntryView> {

@@ -122,6 +122,7 @@ import {
   teamRunCommentScope,
   proposeOrchestratorTask,
   confirmOrchestratorProposal,
+  reviseOrchestratorProposal,
   dismissOrchestratorProposal,
   setUsageBudget,
 } from "./local/api.js";
@@ -1099,6 +1100,9 @@ const renderer = createSessionRenderer({
   },
   confirmOrchestratorProposal(proposalId) {
     return confirmOrchestratorProposal(apiFetch, proposalId, state.deviceId);
+  },
+  reviseOrchestratorProposal(proposalId, updates) {
+    return reviseOrchestratorProposal(apiFetch, proposalId, updates, state.deviceId);
   },
   dismissOrchestratorProposal(proposalId) {
     return dismissOrchestratorProposal(apiFetch, proposalId, state.deviceId);

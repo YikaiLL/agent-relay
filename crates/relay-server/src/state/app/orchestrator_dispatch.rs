@@ -326,6 +326,8 @@ impl AppState {
                 team_id,
                 why,
                 agents,
+                auto_start,
+                start_in_minutes,
             } => {
                 let receipt = self
                     .propose_orchestrator_task(ProposeOrchestratorTaskInput {
@@ -336,6 +338,8 @@ impl AppState {
                         why,
                         agents: seat_agents_view(&agents),
                         device_id,
+                        auto_start,
+                        start_in_minutes,
                         ..Default::default()
                     })
                     .await?;
@@ -351,6 +355,8 @@ impl AppState {
                 team_id,
                 why,
                 agents,
+                auto_start,
+                start_in_minutes,
             } => {
                 let receipt = self
                     .revise_orchestrator_proposal(
@@ -362,6 +368,8 @@ impl AppState {
                             why,
                             agents: seat_agents_view(&agents),
                             device_id,
+                            auto_start,
+                            start_in_minutes,
                             ..Default::default()
                         },
                     )

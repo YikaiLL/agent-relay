@@ -13,6 +13,83 @@ use super::{
     TranscriptRecord,
 };
 
+/// A terminal, sanitized record of the last failed turn on this thread — never
+/// the raw provider body, only what the bridge already surfaced as `reason`
+/// (see `claude_failed_turn_reason` / `codex_turn_failure_reason`).
+///
+/// Consumers must match `turn_id` against the turn THEY sent, not merely check
+/// presence — this record is never cleared, so an unmatched id would let a
+/// stale failure from an earlier turn poison a later, good one.
+#[derive(Debug, Clone)]
+pub(crate) struct TurnFailure {
+    pub(crate) turn_id: String,
+    pub(crate) kind: Option<TurnFailureKind>,
+    pub(crate) reason: String,
+}
+
+/// What a provider said one finished turn cost.
+///
+/// Same shape and same discipline as [`TurnFailure`]: written by the single
+/// usage funnel (`RelayState::record_token_usage`), never cleared, so a reader
+/// must match `turn_id` against the turn IT dispatched rather than check
+/// presence — an unmatched id would let an earlier turn's figure speak for a
+/// later one.
+///
+/// The absence of a record is NOT the same as `billed == 0`. Zero means the
+/// provider reported a figure and it was nothing; absent means it reported no
+/// figure at all, which several paths legitimately do.
+#[derive(Debug, Clone)]
+pub(crate) struct TurnSpend {
+    pub(crate) turn_id: String,
+    pub(crate) billed: u64,
+}
+
+/// How a provider said a turn failed — the one classification space both bridges
+/// map onto. `None` means unclassified, which is an ordinary failure.
+///
+/// | provider signal | kind | policy |
+/// |---|---|---|
+/// | Claude worker `done.failure_kind = "usage_limit"` | `UsageLimit` | halt, settle `Paused` |
+/// | Codex `codexErrorInfo: usageLimitExceeded` | `UsageLimit` | halt, settle `Paused` |
+/// | Codex `codexErrorInfo: sessionBudgetExceeded` | `UsageLimit` | halt, settle `Paused` |
+/// | Codex `serverOverloaded` | none | ordinary failure |
+/// | every other Codex variant (`unauthorized`, `badRequest`, …) | none | ordinary failure |
+/// | an unrecognised kind string from a newer worker | none | ordinary failure |
+///
+/// The line is whether the run is worth keeping until the block lifts. Halting
+/// converts a failure into a RESUMABLE `Paused` run, so the branch, worktree and
+/// finished sub-tasks survive — right for a spend limit, whether it resets on a
+/// clock or when someone raises it. The omissions are equally deliberate:
+/// `serverOverloaded` is a transient the caller should retry, and an auth or
+/// request error is not "waiting for quota" at all — parking either would
+/// describe a run as waiting for something that is never coming. Widening this
+/// enum widens that promise, so [`Self::halts_the_run`] is an exhaustive match —
+/// a new variant has to state its policy rather than inherit one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnFailureKind {
+    UsageLimit,
+}
+
+impl TurnFailureKind {
+    /// Decode the wire string the Claude worker sends
+    /// (`claude-worker/sdk-mapping.mjs`). An unrecognised kind degrades to
+    /// `None`: a newer worker's classification must read as an ordinary failure,
+    /// never panic and never halt.
+    pub(crate) fn from_wire(kind: &str) -> Option<Self> {
+        match kind {
+            "usage_limit" => Some(Self::UsageLimit),
+            _ => None,
+        }
+    }
+
+    /// Whether this kind settles the run `Paused` rather than failing it.
+    pub(crate) fn halts_the_run(self) -> bool {
+        match self {
+            Self::UsageLimit => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ThreadRuntime {
     pub(crate) summary: Option<ThreadSummaryView>,
@@ -48,6 +125,14 @@ pub(crate) struct ThreadRuntime {
     pub(crate) pending_approvals: HashMap<String, PendingApproval>,
     pub(crate) pending_ask_user_questions: HashMap<String, PendingAskUserQuestion>,
     pub(crate) last_update_at: u64,
+    /// Set by the bridge at the same point it writes the transcript `Error`
+    /// entry (claude.rs/codex/rpc.rs); never cleared afterward — see
+    /// [`TurnFailure`] on why a reader must match `turn_id` rather than
+    /// presence alone.
+    pub(crate) last_turn_failure: Option<TurnFailure>,
+    /// Written by `RelayState::record_token_usage` for the turn it is billing;
+    /// never cleared — see [`TurnSpend`] on matching `turn_id`.
+    pub(crate) last_turn_spend: Option<TurnSpend>,
 }
 
 impl ThreadRuntime {
@@ -94,6 +179,8 @@ impl ThreadRuntime {
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
             workspace_missing: None,
+            last_turn_failure: None,
+            last_turn_spend: None,
         }
     }
 
@@ -132,6 +219,8 @@ impl ThreadRuntime {
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
             workspace_missing: None,
+            last_turn_failure: None,
+            last_turn_spend: None,
         }
     }
 
@@ -202,6 +291,8 @@ impl ThreadRuntime {
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
             workspace_missing: None,
+            last_turn_failure: None,
+            last_turn_spend: None,
         }
     }
 

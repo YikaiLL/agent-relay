@@ -31,7 +31,7 @@ use crate::{
     },
     state::{
         BrokerPendingMessage, PendingApproval, PendingTranscriptDelta, RelayState,
-        TranscriptDeltaKind,
+        TranscriptDeltaKind, TurnFailureKind,
     },
 };
 
@@ -1719,6 +1719,17 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                     // string (no provider content).
                     if let Some(reason) = claude_failed_turn_reason(&payload) {
                         let turn_id = completed_turn_id.or_else(|| event_turn_id.clone());
+                        // Truthful classification for team_turn (state/app/team.rs): a
+                        // failed terminal must stop reading as Silent. Matched there by
+                        // turn id, so only worth recording when we have one.
+                        if let Some(turn_id) = turn_id.clone() {
+                            relay.set_last_turn_failure(
+                                &tid,
+                                turn_id,
+                                claude_failed_turn_kind(&payload),
+                                reason.clone(),
+                            );
+                        }
                         relay.enqueue_error_push(&tid, reason.clone());
                         relay.upsert_transcript_item_for_thread(
                             &tid,
@@ -1759,6 +1770,16 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                     // snapshot). See the active-route note above.
                     if let Some(reason) = claude_failed_turn_reason(&payload) {
                         let turn_id = completed_turn_id.or_else(|| event_turn_id.clone());
+                        // See the active-route note above: truthful classification for
+                        // team_turn, matched there by turn id.
+                        if let Some(turn_id) = turn_id.clone() {
+                            relay.set_last_turn_failure(
+                                &thread_id,
+                                turn_id,
+                                claude_failed_turn_kind(&payload),
+                                reason.clone(),
+                            );
+                        }
                         relay.enqueue_error_push(&thread_id, reason.clone());
                         relay.bg_upsert_transcript_item(
                             &thread_id,
@@ -1849,6 +1870,22 @@ fn claude_failed_turn_reason(payload: &Value) -> Option<String> {
     )
 }
 
+/// The worker's `failure_kind`, decoded through [`TurnFailureKind`] — mirrors
+/// `claude_failed_turn_reason`'s guard. `None` covers a non-failure, a failure
+/// the worker left unclassified, and a kind a newer worker knows and we do not.
+fn claude_failed_turn_kind(payload: &Value) -> Option<TurnFailureKind> {
+    if !payload
+        .get("failed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    string_at(payload, &["failure_kind"])
+        .as_deref()
+        .and_then(TurnFailureKind::from_wire)
+}
+
 /// Stable per-turn id for the synthetic failure entry so a re-delivered terminal
 /// upserts (never duplicates) the same entry.
 fn claude_turn_error_item_id(turn_id: Option<&str>) -> String {
@@ -1902,7 +1939,23 @@ fn record_claude_turn_usage(
     let observation = relay.claude_usage.observe(&thread_id, payload);
     let (per_model, cost_usd) = match observation {
         Some(observation) => (observation.per_model, observation.cost_usd),
-        None if payload.get("model_usage").is_some() => return,
+        // `model_usage` was there and every per-model delta was ZERO. That is a
+        // reported figure of nothing, not a missing one — bill it as an explicit
+        // zero so the reviewer gate can tell the two apart. The funnel drops
+        // empty usage before the ledger, so no row is written either way.
+        None if payload.get("model_usage").is_some() => {
+            relay.record_token_usage(
+                &thread_id,
+                turn_id,
+                CLAUDE_PROVIDER_KEY,
+                crate::usage::TokenUsage::default(),
+                None,
+                None,
+                None,
+                failed,
+            );
+            return;
+        }
         None => (Vec::new(), cost_usd),
     };
 
@@ -2099,6 +2152,89 @@ fn thread_belongs_to_claude(relay: &RelayState, thread_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn relay_with_thread(thread_id: &str) -> std::sync::Arc<RwLock<RelayState>> {
+        let (change_tx, _) = tokio::sync::watch::channel(0_u64);
+        let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+            "/tmp/project".to_string(),
+            change_tx,
+            crate::state::SecurityProfile::private(),
+        )));
+        {
+            let mut relay = state.write().await;
+            relay.active_thread_id = Some(thread_id.to_string());
+            // The runtime the spend is recorded on; a bare id has none.
+            relay.set_thread_status(thread_id, "active".to_string(), Vec::new());
+        }
+        state
+    }
+
+    /// The PRODUCTION path for a zero-token Claude turn, parser included.
+    ///
+    /// `model_usage` present with every delta at zero used to return before the
+    /// usage funnel entirely, so the reviewer gate saw "no figure" and opened —
+    /// the exact bug the gate exists to close. A test that called
+    /// `record_token_usage` directly could not have caught it.
+    #[tokio::test]
+    async fn a_zero_token_claude_turn_records_a_zero_spend_not_an_absence() {
+        let state = relay_with_thread("thread-1").await;
+        let mut relay = state.write().await;
+        record_claude_turn_usage(
+            &mut relay,
+            &serde_json::json!({
+                "turn_id": "turn-1",
+                "model_usage": {
+                    "claude-opus-5": {
+                        "inputTokens": 0,
+                        "outputTokens": 0,
+                        "cacheReadInputTokens": 0,
+                        "cacheCreationInputTokens": 0,
+                    }
+                },
+            }),
+            Some("thread-1"),
+        );
+
+        let spend = relay
+            .last_turn_spend("thread-1")
+            .expect("a reported zero must leave a record, or it reads as no report");
+        assert_eq!(spend.turn_id, "turn-1");
+        assert_eq!(spend.billed, 0);
+    }
+
+    #[tokio::test]
+    async fn a_billed_claude_turn_records_what_it_spent() {
+        let state = relay_with_thread("thread-1").await;
+        let mut relay = state.write().await;
+        record_claude_turn_usage(
+            &mut relay,
+            &serde_json::json!({
+                "turn_id": "turn-1",
+                "model_usage": {
+                    "claude-opus-5": { "inputTokens": 120, "outputTokens": 40 }
+                },
+            }),
+            Some("thread-1"),
+        );
+
+        let spend = relay.last_turn_spend("thread-1").expect("a billed turn");
+        assert_eq!(spend.turn_id, "turn-1");
+        assert_eq!(spend.billed, 160);
+    }
+
+    /// A turn that reports NO usage block at all must leave no record, so the
+    /// gate takes its documented fallback instead of reading a phantom zero.
+    #[tokio::test]
+    async fn a_claude_turn_with_no_usage_block_records_nothing() {
+        let state = relay_with_thread("thread-1").await;
+        let mut relay = state.write().await;
+        record_claude_turn_usage(
+            &mut relay,
+            &serde_json::json!({ "turn_id": "turn-1" }),
+            Some("thread-1"),
+        );
+        assert!(relay.last_turn_spend("thread-1").is_none());
+    }
     use std::time::Duration;
 
     #[test]

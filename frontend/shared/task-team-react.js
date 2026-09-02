@@ -12,6 +12,9 @@ import { formatAttachmentBytes } from "./attachment-size.js";
 import { ConversationComposer } from "./composer.js";
 import { AgentWorkingIndicator } from "./conversation.js";
 import { createVerbCycler, progressPhaseLabel, VERB_CYCLE_MS } from "../progress-verbs.js";
+// The remote pair, not `app.js`'s private copies: these take an injectable
+// clock, which is the only reason a scheduled card is testable at a fixed hour.
+import { formatRelativeTime, formatTimestamp } from "../remote/utils.js";
 import { TranscriptPane } from "./transcript-pane.js";
 import {
   availableTeamActions,
@@ -236,6 +239,10 @@ export function OrchestratorPane({
   onPropose = null,
   onConfirmProposal = null,
   onDismissProposal = null,
+  onToggleProposalAutoStart = null,
+  // Injectable clock: a scheduled card renders a countdown, and a test that
+  // read the real one could not assert what it says.
+  nowSeconds = null,
   onReset = null,
   resetBusy = false,
   attachments = [],
@@ -372,6 +379,8 @@ export function OrchestratorPane({
               busy: composerBusy,
               onConfirm: onConfirmProposal,
               onDismiss: onDismissProposal,
+              onToggleAutoStart: onToggleProposalAutoStart,
+              nowSeconds,
             })
           )
         )
@@ -498,7 +507,60 @@ function ProposalAgentSummary({ agents }) {
   );
 }
 
-function OrchestratorProposalCard({ proposal, busy = false, onConfirm = null, onDismiss = null }) {
+/**
+ * How long until `startsAt`, or `null` once it has arrived.
+ *
+ * `formatRelativeTime` measures how long ago its first argument was, so the
+ * pair is swapped to measure forward. Its floor is the word "now", which is
+ * right for the past and lands as "in now" here — hence the explicit boundary
+ * at the minute, exactly where its own minute count takes over.
+ */
+function timeUntil(startsAt, now) {
+  const secondsAway = startsAt - now;
+  if (secondsAway <= 0) {
+    return null;
+  }
+  return secondsAway < 60 ? "under a minute" : formatRelativeTime(now, startsAt);
+}
+
+/**
+ * What this card's schedule actually promises, as one sentence.
+ *
+ * A timestamp on its own is ambiguous: the same "09:00" is a machine starting
+ * work unattended or a note beside a button someone still has to press.
+ * `auto_start` is the whole difference, so the two never share a sentence.
+ */
+function scheduleSentence(proposal, nowSeconds) {
+  const startsAt = Number(proposal?.scheduled_start_at) || 0;
+  const armed = Boolean(proposal?.auto_start);
+  if (!startsAt) {
+    // Reachable: the tool may stage `auto_start` with no `start_in_minutes`.
+    // Nothing fires without a time, so the card must not imply it will.
+    return armed ? "No start time, so it will not start on its own." : null;
+  }
+  const now = nowSeconds == null ? Math.floor(Date.now() / 1000) : Number(nowSeconds);
+  const stamp = formatTimestamp(startsAt);
+  const away = timeUntil(startsAt, now);
+  if (armed) {
+    return away
+      ? `Starts on its own in ${away}, on ${stamp}.`
+      : `Starts on its own — due now, ${stamp}.`;
+  }
+  return away
+    ? `Planned for ${stamp}, in ${away}. Waiting for you to press Start task.`
+    : `Planned for ${stamp}. Waiting for you to press Start task.`;
+}
+
+function OrchestratorProposalCard({
+  proposal,
+  busy = false,
+  onConfirm = null,
+  onDismiss = null,
+  onToggleAutoStart = null,
+  nowSeconds = null,
+}) {
+  const armed = Boolean(proposal.auto_start);
+  const schedule = scheduleSentence(proposal, nowSeconds);
   return h(
     "div",
     { className: "task-orch-card task-orch-proposal" },
@@ -536,6 +598,7 @@ function OrchestratorProposalCard({ proposal, busy = false, onConfirm = null, on
         )
       : null,
     h(ProposalAgentSummary, { agents: proposal.agents }),
+    schedule ? h("p", { className: "task-orch-card-note task-orch-card-schedule" }, schedule) : null,
     h(
       "div",
       { className: "task-orch-proposal-actions" },
@@ -548,6 +611,21 @@ function OrchestratorProposalCard({ proposal, busy = false, onConfirm = null, on
           onClick: () => onConfirm?.(proposal.id),
         },
         "Start task"
+      ),
+      // Quiet even when armed: solid is what "Start task" uses, and two accent
+      // buttons side by side would argue about which one starts the work. The
+      // tick carries the state, as it does for `ask-user-option`.
+      h(
+        "button",
+        {
+          type: "button",
+          className: "task-orch-card-action is-quiet task-orch-card-autostart",
+          "aria-pressed": armed,
+          disabled: busy || !onToggleAutoStart,
+          onClick: () => onToggleAutoStart?.(proposal.id, !armed),
+        },
+        armed ? h("span", { "aria-hidden": "true" }, "✓ ") : null,
+        "Start automatically"
       ),
       h(
         "button",
@@ -1363,6 +1441,7 @@ export function TaskTeamScreen({
         onPropose: orchestrator?.onPropose || null,
         onConfirmProposal: orchestrator?.onConfirmProposal || null,
         onDismissProposal: orchestrator?.onDismissProposal || null,
+        onToggleProposalAutoStart: orchestrator?.onToggleProposalAutoStart || null,
         onReset: orchestrator?.onReset || null,
         resetBusy: Boolean(orchestrator?.resetBusy),
         attachments: orchestrator?.attachments || [],

@@ -343,6 +343,7 @@ export function createSessionRenderer({
   tickTaskReviewFile,
   proposeOrchestratorTask,
   confirmOrchestratorProposal,
+  reviseOrchestratorProposal,
   dismissOrchestratorProposal,
   sendMessage,
   fetchTranscriptPage,
@@ -2304,6 +2305,8 @@ export function createSessionRenderer({
               onPropose: (text) => proposeFromOrchestratorDraft(text),
               onConfirmProposal: (proposalId) => confirmOrchestratorProposalCard(proposalId),
               onDismissProposal: (proposalId) => dismissOrchestratorProposalCard(proposalId),
+              onToggleProposalAutoStart: (proposalId, autoStart) =>
+                setOrchestratorProposalAutoStart(proposalId, autoStart),
               onReset: typeof resetOrchestrator === "function" ? () => restartOrchestrator() : null,
               resetBusy: Boolean(state.orchestratorResetting),
               attachments: (state.orchestratorImageAttachments || []).map((attachment) => ({
@@ -2675,6 +2678,7 @@ export function createSessionRenderer({
     sendMessage,
     proposeOrchestratorTask,
     confirmOrchestratorProposal,
+    reviseOrchestratorProposal,
     teamsCache,
     onOpenTask,
     // The Orchestrator has no composer node under it, so the failure `sendMessage`
@@ -2980,6 +2984,27 @@ export function createSessionRenderer({
     }
     try {
       await orchestratorChat.confirm(proposalId);
+    } catch (error) {
+      state.orchestratorSendError = error?.message || String(error);
+    } finally {
+      state.orchestratorProposalBusy = false;
+      if (state.session) {
+        renderTaskTeam(state.session);
+      }
+    }
+  }
+
+  async function setOrchestratorProposalAutoStart(proposalId, autoStart) {
+    if (!proposalId || typeof reviseOrchestratorProposal !== "function") {
+      return;
+    }
+    state.orchestratorProposalBusy = true;
+    state.orchestratorSendError = null;
+    if (state.session) {
+      renderTaskTeam(state.session);
+    }
+    try {
+      await orchestratorChat.revise(proposalId, { auto_start: Boolean(autoStart) });
     } catch (error) {
       state.orchestratorSendError = error?.message || String(error);
     } finally {

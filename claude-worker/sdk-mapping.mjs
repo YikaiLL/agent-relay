@@ -162,13 +162,9 @@ export function mapModelInfo(modelInfo, options = {}) {
 // (e.g. mythos) is a one-line data change here. See anthropics/claude-code#73333,
 // agentclientprotocol/claude-agent-acp#762.
 //
-// NOTE: a gated/out-of-credits account picking this model surfaces only as a
-// generic turn failure today — we deliberately do NOT map the SDK's
-// `rate_limit_event` (errorCode "credits_required") to a worker `error`, since
-// that event is log-only (stripped from broker-bound snapshots as non-remote-safe)
-// and the progress tracker treats `error` as a turn terminal, contradicting that
-// this event is not one. A real "credits required" UX needs the credits context
-// folded into the eventual failed `result`'s reason, not a bolted-on log line.
+// NOTE: a gated/out-of-credits account hitting a limit surfaces via
+// `rate_limit_event`, not the failed `result` itself — mapSdkMessage remembers
+// it and folds a `failure_kind` into `done` (see the `rate_limit_event` case).
 const EXTRA_MODEL_INFOS = [
   {
     value: "fable",
@@ -300,6 +296,20 @@ const FAILED_TURN_REASONS = {
   error_max_budget_usd: "reached the maximum budget",
   error_max_structured_output_retries: "exceeded the structured-output retry limit",
 };
+
+// Closed set for `done.failure_kind` — add to it only alongside a new classifier.
+export const FAILURE_KINDS = new Set(["usage_limit"]);
+
+// "rejected" or errorCode "credits_required" means this turn was actually
+// blocked; "allowed"/"allowed_warning" are informational only, not a failure.
+function rateLimitFailureKind(rateLimitInfo) {
+  if (!rateLimitInfo || typeof rateLimitInfo !== "object") return null;
+  if (rateLimitInfo.status === "rejected" || rateLimitInfo.errorCode === "credits_required") {
+    return "usage_limit";
+  }
+  return null;
+}
+
 /**
  * The accounting fields of an SDK `result` message.
  *
@@ -331,7 +341,12 @@ function turnAccounting(msg) {
   return out;
 }
 
-export function failedTurnReason(subtype) {
+export function failedTurnReason(subtype, failureKind) {
+  // Outranks subtype: the SDK has no dedicated subtype for this, so it would
+  // otherwise read as the generic "an error occurred during execution".
+  if (failureKind === "usage_limit") {
+    return "Claude turn failed: reached the usage limit";
+  }
   if (typeof subtype === "string" && subtype in FAILED_TURN_REASONS) {
     return `Claude turn failed: ${FAILED_TURN_REASONS[subtype]}`;
   }
@@ -394,8 +409,17 @@ export function mcpStatusLogLines(mcpServers) {
   return lines;
 }
 
-export function mapSdkMessage(msg) {
+// `turnState`: caller-owned, reused across one stream's messages (flushEvents
+// in worker.mjs) so a limit seen earlier can be folded into a later `done`.
+export function mapSdkMessage(msg, turnState = {}) {
   switch (msg.type) {
+    case "rate_limit_event": {
+      // Log-only (never its own event); remember our own closed classification
+      // of the latest one so a later failed `result` can attribute why.
+      turnState.failureKind = rateLimitFailureKind(msg.rate_limit_info);
+      return null;
+    }
+
     case "system": {
       if (msg.subtype === "init") {
         return {
@@ -534,21 +558,31 @@ export function mapSdkMessage(msg) {
       // Worker stderr is forwarded into the relay's GLOBAL logs, which ride every
       // snapshot to every paired device (broker.rs encrypts one snapshot for all
       // targets). Copying provider output here would leak a background thread's
-      // content to unrelated devices that have no path scope for it.
+      // content to unrelated devices that have no path scope for it. Same for
+      // `failure_kind`: our own label, never the SDK's `rate_limit_info` itself.
       const isError =
         msg.is_error === true ||
         (typeof msg.subtype === "string" && msg.subtype !== "success");
+      // Read then clear: scoped to this turn, must not leak into the next one.
+      const failureKind = turnState.failureKind ?? null;
+      turnState.failureKind = null;
       if (isError) {
-        // The sanitized, subtype-only reason rides BOTH the `error` event (for
-        // the operator log) AND the terminal `done` (`failed`/`reason`). The
-        // relay turns the failed `done` into a durable transcript failure entry
-        // — logs alone are insufficient, because operator-only logs are stripped
-        // from broker-bound snapshots, so a remote/mobile client would otherwise
-        // see a failed turn settle as a clean success.
-        const reason = failedTurnReason(msg.subtype);
+        // The sanitized reason rides BOTH the `error` event (for the operator
+        // log) AND the terminal `done` (`failed`/`reason`). The relay turns the
+        // failed `done` into a durable transcript failure entry — logs alone
+        // are insufficient, because operator-only logs are stripped from
+        // broker-bound snapshots, so a remote/mobile client would otherwise see
+        // a failed turn settle as a clean success.
+        const reason = failedTurnReason(msg.subtype, failureKind);
         return [
           { type: "error", message: reason },
-          { type: "done", ...turnAccounting(msg), failed: true, reason },
+          {
+            type: "done",
+            ...turnAccounting(msg),
+            failed: true,
+            reason,
+            ...(failureKind ? { failure_kind: failureKind } : {}),
+          },
         ];
       }
       return { type: "done", ...turnAccounting(msg) };

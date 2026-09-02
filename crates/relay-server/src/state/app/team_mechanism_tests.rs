@@ -53,6 +53,7 @@ fn team_input(cwd: &str) -> crate::state::app::team::TeamStartRequest {
         dev_effort: String::new(),
         reviewer_effort: String::new(),
         dev_agents: None,
+        starting_proposal_id: None,
         tl_provider: "codex".to_string(),
         dev_provider: "codex".to_string(),
         reviewer_provider: "codex".to_string(),
@@ -761,6 +762,57 @@ abandoned (interrupted: {interrupts:?})"
     );
 }
 
+/// The root-cause regression this whole task exists to fix: a Dev turn that
+/// STARTS, RUNS, and ends with a FAILED provider terminal must be reported
+/// `Failed`, not `Silent`. The failure lands as a transcript `Error` entry,
+/// never an `AgentText` one, so `latest_assistant_entry` cannot see it —
+/// `team_turn` (state/app/team.rs) must instead read the bridge's own
+/// `last_turn_failure` record (state/relay/runtime.rs), which claude.rs and
+/// codex/rpc.rs write at the same point they already write that Error entry.
+#[tokio::test]
+async fn a_dev_turn_that_ends_failed_is_reported_failed_not_silent() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    // Deliberately UNCLASSIFIED (`kind: None`): this test is only about the
+    // Silent-vs-Failed classification a plain provider failure gets, decoupled
+    // from the halt-the-run behavior a `usage_limit` kind now also triggers
+    // (see `a_dev_turn_that_hits_a_usage_limit_halts_the_run_before_any_review`
+    // in this same file) — conflating the two would make this assert on
+    // whichever one happened to change most recently.
+    providers
+        .get("codex")
+        .unwrap()
+        .fail_completed_turn_with
+        .lock()
+        .await
+        .replace(("the provider had an internal error".to_string(), None));
+    let observed = std::sync::Arc::new(Mutex::new(None));
+    let app = app.with_team_driver(std::sync::Arc::new(OneDevTurnDriver {
+        observed: observed.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    let (_sent_to, outcome) = observed
+        .lock()
+        .await
+        .clone()
+        .expect("the driver ran a dev turn");
+    match outcome {
+        relay_api::team::TeamTurnOutcome::Failed(reason) => {
+            assert!(
+                reason.contains("the provider had an internal error"),
+                "the failed turn's reason must say why: {reason}"
+            );
+        }
+        other => panic!(
+            "a turn that started, ran, and ended with a FAILED terminal must not read as \
+{other:?}"
+        ),
+    }
+}
+
 /// A run-owned thread — the design reviewer, the MR-gate reviewer, or the dev
 /// that addresses MR findings — must bill under the seat it was started as.
 #[tokio::test]
@@ -951,5 +1003,792 @@ async fn a_tl_turn_after_a_lost_runtime_still_runs_on_the_seats_model() {
         sent, "opus[1m]",
         "a TL turn must run on the seat's own model, never on whatever the user last \
 chatted with: {turn_models:?}"
+    );
+}
+
+/// Replays the private driver's dev-then-review sequence for one sub-task, far
+/// enough to exercise the provider-halt and reviewer-gate mechanisms this
+/// sub-task adds. Round bookkeeping (`rounds_used`/`Escalated`) is normally the
+/// PRIVATE driver's job; this fakes just enough of it (a NEEDS_CHANGES verdict
+/// every round) to prove the new gate does not interfere with a review loop
+/// that legitimately reaches `Escalated`.
+struct DevThenReviewDriver {
+    /// Set right after the dev turn, before the first reviewer attempt — models
+    /// a stop landing in exactly the window the driver would otherwise use to
+    /// start reviewing, ahead of its own next boundary check.
+    request_stop_before_review: bool,
+    /// How many reviewer turns to attempt. Zero skips reviewing (and starting
+    /// the reviewer thread) entirely — the sane thing a real driver does after
+    /// a dev turn that did not land.
+    reviewer_rounds: u32,
+    dev_outcome: std::sync::Arc<Mutex<Option<relay_api::team::TeamTurnOutcome>>>,
+    reviewer_outcomes: std::sync::Arc<Mutex<Vec<relay_api::team::TeamTurnOutcome>>>,
+}
+
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for DevThenReviewDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, port: std::sync::Arc<dyn relay_api::TeamPort>, run_id: String) {
+        let dev_thread = port
+            .start_thread(&run_id, relay_api::team::TeamRole::Dev)
+            .await
+            .expect("dev seat thread");
+        port.update_run(
+            &run_id,
+            Box::new(move |run| {
+                run.sub_tasks.push(crate::state::SubTask {
+                    id: "st-1".to_string(),
+                    dev_thread_id: Some(dev_thread),
+                    ..Default::default()
+                });
+            }),
+        )
+        .await;
+
+        let dev_outcome = port
+            .turn(
+                &run_id,
+                relay_api::team::TeamThreadSlot::SubTaskDev(0),
+                relay_api::team::TeamRole::Dev,
+                "write the parser",
+            )
+            .await;
+        *self.dev_outcome.lock().await = Some(dev_outcome);
+
+        if self.reviewer_rounds > 0 {
+            if self.request_stop_before_review {
+                // The flags a user's stop sets, without the full drain — the
+                // `PausePending` race window the reviewer gate exists for.
+                port.update_run(&run_id, Box::new(|run| run.request_stop("device-stop")))
+                    .await;
+            }
+
+            let reviewer_thread = port
+                .start_thread(&run_id, relay_api::team::TeamRole::Reviewer)
+                .await
+                .expect("reviewer seat thread");
+            port.update_run(
+                &run_id,
+                Box::new(move |run| {
+                    if let Some(task) = run.sub_tasks.get_mut(0) {
+                        task.reviewer_thread_id = Some(reviewer_thread);
+                    }
+                }),
+            )
+            .await;
+
+            for _ in 0..self.reviewer_rounds {
+                let outcome = port
+                    .turn(
+                        &run_id,
+                        relay_api::team::TeamThreadSlot::SubTaskReviewer(0),
+                        relay_api::team::TeamRole::Reviewer,
+                        "review it",
+                    )
+                    .await;
+                let refused = matches!(outcome, relay_api::team::TeamTurnOutcome::Failed(_));
+                self.reviewer_outcomes.lock().await.push(outcome);
+                if refused {
+                    break;
+                }
+                // A NEEDS_CHANGES verdict every round, exactly the shape that
+                // reaches `Escalated` once the round budget runs out.
+                port.update_run(
+                    &run_id,
+                    Box::new(|run| {
+                        if let Some(task) = run.sub_tasks.get_mut(0) {
+                            task.rounds_used += 1;
+                            if task.rounds_used >= relay_api::team::MAX_SUBTASK_REVIEW_ROUNDS {
+                                task.status = relay_api::team::SubTaskStatus::Escalated;
+                            }
+                        }
+                    }),
+                )
+                .await;
+            }
+        }
+
+        // Wrap up like `OneDevTurnDriver` does. A no-op when this run already
+        // settled itself (the provider halt, or a gate refusal) — every
+        // `TeamRun` mutator refuses once `is_settled_without_driver()` is true —
+        // and otherwise leaves a clean terminal instead of falling to the crash
+        // net's `Interrupted`.
+        port.settle_run(
+            &run_id,
+            crate::state::TeamRunStatus::Failed,
+            "test driver done",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_dev_turn_that_hits_a_usage_limit_halts_the_run_before_any_review() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .fail_completed_turn_with
+        .lock()
+        .await
+        .replace((
+            "Usage limit reached".to_string(),
+            Some("usage_limit".to_string()),
+        ));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 0,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    match dev_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => {
+            assert!(
+                reason.contains("Usage limit reached"),
+                "the dev turn's own reason should say so: {reason}"
+            );
+        }
+        other => panic!("the dev turn should have failed on the provider limit: {other:?}"),
+    }
+    assert!(
+        run.pause_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Usage limit reached")),
+        "pause_reason must name the limit, got {:?}",
+        run.pause_reason
+    );
+    assert_eq!(
+        run.pause_kind,
+        Some(relay_api::team::TeamPauseKind::Provider)
+    );
+    assert!(
+        reviewer_outcomes.lock().await.is_empty(),
+        "the reviewer thread must never be given a turn after a provider halt"
+    );
+    assert_eq!(run.sub_tasks[0].rounds_used, 0);
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
+}
+
+/// A kind from a worker NEWER than this build. It must decode to "no kind" and
+/// take the ordinary-failure path: every kind that halts settles the run
+/// `Paused` — resumable, and read by the user as "waiting for quota" — so an
+/// unrecognised one must never reach that path on the strength of being unknown.
+#[tokio::test]
+async fn an_unrecognised_failure_kind_fails_the_turn_without_pausing_the_run() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .fail_completed_turn_with
+        .lock()
+        .await
+        .replace((
+            "The provider rejected the request".to_string(),
+            Some("bad_request_v2".to_string()),
+        ));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 0,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    // Reaching `Failed` at all is the assertion: a halt would settle `Paused`
+    // first, and every later mutator — this one included — is then a no-op.
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    match dev_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => {
+            assert!(
+                reason.contains("The provider rejected the request"),
+                "the turn still fails, and still says why: {reason}"
+            );
+        }
+        other => panic!("an unclassified failure is still a failed turn: {other:?}"),
+    }
+    assert_eq!(
+        run.pause_kind, None,
+        "an unknown kind must not be read as a provider limit"
+    );
+}
+
+/// The same policy as the usage-limit halt, reached from Codex's OTHER session
+/// limit. Ending a session-budget failure terminally throws away the branch,
+/// the worktree and every finished sub-task; paused, they are all still there
+/// when the budget is raised.
+#[tokio::test]
+async fn a_dev_turn_that_exhausts_the_session_budget_halts_the_run_before_any_review() {
+    // Asserted, not assumed: the harness below speaks the Claude worker's wire
+    // string, so without this the test would ride the usage-limit path and
+    // prove nothing about Codex's session-budget variant.
+    let kind = crate::codex::codex_error_info_kind(&serde_json::json!("sessionBudgetExceeded"))
+        .expect("a session budget is a session limit and must be classified");
+    assert!(
+        kind.halts_the_run(),
+        "a classified session limit must pause the run rather than end it"
+    );
+
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .fail_completed_turn_with
+        .lock()
+        .await
+        .replace((
+            "Session budget exhausted".to_string(),
+            Some("usage_limit".to_string()),
+        ));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 0,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    match dev_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => {
+            assert!(
+                reason.contains("Session budget exhausted"),
+                "the dev turn's own reason should say so: {reason}"
+            );
+        }
+        other => panic!("the dev turn should have failed on the session budget: {other:?}"),
+    }
+    assert!(
+        run.pause_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Session budget exhausted")),
+        "pause_reason must name the limit, got {:?}",
+        run.pause_reason
+    );
+    assert_eq!(
+        run.pause_kind,
+        Some(relay_api::team::TeamPauseKind::Provider)
+    );
+    assert!(
+        reviewer_outcomes.lock().await.is_empty(),
+        "the reviewer thread must never be given a turn after a provider halt"
+    );
+    assert_eq!(
+        run.sub_tasks[0].rounds_used, 0,
+        "a paused run has spent no review budget"
+    );
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
+}
+
+/// `Replied` proves the agent SPOKE, not that it worked. A dev that answers
+/// "I couldn't do this" and spends nothing must not open the reviewer gate —
+/// otherwise a reviewer runs against an unchanged branch, burns both rounds and
+/// escalates, which is the false failure this whole feature exists to stop.
+#[tokio::test]
+async fn a_dev_turn_that_replies_but_bills_nothing_leaves_the_gate_shut() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    // The provider reports a figure, and that figure is zero.
+    providers
+        .get("codex")
+        .unwrap()
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((0, None));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    // A gate refusal settles the run `Paused` at a boundary, the same terminal
+    // `a_reviewer_turn_is_refused_without_a_landed_dev_turn` waits for.
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    assert!(
+        matches!(
+            dev_outcome.lock().await.clone(),
+            Some(relay_api::team::TeamTurnOutcome::Replied(_))
+        ),
+        "the premise: the dev DID reply, it just did no work"
+    );
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 0,
+        "a turn that billed nothing has not landed"
+    );
+    match reviewer_outcomes.lock().await.first() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => assert!(
+            reason.contains("no landed dev turn"),
+            "the reviewer must be refused by the gate: {reason}"
+        ),
+        other => panic!("the reviewer must not run against an unchanged branch: {other:?}"),
+    }
+    assert_eq!(
+        run.sub_tasks[0].rounds_used, 0,
+        "no review budget was spent"
+    );
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
+}
+
+/// The other half: real spend opens the gate, so ordinary work still reviews.
+#[tokio::test]
+async fn a_dev_turn_that_bills_tokens_opens_the_reviewer_gate() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((1_200, None));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 1,
+        "a turn that billed tokens has landed"
+    );
+    assert!(
+        !matches!(
+            reviewer_outcomes.lock().await.first(),
+            Some(relay_api::team::TeamTurnOutcome::Failed(reason)) if reason.contains("no landed dev turn")
+        ),
+        "the gate must not refuse a dev turn that really spent"
+    );
+}
+
+/// The FALLBACK, pinned so it can never become a silent one. Not every path
+/// reports usage; requiring a figure would refuse every reviewer turn forever
+/// on such a provider and deadlock the run. No figure means the old `Replied`
+/// rule stands.
+#[tokio::test]
+async fn a_dev_turn_with_no_usage_figure_at_all_still_counts_as_landed() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    // Deliberately NOT setting `report_turn_usage`: nothing is reported.
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+    let _ = &providers;
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 1,
+        "with no figure to judge by, a reply still lands"
+    );
+}
+
+/// The record is never cleared, so a reader that checked mere presence would let
+/// an EARLIER turn's figure decide this one. A leftover zero must not shut the
+/// gate on a turn that reported nothing of its own.
+#[tokio::test]
+async fn a_spend_figure_from_another_turn_does_not_shut_the_gate() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    // Zero tokens, billed against a turn id this run never dispatched.
+    providers
+        .get("codex")
+        .unwrap()
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((0, Some("turn-from-an-earlier-life".to_string())));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 1,
+        "a figure for a different turn is not this turn's evidence"
+    );
+}
+
+#[tokio::test]
+async fn a_reviewer_turn_is_refused_without_a_landed_dev_turn() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    // The dev turn completes (active turn clears, thread goes idle) but emits no
+    // assistant message at all — the `Silent` shape, not a failure. This must
+    // NOT count as landed, or the gate this test exists to pin would never fire
+    // for the very case the brief calls out.
+    providers
+        .get("codex")
+        .unwrap()
+        .emit_assistant
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    assert!(
+        matches!(
+            dev_outcome.lock().await.clone(),
+            Some(relay_api::team::TeamTurnOutcome::Silent)
+        ),
+        "the dev turn must land nothing (Silent) — not fail — to exercise the \
+zero-landed gate rather than the provider-halt one"
+    );
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 0,
+        "a Silent dev turn must not count as landed"
+    );
+    let reviewer_outcomes = reviewer_outcomes.lock().await.clone();
+    assert_eq!(reviewer_outcomes.len(), 1);
+    assert!(
+        matches!(
+            reviewer_outcomes[0],
+            relay_api::team::TeamTurnOutcome::Failed(_)
+        ),
+        "a reviewer turn with nothing landed to review must be refused: {:?}",
+        reviewer_outcomes[0]
+    );
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated,
+        "a refused reviewer turn must never escalate the sub-task"
+    );
+}
+
+#[tokio::test]
+async fn a_stop_mid_run_refuses_the_next_reviewer_turn() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: true,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    assert!(
+        matches!(
+            dev_outcome.lock().await.clone(),
+            Some(relay_api::team::TeamTurnOutcome::Replied(_))
+        ),
+        "the dev turn itself must land normally; only the reviewer turn after \
+the stop is refused"
+    );
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 1,
+        "the refusal must be attributable to the stop, not to a missing dev turn"
+    );
+    let reviewer_outcomes = reviewer_outcomes.lock().await.clone();
+    assert_eq!(reviewer_outcomes.len(), 1);
+    assert!(
+        matches!(
+            reviewer_outcomes[0],
+            relay_api::team::TeamTurnOutcome::Failed(_)
+        ),
+        "a reviewer turn requested while stopping must be refused: {:?}",
+        reviewer_outcomes[0]
+    );
+    assert_eq!(
+        run.sub_tasks[0].rounds_used, 0,
+        "a refused round must never be counted against the review budget"
+    );
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
+}
+
+/// Drives a landed Dev turn, then waits to be released before attempting the
+/// Reviewer turn — giving a test full control over exactly when that second
+/// turn starts, so it can arrange a stop to land in the specific window
+/// between the reviewer gate's early check and the drive gate.
+struct RaceWindowDriver {
+    dev_outcome: std::sync::Arc<Mutex<Option<relay_api::team::TeamTurnOutcome>>>,
+    reviewer_outcome: std::sync::Arc<Mutex<Option<relay_api::team::TeamTurnOutcome>>>,
+    dev_landed: std::sync::Arc<tokio::sync::Notify>,
+    proceed_to_reviewer: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for RaceWindowDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, port: std::sync::Arc<dyn relay_api::TeamPort>, run_id: String) {
+        let dev_thread = port
+            .start_thread(&run_id, relay_api::team::TeamRole::Dev)
+            .await
+            .expect("dev seat thread");
+        port.update_run(
+            &run_id,
+            Box::new(move |run| {
+                run.sub_tasks.push(crate::state::SubTask {
+                    id: "st-1".to_string(),
+                    dev_thread_id: Some(dev_thread),
+                    ..Default::default()
+                });
+            }),
+        )
+        .await;
+        let dev_outcome = port
+            .turn(
+                &run_id,
+                relay_api::team::TeamThreadSlot::SubTaskDev(0),
+                relay_api::team::TeamRole::Dev,
+                "write the parser",
+            )
+            .await;
+        *self.dev_outcome.lock().await = Some(dev_outcome);
+        // The dev turn's own `dev_turns_landed` bump has already happened by
+        // now — it runs before `team_turn` returns, and this await only
+        // resolves once that call has returned.
+        self.dev_landed.notify_one();
+        self.proceed_to_reviewer.notified().await;
+
+        let reviewer_thread = port
+            .start_thread(&run_id, relay_api::team::TeamRole::Reviewer)
+            .await
+            .expect("reviewer seat thread");
+        port.update_run(
+            &run_id,
+            Box::new(move |run| {
+                if let Some(task) = run.sub_tasks.get_mut(0) {
+                    task.reviewer_thread_id = Some(reviewer_thread);
+                }
+            }),
+        )
+        .await;
+        let reviewer_outcome = port
+            .turn(
+                &run_id,
+                relay_api::team::TeamThreadSlot::SubTaskReviewer(0),
+                relay_api::team::TeamRole::Reviewer,
+                "review it",
+            )
+            .await;
+        *self.reviewer_outcome.lock().await = Some(reviewer_outcome);
+        port.settle_run(
+            &run_id,
+            crate::state::TeamRunStatus::Failed,
+            "test driver done",
+        )
+        .await;
+    }
+}
+
+/// [P1 fix] The early reviewer-gate check (before any thread is resolved) is
+/// NOT sufficient by itself: `team_turn` still has to resolve the thread,
+/// write the phase note, and reach `team_drive_gate` before it can dispatch —
+/// and a stop's `request_stop` sets its flags without ever taking that gate,
+/// so it can land in exactly that window. This pins that the gate is
+/// REPEATED once `team_drive_gate` is held, using the existing pre-gate latch
+/// (`hold_team_turn_barrier`) to land the stop deterministically rather than
+/// racing real wall-clock timing.
+#[tokio::test]
+async fn a_stop_landing_between_the_reviewer_gates_early_check_and_the_drive_gate_is_still_caught()
+{
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcome = std::sync::Arc::new(Mutex::new(None));
+    let dev_landed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let proceed_to_reviewer = std::sync::Arc::new(tokio::sync::Notify::new());
+    let app = app.with_team_driver(std::sync::Arc::new(RaceWindowDriver {
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcome: reviewer_outcome.clone(),
+        dev_landed: dev_landed.clone(),
+        proceed_to_reviewer: proceed_to_reviewer.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    // The dev turn has landed (and bumped `dev_turns_landed`) by the time this
+    // resolves; the driver is now parked before even starting the reviewer
+    // thread, so `team_turn_barrier` is uncontended.
+    dev_landed.notified().await;
+
+    let before = app.team_turn_arrivals();
+    let latch = app.hold_team_turn_barrier().await;
+    // Release the driver NOW, while we hold the latch: its reviewer turn's
+    // early check runs and PASSES (dev_turns_landed is 1, nothing pausing
+    // yet), then it parks on the latch we are holding — never reaching
+    // `team_drive_gate` until we say so.
+    proceed_to_reviewer.notify_one();
+
+    for _ in 0..2_000 {
+        if app.team_turn_arrivals() > before {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        app.team_turn_arrivals() > before,
+        "the reviewer turn should have reached the pre-gate latch by now"
+    );
+
+    // The stop lands in exactly the window the early check cannot see: past
+    // its own check (already passed), not yet holding the drive gate.
+    app.relay
+        .write()
+        .await
+        .update_team_run(&run_id, |run| run.request_stop("device-stop"));
+    drop(latch);
+
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    assert!(
+        matches!(
+            dev_outcome.lock().await.clone(),
+            Some(relay_api::team::TeamTurnOutcome::Replied(_))
+        ),
+        "the dev turn itself must land normally"
+    );
+    match reviewer_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(_)) => {}
+        other => panic!(
+            "a stop landing between the reviewer turn's early check and the \
+drive gate must still refuse it, not merely a stop that lands before the \
+early check runs at all: {other:?}"
+        ),
+    }
+    assert_eq!(
+        run.sub_tasks[0].rounds_used, 0,
+        "a refused round must never be counted against the review budget"
+    );
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
+}
+
+/// Regression: the new gate must not weaken the ordinary path. A dev turn that
+/// lands, followed by a reviewer that rejects it twice, must still reach
+/// `Escalated` exactly as it did before this sub-task.
+#[tokio::test]
+async fn a_landed_dev_turn_and_two_reviewer_rejections_still_escalate() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: crate::state::MAX_SUBTASK_REVIEW_ROUNDS,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    let reviewer_outcomes = reviewer_outcomes.lock().await.clone();
+    assert_eq!(
+        reviewer_outcomes.len(),
+        crate::state::MAX_SUBTASK_REVIEW_ROUNDS as usize,
+        "both review rounds must actually run: {reviewer_outcomes:?}"
+    );
+    for outcome in &reviewer_outcomes {
+        assert!(
+            !matches!(outcome, relay_api::team::TeamTurnOutcome::Failed(_)),
+            "a landed dev turn must not have its reviewer refused: {outcome:?}"
+        );
+    }
+    let relay = app.relay.read().await;
+    let run = relay
+        .team_run(&run_id)
+        .cloned()
+        .expect("run still recorded");
+    assert_eq!(
+        run.sub_tasks[0].rounds_used,
+        crate::state::MAX_SUBTASK_REVIEW_ROUNDS
+    );
+    assert_eq!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
     );
 }

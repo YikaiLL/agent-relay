@@ -3963,3 +3963,128 @@ async fn a_native_fork_sends_the_resolved_model_to_the_provider() {
     );
     assert_eq!(fork["params"]["threadId"], "thread-src");
 }
+
+// Which Codex failures are LIMITS — the ones that pause a task run instead of
+// ending it. A pause is resumable, so the branch, worktree and sub-task
+// progress survive until the limit lifts; an ordinary failure throws them away.
+#[test]
+fn codex_classifies_both_session_limits_and_nothing_else() {
+    for limit in ["usageLimitExceeded", "sessionBudgetExceeded"] {
+        assert_eq!(
+            codex_error_info_kind(&json!(limit)),
+            Some(TurnFailureKind::UsageLimit),
+            "{limit:?} is a session limit and must pause the run, not end it"
+        );
+        // The same variant arrives object-wrapped too, and this mapper reads
+        // both — a classification that depended on the shape would be a
+        // coin-flip on whichever form the provider happened to send.
+        assert_eq!(
+            codex_error_info_kind(&json!({ limit: {} })),
+            Some(TurnFailureKind::UsageLimit),
+            "{limit:?} must classify the same object-wrapped as bare"
+        );
+    }
+
+    // A transient, not a limit. Pausing would park the run as "waiting for
+    // quota" when the answer is simply to try again.
+    for ordinary in [
+        "serverOverloaded",
+        "contextWindowExceeded",
+        "unauthorized",
+        "badRequest",
+        "internalServerError",
+        "other",
+        "someUnknownFutureVariant",
+    ] {
+        assert_eq!(
+            codex_error_info_kind(&json!(ordinary)),
+            None,
+            "{ordinary:?} must stay an ordinary failure"
+        );
+        assert_eq!(codex_error_info_kind(&json!({ ordinary: {} })), None);
+    }
+}
+
+/// The PRODUCTION path for a zero-token Codex turn, parser included.
+///
+/// The reviewer gate keys on `last_turn_spend`, and a test that called
+/// `record_token_usage` directly would have proved nothing here: the tracker
+/// used to swallow an all-zero delta before the funnel ever saw it, so a real
+/// zero reply reached the gate as "no figure" and opened it.
+#[tokio::test]
+async fn a_zero_token_codex_turn_records_a_zero_spend_not_an_absence() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("thread-1".to_string());
+        // The runtime the spend is recorded on; a bare id has none.
+        relay.set_thread_status("thread-1", "active".to_string(), Vec::new());
+    }
+
+    handle_notification(
+        json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "last": { "totalTokens": 0 },
+                    "total": { "totalTokens": 0 },
+                }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    let spend = relay
+        .last_turn_spend("thread-1")
+        .expect("a reported zero must leave a record, or it reads as no report");
+    assert_eq!(spend.turn_id, "turn-1");
+    assert_eq!(spend.billed, 0);
+}
+
+/// The other side of the same seam: real tokens are recorded against the turn
+/// that spent them.
+#[tokio::test]
+async fn a_billed_codex_turn_records_what_it_spent() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("thread-1".to_string());
+        // The runtime the spend is recorded on; a bare id has none.
+        relay.set_thread_status("thread-1", "active".to_string(), Vec::new());
+    }
+
+    handle_notification(
+        json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "last": { "inputTokens": 10, "outputTokens": 5, "totalTokens": 15 },
+                    "total": { "inputTokens": 10, "outputTokens": 5, "totalTokens": 15 },
+                }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    let spend = relay.last_turn_spend("thread-1").expect("a billed turn");
+    assert_eq!(spend.turn_id, "turn-1");
+    assert!(spend.billed > 0, "got {}", spend.billed);
+}

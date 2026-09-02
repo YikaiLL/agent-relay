@@ -22,7 +22,7 @@ use crate::{
 
 use super::{
     ensure_path_within_device_scope, persistence::PersistedRelayState, unix_now, ReviewJob,
-    RunStatus, SecurityProfile, TeamRun, TeamRunStatus, TeamThreadGate, WorkflowRun,
+    RunStatus, SecurityProfile, TeamPauseKind, TeamRun, TeamRunStatus, TeamThreadGate, WorkflowRun,
     CONTROLLER_LEASE_SECS, DEFAULT_APPROVAL_POLICY, DEFAULT_EFFORT, DEFAULT_MODEL, DEFAULT_SANDBOX,
     STALE_TURN_PROGRESS_TIMEOUT_SECS,
 };
@@ -38,7 +38,7 @@ pub(crate) use self::push::{
     is_acceptable_push_endpoint, load_or_generate_vapid, vapid_key_path, PushAttentionTracker,
     PushDispatcher, PushJob, PushKind, PushSubscription, PushSubscriptionInput,
 };
-pub(crate) use self::runtime::ThreadRuntime;
+pub(crate) use self::runtime::{ThreadRuntime, TurnFailure, TurnFailureKind, TurnSpend};
 pub(crate) use self::transcript::TranscriptRecord;
 
 const REMOTE_ACTION_REPLAY_TTL_SECS: u64 = 600;
@@ -514,6 +514,10 @@ pub struct RelayState {
     /// Pending Orchestrator proposals (M4 propose/confirm). Persisted so a
     /// restart does not wipe a card the user was about to confirm.
     pub(super) orchestrator_proposals: Vec<crate::protocol::OrchestratorProposalView>,
+    /// Scheduled cards claimed by the watchdog and not yet started: off the list
+    /// above (so nothing shows or fires twice) but still saved, because a crash
+    /// while the worktree is provisioned would otherwise lose the schedule.
+    pub(super) starting_scheduled_proposals: Vec<crate::protocol::OrchestratorProposalView>,
     /// Web Push subscriptions for remote devices, keyed by `device_id` (a device
     /// can have several browser subscriptions; deduped by endpoint). Persisted so
     /// a closed/locked phone keeps receiving pushes across a relay restart.
@@ -631,6 +635,7 @@ impl RelayState {
             orchestrator_system_prompt: None,
             orchestrator_system_prompt_version: None,
             orchestrator_proposals: Vec::new(),
+            starting_scheduled_proposals: Vec::new(),
             push_subscriptions: HashMap::new(),
             push_tx: None,
             push_vapid_public_key: None,
@@ -907,6 +912,69 @@ impl RelayState {
 
     pub(crate) fn runtime_for_thread(&self, thread_id: &str) -> Option<&ThreadRuntime> {
         self.runtimes.get(thread_id)
+    }
+
+    /// Record a bridge's sanitized classification of a turn that ended failed.
+    /// Never cleared — callers must match `turn_id`, not presence (see
+    /// [`TurnFailure`]).
+    pub(crate) fn set_last_turn_failure(
+        &mut self,
+        thread_id: &str,
+        turn_id: String,
+        kind: Option<TurnFailureKind>,
+        reason: String,
+    ) {
+        if let Some(runtime) = self.runtimes.get_mut(thread_id) {
+            runtime.last_turn_failure = Some(TurnFailure {
+                turn_id,
+                kind,
+                reason,
+            });
+        }
+    }
+
+    pub(crate) fn last_turn_failure(&self, thread_id: &str) -> Option<&TurnFailure> {
+        self.runtime_for_thread(thread_id)
+            .and_then(|runtime| runtime.last_turn_failure.as_ref())
+    }
+
+    /// Note what a provider said one turn cost. See [`TurnSpend`] — the record
+    /// exists so a reader can tell a reported zero from no report at all.
+    ///
+    /// ACCUMULATES within a turn: both bridges report more than once per turn
+    /// (Claude per model, Codex per model request), so overwriting would let a
+    /// later zero erase spend already reported for the same turn.
+    fn note_turn_spend(
+        &mut self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        usage: &crate::usage::TokenUsage,
+    ) {
+        // Usage with no turn id cannot be matched to a dispatched turn, and a
+        // reader that cannot match must fall back rather than guess.
+        let Some(turn_id) = turn_id else {
+            return;
+        };
+        let billed = usage.total.max(usage.sum_of_parts());
+        let Some(runtime) = self.runtimes.get_mut(thread_id) else {
+            return;
+        };
+        match runtime.last_turn_spend.as_mut() {
+            Some(spend) if spend.turn_id == turn_id => {
+                spend.billed = spend.billed.saturating_add(billed);
+            }
+            _ => {
+                runtime.last_turn_spend = Some(TurnSpend {
+                    turn_id: turn_id.to_string(),
+                    billed,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn last_turn_spend(&self, thread_id: &str) -> Option<&TurnSpend> {
+        self.runtime_for_thread(thread_id)
+            .and_then(|runtime| runtime.last_turn_spend.as_ref())
     }
 
     pub(crate) fn thread_turn_revision(&self, thread_id: &str) -> u64 {
@@ -2087,6 +2155,11 @@ impl RelayState {
         model_hint: Option<String>,
         failed: bool,
     ) {
+        // BEFORE the empty-usage return below, on purpose. "The provider said
+        // zero" and "the provider said nothing" are different facts, and the
+        // reviewer gate has to tell them apart; dropping the zero here would
+        // collapse them back together.
+        self.note_turn_spend(thread_id, turn_id.as_deref(), &usage);
         if usage.is_empty() {
             return;
         }
@@ -2517,12 +2590,16 @@ impl RelayState {
                 let mut run = run.clone();
                 match run.status {
                     TeamRunStatus::PausePending => {
-                        run.settle_paused("the relay restarted while the team was pausing");
+                        run.settle_paused(
+                            "the relay restarted while the team was pausing",
+                            TeamPauseKind::Boundary,
+                        );
                     }
                     TeamRunStatus::AwaitingUser => {
                         run.rollback_current_round();
                         run.settle_paused(
                             "the relay restarted while the team was waiting on your answer; that step will be re-run",
+                            TeamPauseKind::Boundary,
                         );
                     }
                     _ => {

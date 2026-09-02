@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { createOrchestratorChatActions } from "./orchestrator-chat.js";
 
 function harness(overrides = {}) {
-  const calls = { send: [], propose: [], confirm: [], openTask: [], invalidate: 0 };
+  const calls = { send: [], propose: [], confirm: [], revise: [], openTask: [], invalidate: 0 };
   const state = { session: { orchestrator_proposals: [] } };
   const actions = createOrchestratorChatActions({
     state,
@@ -19,6 +19,10 @@ function harness(overrides = {}) {
     confirmOrchestratorProposal: async (id) => {
       calls.confirm.push(id);
       return { team_run_id: "run-1" };
+    },
+    reviseOrchestratorProposal: async (id, updates) => {
+      calls.revise.push([id, updates]);
+      return { proposal: { id, title: "Add a parser", ...updates } };
     },
     teamsCache: {
       invalidate: () => {
@@ -155,4 +159,35 @@ test("send forwards attached images, and an image alone is enough to send", asyn
   assert.deepEqual(calls[0].images, [{ data_url: "data:image/png;base64,AAA" }]);
   assert.equal(calls[1].text, "");
   assert.deepEqual(calls[1].images, [{ data_url: "data:image/png;base64,BBB" }]);
+});
+
+// Arming a card is an edit, not a start. It goes through the same staging the
+// propose path uses, so the card redraws from what the relay stored.
+test("arming a staged card updates it in place and starts nothing", async () => {
+  const { actions, calls, state } = harness();
+  state.session.orchestrator_proposals = [
+    { id: "prop-1", title: "Add a parser", auto_start: false },
+  ];
+
+  const receipt = await actions.revise("prop-1", { auto_start: true });
+
+  assert.deepEqual(calls.revise, [["prop-1", { auto_start: true }]]);
+  assert.deepEqual(calls.confirm, [], "revising must never start a run");
+  assert.deepEqual(calls.openTask, [], "and must not navigate into one");
+  assert.equal(receipt.proposal.auto_start, true);
+  assert.deepEqual(
+    state.session.orchestrator_proposals,
+    [{ id: "prop-1", title: "Add a parser", auto_start: true }],
+    "the staged card is replaced, not duplicated",
+  );
+});
+
+test("revising without a backing call does nothing at all", async () => {
+  const { actions, state } = harness({ reviseOrchestratorProposal: undefined });
+  state.session.orchestrator_proposals = [{ id: "prop-1", auto_start: false }];
+
+  assert.equal(await actions.revise("prop-1", { auto_start: true }), null);
+  assert.deepEqual(state.session.orchestrator_proposals, [
+    { id: "prop-1", auto_start: false },
+  ]);
 });

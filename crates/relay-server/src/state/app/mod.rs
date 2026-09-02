@@ -77,6 +77,10 @@ fn spawn_push_attention_task(relay: Arc<RwLock<RelayState>>, mut receiver: watch
     });
 }
 
+/// Scheduled-proposal watchdog tick. Matches the stale-turn watchdog beside it;
+/// it is the worst-case lateness of a start, not a deadline.
+const SCHEDULED_PROPOSAL_TICK_MS: u64 = 15_000;
+
 /// Error returned when a user op targets a thread that a non-terminal review
 /// currently owns (its parent or reviewer thread). Such a thread is frozen for
 /// send/stop while the review runs in the background; every OTHER thread stays
@@ -100,9 +104,9 @@ pub struct AppState {
     /// which is why the guards below need no `cfg` and the public repo compiles
     /// and runs untouched.
     orchestrators: relay_api::Orchestrators,
-    /// The private task workflow runner and sole product registration point.
-    /// `None` in a public build: task starts refuse before any work begins.
-    team_driver: Option<Arc<dyn relay_api::TeamDriver>>,
+    /// The private workflow runner, `None` in a public build. Clone-shared so
+    /// install order cannot matter; not a `OnceLock` — tests replace it.
+    team_driver: Arc<std::sync::Mutex<Option<Arc<dyn relay_api::TeamDriver>>>>,
     /// Line-comment anchor re-location. Public builds use
     /// [`crate::usage::review_anchors::UnavailableReviewAnchors`].
     review_anchors: Arc<dyn relay_api::ReviewAnchors>,
@@ -152,6 +156,9 @@ pub struct AppState {
     /// every scrap of progress and FREEZES entirely while a turn is parked on a
     /// user's question. Overridable in tests.
     team_step_stall_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// How often the scheduled-proposal watchdog looks for a due card. 15s in
+    /// production; shrunk by tests, which cannot wait on the real one.
+    scheduled_proposal_tick_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Serializes the two things that must never interleave for a task team:
     /// STARTING a turn on one of its threads, and CHANGING whether the run may be
     /// driven at all.
@@ -356,7 +363,7 @@ impl AppState {
         Self {
             relay,
             orchestrators: relay_api::Orchestrators::default(),
-            team_driver: None,
+            team_driver: Arc::new(std::sync::Mutex::new(None)),
             review_anchors: Arc::new(crate::usage::review_anchors::UnavailableReviewAnchors),
             providers,
             provider_model_catalogs: Arc::new(RwLock::new(HashMap::new())),
@@ -392,6 +399,9 @@ impl AppState {
             #[cfg(test)]
             workspace_resolve_writeback_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
+            scheduled_proposal_tick_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                SCHEDULED_PROPOSAL_TICK_MS,
+            )),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -518,7 +528,7 @@ impl AppState {
         let state = Self {
             relay,
             orchestrators: relay_api::Orchestrators::default(),
-            team_driver: None,
+            team_driver: Arc::new(std::sync::Mutex::new(None)),
             review_anchors: Arc::new(crate::usage::review_anchors::UnavailableReviewAnchors),
             providers,
             provider_model_catalogs: Arc::new(RwLock::new(HashMap::new())),
@@ -554,6 +564,9 @@ impl AppState {
             #[cfg(test)]
             workspace_resolve_writeback_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
+            scheduled_proposal_tick_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                SCHEDULED_PROPOSAL_TICK_MS,
+            )),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -682,6 +695,43 @@ impl AppState {
                 app.stop_stale_turns_at(unix_now()).await;
             }
         });
+    }
+
+    /// One place where startup's background loops begin, so `main` and the tests
+    /// compose it alike. Placement is free: the team driver is clone-shared.
+    pub(crate) fn spawn_configured_watchdogs(&self) {
+        self.spawn_scheduled_proposal_watchdog();
+    }
+
+    /// Fires scheduled proposal cards. The due decision lives in
+    /// `start_due_scheduled_proposals_at`, which takes `now` so tests can
+    /// choose it — this loop only supplies the wall clock.
+    ///
+    /// Reached only through [`AppState::spawn_configured_watchdogs`], which is
+    /// what owns the "not before configuration" rule.
+    fn spawn_scheduled_proposal_watchdog(&self) {
+        let app = self.clone();
+        // Read once, at spawn: a test shrinks it before spawning, and an
+        // interval's period is fixed when it is built.
+        let period = Duration::from_millis(
+            app.scheduled_proposal_tick_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1),
+        );
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(period);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                app.start_due_scheduled_proposals_at(unix_now()).await;
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_scheduled_proposal_tick_ms(&self, ms: u64) {
+        self.scheduled_proposal_tick_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn stop_stale_turns_at(&self, now: u64) {
@@ -871,9 +921,12 @@ in thread {thread_id}: {error}"
         &self.orchestrators
     }
 
-    /// Install the private workflow runner. Call once before sharing the state.
-    pub fn with_team_driver(mut self, driver: Arc<dyn relay_api::TeamDriver>) -> Self {
-        self.team_driver = Some(driver);
+    /// Install the private workflow runner. Writes through the shared cell, so
+    /// clones taken before this call see it too.
+    pub fn with_team_driver(self, driver: Arc<dyn relay_api::TeamDriver>) -> Self {
+        if let Ok(mut slot) = self.team_driver.lock() {
+            *slot = Some(driver);
+        }
         self
     }
 
@@ -886,9 +939,15 @@ in thread {thread_id}: {error}"
         self
     }
 
+    /// The installed workflow runner, if this build has one. Cloned out rather
+    /// than borrowed: the guard must not be held across an await.
+    pub(crate) fn team_driver(&self) -> Option<Arc<dyn relay_api::TeamDriver>> {
+        self.team_driver.lock().ok()?.clone()
+    }
+
     /// Whether this build has the private workflow runner.
     pub(crate) fn has_team_driver(&self) -> bool {
-        self.team_driver.is_some()
+        self.team_driver().is_some()
     }
 
     /// Unlock in-development features. Call once at startup, before the state is shared.

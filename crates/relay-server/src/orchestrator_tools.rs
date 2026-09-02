@@ -135,6 +135,11 @@ pub(crate) enum ParamKind {
     Object,
     /// List of strings → JSON Schema `array` of `string`.
     TextList,
+    /// JSON `true`/`false`. Not text: the model sends a bare bool whatever the
+    /// schema says, and `parse_call` rejects a shape it was not told to expect.
+    Bool,
+    /// JSON whole number, same reasoning as [`ParamKind::Bool`].
+    Integer,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -165,6 +170,8 @@ impl ToolSpec {
                 ParamKind::OneOf(options) => json!({ "type": "string", "enum": options }),
                 ParamKind::Object => json!({ "type": "object" }),
                 ParamKind::TextList => json!({ "type": "array", "items": { "type": "string" } }),
+                ParamKind::Bool => json!({ "type": "boolean" }),
+                ParamKind::Integer => json!({ "type": "integer" }),
             };
             entry["description"] = Value::String(param.summary.to_string());
             properties.insert(param.name.to_string(), entry);
@@ -245,6 +252,20 @@ your own choice.",
                 summary: "Per-seat exceptions, keyed tl/dev/reviewer, each any of \
 provider/model/effort. Overrides only the fields it names.",
             },
+            ToolParam {
+                name: "auto_start",
+                kind: ParamKind::Bool,
+                required: false,
+                summary: "Let the card confirm itself when its start time arrives. \
+Default false — the user confirms by hand.",
+            },
+            ToolParam {
+                name: "start_in_minutes",
+                kind: ParamKind::Integer,
+                required: false,
+                summary: "When to start it, in whole minutes from now. Without \
+auto_start it only records the intent.",
+            },
         ],
     },
     ToolSpec {
@@ -308,6 +329,18 @@ your own choice.",
                 required: false,
                 summary: "Per-seat exceptions, keyed tl/dev/reviewer, each any of \
 provider/model/effort. Replaces the staged overrides.",
+            },
+            ToolParam {
+                name: "auto_start",
+                kind: ParamKind::Bool,
+                required: false,
+                summary: "Turn self-confirming on or off. Omit to keep it.",
+            },
+            ToolParam {
+                name: "start_in_minutes",
+                kind: ParamKind::Integer,
+                required: false,
+                summary: "Re-time the start, in whole minutes from now. Omit to keep it.",
             },
         ],
     },
@@ -568,6 +601,9 @@ pub(crate) enum ToolCall {
         team_id: Option<String>,
         why: Option<String>,
         agents: TeamAgents,
+        auto_start: Option<bool>,
+        /// Relative; the server resolves it against its own clock.
+        start_in_minutes: Option<i64>,
     },
     ReviseProposal {
         proposal_id: String,
@@ -576,6 +612,8 @@ pub(crate) enum ToolCall {
         team_id: Option<String>,
         why: Option<String>,
         agents: TeamAgents,
+        auto_start: Option<bool>,
+        start_in_minutes: Option<i64>,
     },
     ListAgents,
     ListTeams,
@@ -738,7 +776,10 @@ pub(crate) fn parse_call(name: &str, args: &Value) -> Result<ToolCall, String> {
     }
 
     let text = |param: &ToolParam| -> Result<Option<String>, String> {
-        if matches!(param.kind, ParamKind::Object | ParamKind::TextList) {
+        if matches!(
+            param.kind,
+            ParamKind::Object | ParamKind::TextList | ParamKind::Bool | ParamKind::Integer
+        ) {
             // Read by the arm that knows the shape; nothing string-like here.
             return Ok(None);
         }
@@ -773,13 +814,42 @@ pub(crate) fn parse_call(name: &str, args: &Value) -> Result<ToolCall, String> {
         }
     };
 
-    let get = |param_name: &str| -> Result<Option<String>, String> {
-        let param = spec
-            .params
+    let find = |param_name: &str| -> &ToolParam {
+        spec.params
             .iter()
             .find(|param| param.name == param_name)
-            .expect("registry param must exist");
-        text(param)
+            .expect("registry param must exist")
+    };
+
+    let get = |param_name: &str| -> Result<Option<String>, String> { text(find(param_name)) };
+
+    let get_bool = |param_name: &str| -> Result<Option<bool>, String> {
+        let param = find(param_name);
+        match object.get(param.name) {
+            None | Some(Value::Null) if param.required => {
+                Err(format!("{name}: '{}' is required", param.name))
+            }
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(value)) => Ok(Some(*value)),
+            Some(_) => Err(format!("{name}: '{}' must be true or false", param.name)),
+        }
+    };
+
+    let get_integer = |param_name: &str| -> Result<Option<i64>, String> {
+        let param = find(param_name);
+        match object.get(param.name) {
+            None | Some(Value::Null) if param.required => {
+                Err(format!("{name}: '{}' is required", param.name))
+            }
+            None | Some(Value::Null) => Ok(None),
+            // `as_i64` also rejects a fractional number, which is the shape a
+            // model reaches for when it means "half an hour".
+            Some(Value::Number(value)) => value
+                .as_i64()
+                .map(Some)
+                .ok_or_else(|| format!("{name}: '{}' must be a whole number", param.name)),
+            Some(_) => Err(format!("{name}: '{}' must be a whole number", param.name)),
+        }
     };
 
     // Task-wide ask; per-seat overrides are layered over it by `per_seat`.
@@ -799,6 +869,8 @@ pub(crate) fn parse_call(name: &str, args: &Value) -> Result<ToolCall, String> {
             team_id: get("team_id")?,
             why: get("why")?,
             agents: parse_team_agents(spec.name, object, task_wide()?)?,
+            auto_start: get_bool("auto_start")?,
+            start_in_minutes: get_integer("start_in_minutes")?,
         }),
         "revise_proposal" => Ok(ToolCall::ReviseProposal {
             proposal_id: get("proposal_id")?.expect("required param yields Some"),
@@ -807,6 +879,8 @@ pub(crate) fn parse_call(name: &str, args: &Value) -> Result<ToolCall, String> {
             team_id: get("team_id")?,
             why: get("why")?,
             agents: parse_team_agents(spec.name, object, task_wide()?)?,
+            auto_start: get_bool("auto_start")?,
+            start_in_minutes: get_integer("start_in_minutes")?,
         }),
         "list_agents" => Ok(ToolCall::ListAgents),
         "task_definition" => Ok(ToolCall::TaskDefinition {
@@ -923,6 +997,8 @@ that it is acting on a CARD, not on the task",
                         ParamKind::OneOf(options) => Value::String(options[0].to_string()),
                         ParamKind::Object => json!({ "Question": "yes" }),
                         ParamKind::TextList => json!(["x"]),
+                        ParamKind::Bool => json!(true),
+                        ParamKind::Integer => json!(1),
                     };
                     (param.name.to_string(), value)
                 })
@@ -995,7 +1071,57 @@ that it is acting on a CARD, not on the task",
                 team_id: None,
                 why: None,
                 agents: TeamAgents::default(),
+                auto_start: None,
+                start_in_minutes: None,
             }
+        );
+    }
+
+    /// A schedule is a bool and a number on the wire. Declaring them as text
+    /// would not stop the model sending JSON types — it would just make
+    /// `parse_call` refuse the call it was always going to get.
+    #[test]
+    fn a_schedule_arrives_as_a_json_bool_and_number() {
+        let schema = spec_for("propose_task")
+            .expect("propose_task")
+            .input_schema();
+        assert_eq!(schema["properties"]["auto_start"]["type"], "boolean");
+        assert_eq!(schema["properties"]["start_in_minutes"]["type"], "integer");
+
+        let call = parse_call(
+            "propose_task",
+            &json!({ "title": "Add a parser", "auto_start": true, "start_in_minutes": 30 }),
+        )
+        .expect("the shapes the schema asks for must parse");
+        let ToolCall::ProposeTask {
+            auto_start,
+            start_in_minutes,
+            ..
+        } = call
+        else {
+            panic!("propose_task parsed as another call");
+        };
+        assert_eq!(auto_start, Some(true));
+        assert_eq!(start_in_minutes, Some(30));
+    }
+
+    #[test]
+    fn a_schedule_in_the_wrong_shape_is_refused_by_name() {
+        let err = parse_call(
+            "propose_task",
+            &json!({ "title": "t", "auto_start": "yes" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("'auto_start' must be true or false"), "{err}");
+
+        let err = parse_call(
+            "propose_task",
+            &json!({ "title": "t", "start_in_minutes": 1.5 }),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("'start_in_minutes' must be a whole number"),
+            "half an hour is 30, not 0.5: {err}"
         );
     }
 

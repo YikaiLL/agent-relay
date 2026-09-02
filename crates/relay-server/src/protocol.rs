@@ -2760,6 +2760,21 @@ pub struct OrchestratorProposalView {
     #[serde(default, skip_serializing_if = "TaskSeatAgentsView::is_empty")]
     pub agents: TaskSeatAgentsView,
     pub created_at: u64,
+    /// Whether this card is allowed to confirm itself when its time comes.
+    /// Default OFF: a card only ever starts by hand unless asked otherwise.
+    #[serde(default)]
+    pub auto_start: bool,
+    /// Absolute unix seconds, resolved server-side from the tool's RELATIVE
+    /// `start_in_minutes` — the orchestrator is never told the current time.
+    #[serde(default)]
+    pub scheduled_start_at: Option<u64>,
+    /// Who staged the card. An auto-start has no device of its own, and
+    /// `confirm_orchestrator_proposal` requires one.
+    #[serde(default)]
+    pub proposed_by_device_id: String,
+    /// Why an auto-start did not happen. Written by the watchdog, never here.
+    #[serde(default)]
+    pub schedule_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2781,6 +2796,11 @@ pub struct ProposeOrchestratorTaskInput {
     pub agents: TaskSeatAgentsView,
     #[serde(default)]
     pub device_id: Option<String>,
+    #[serde(default)]
+    pub auto_start: Option<bool>,
+    /// Minutes from now, resolved to `scheduled_start_at` at propose time.
+    #[serde(default)]
+    pub start_in_minutes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2806,6 +2826,9 @@ pub struct ReviseOrchestratorProposalInput {
     /// Only the named fields are applied; the rest of the staged choice stands.
     pub agents: TaskSeatAgentsView,
     pub device_id: Option<String>,
+    pub auto_start: Option<bool>,
+    /// Minutes from now, re-resolved against the clock at revise time.
+    pub start_in_minutes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -3129,6 +3152,10 @@ pub struct StartTeamInput {
     pub dev_agents: Option<u32>,
     #[serde(default)]
     pub device_id: Option<String>,
+    /// Internal: clear a parked scheduled claim when the run is recorded.
+    /// Not a client field — `confirm` sets it for the auto-start path.
+    #[serde(default, skip_serializing)]
+    pub starting_proposal_id: Option<String>,
 }
 
 /// Every whole-run action takes the same shape: which run, and who is asking.
@@ -3208,6 +3235,11 @@ pub struct TeamRunView {
     pub unresolved: Vec<String>,
     pub head_commit: Option<String>,
     pub pause_reason: Option<String>,
+    /// Machine-readable companion to `pause_reason`: `"user"` / `"provider"` /
+    /// `"boundary"` (see `relay_api::team::TeamPauseKind`), or `None` before this
+    /// run's first pause. A `String`, not the enum, so it stays plain-Hash-able
+    /// like every other view field `teams_revision` hashes.
+    pub pause_kind: Option<String>,
     pub error: Option<String>,
     pub requested_at: u64,
     pub updated_at: u64,

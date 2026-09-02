@@ -445,6 +445,17 @@ async fn handle_notification_for_provider(
                         {
                             relay.push_log("error", raw.to_string());
                         }
+                        // Truthful classification for team_turn (state/app/team.rs): a
+                        // failed terminal must stop reading as Silent. Matched there by
+                        // turn id, so only worth recording when we have one.
+                        if let Some(turn_id) = completed_turn.clone() {
+                            relay.set_last_turn_failure(
+                                &bg_thread_id,
+                                turn_id,
+                                value_at(&params, &["turn"]).and_then(codex_turn_failure_kind),
+                                reason.clone(),
+                            );
+                        }
                         relay.enqueue_error_push(&bg_thread_id, reason.clone());
                         // DURABLE failure entry on the background thread's runtime,
                         // present when the user switches back (and in its
@@ -514,6 +525,17 @@ async fn handle_notification_for_provider(
                             relay.push_log("error", raw.to_string());
                         }
                         if let Some(thread_id) = relay.active_thread_id.clone() {
+                            // Truthful classification for team_turn (state/app/team.rs):
+                            // a failed terminal must stop reading as Silent. Matched
+                            // there by turn id, so only worth recording when we have one.
+                            if let Some(turn_id) = completed_turn.clone() {
+                                relay.set_last_turn_failure(
+                                    &thread_id,
+                                    turn_id,
+                                    value_at(&params, &["turn"]).and_then(codex_turn_failure_kind),
+                                    reason.clone(),
+                                );
+                            }
                             relay.enqueue_error_push(&thread_id, reason.clone());
                             // DURABLE failure entry: operator logs are stripped
                             // from broker-bound snapshots, so a log line alone

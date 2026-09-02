@@ -9,6 +9,7 @@ export function createOrchestratorChatActions({
   sendMessage,
   proposeOrchestratorTask,
   confirmOrchestratorProposal,
+  reviseOrchestratorProposal,
   teamsCache,
   onOpenTask,
   // What the relay actually said, for the thread that refused. `sendMessage`
@@ -151,5 +152,24 @@ export function createOrchestratorChatActions({
     return receipt;
   }
 
-  return { send, propose, confirm };
+  /**
+   * Edit a staged card in place. Starts nothing — the returned proposal
+   * replaces the staged one, so the card redraws from what the relay stored
+   * rather than from what this client hoped it would store.
+   */
+  async function revise(proposalId, updates) {
+    if (!proposalId || typeof reviseOrchestratorProposal !== "function") {
+      return null;
+    }
+    const receipt = await reviseOrchestratorProposal(proposalId, updates);
+    if (receipt?.proposal) {
+      stageProposal(receipt.proposal);
+    }
+    if (state.session) {
+      renderTaskTeam(state.session);
+    }
+    return receipt;
+  }
+
+  return { send, propose, confirm, revise };
 }

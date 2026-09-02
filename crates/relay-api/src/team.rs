@@ -181,6 +181,58 @@ impl<'de> Deserialize<'de> for TeamRunStatus {
     }
 }
 
+/// Why a run settled into `Paused`. Machine-readable so a client can tell "you
+/// paused this" apart from "a provider limit stopped it" apart from "the relay's
+/// own mechanism settled it" without parsing `pause_reason` prose.
+///
+/// Decodes leniently to `User` for the same reason `TeamRunStatus` does (see the
+/// module docs): an unrecognized value must degrade rather than fail the whole
+/// state file, and `User` is the safest guess for data written before this type
+/// existed at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamPauseKind {
+    /// A direct, synchronous user action settled it: Stop, Cancel-to-pause, or
+    /// recovering a `Blocked` run.
+    User,
+    /// A provider terminal the run cannot continue past (a usage limit today)
+    /// settled it.
+    Provider,
+    /// Settled at a boundary check rather than by a direct user action: the
+    /// driver's own per-step settle after a graceful pause was requested, the
+    /// relay reconciling a stranded pause at restart, or this crate's own
+    /// pre-dispatch reviewer gate.
+    Boundary,
+}
+
+impl TeamPauseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Provider => "provider",
+            Self::Boundary => "boundary",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Self {
+        match raw {
+            "provider" => Self::Provider,
+            "boundary" => Self::Boundary,
+            _ => Self::User,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TeamPauseKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Option::<String>::deserialize(deserializer)?;
+        Ok(raw.as_deref().map(Self::from_wire).unwrap_or(Self::User))
+    }
+}
+
 /// What a user may do with a thread a task team owns.
 ///
 /// One answer for every lock call site, rather than each guard inventing its own
@@ -515,6 +567,12 @@ pub struct SubTask {
     /// crash between them must not lose the report.
     pub digested: bool,
     pub error: Option<String>,
+    /// How many Dev-role turns on this sub-task ended non-failed. The public
+    /// reviewer gate (`state/app/team.rs`) refuses to start a reviewer turn while
+    /// this is zero — never on `base_commit` or diff emptiness, which only the
+    /// private driver writes and a public gate must not depend on.
+    #[serde(default)]
+    pub dev_turns_landed: u32,
 }
 
 /// One TL session in the succession chain.
@@ -723,6 +781,11 @@ pub struct TeamRun {
     pub stopping: bool,
     pub pause_requested_by: String,
     pub pause_reason: Option<String>,
+    /// Machine-readable companion to `pause_reason` — see [`TeamPauseKind`].
+    /// `None` until the first pause this run ever takes; cleared by `resume`,
+    /// same as `pause_reason`.
+    #[serde(default)]
+    pub pause_kind: Option<TeamPauseKind>,
     pub awaiting: Option<AwaitingUser>,
 
     pub design_verdict: Option<WorkflowVerdict>,
@@ -824,13 +887,14 @@ impl TeamRun {
     }
 
     /// Settle a requested pause. Returns whether it took.
-    pub fn settle_paused(&mut self, reason: impl Into<String>) -> bool {
+    pub fn settle_paused(&mut self, reason: impl Into<String>, kind: TeamPauseKind) -> bool {
         if self.status.is_terminal() || self.status.is_settled_without_driver() {
             return false;
         }
         self.pause_requested = false;
         self.stopping = false;
         self.pause_reason = Some(reason.into());
+        self.pause_kind = Some(kind);
         // Nothing is in flight once a pause settles: the caller proved every owned
         // turn is quiescent before getting here. Leaving a stale marker would make
         // the next cleanup pass read an unobservable turn and block the run.
@@ -906,6 +970,7 @@ impl TeamRun {
         self.stopping = false;
         self.pause_requested_by = String::new();
         self.pause_reason = None;
+        self.pause_kind = None;
         self.error = None;
         self.status = TeamRunStatus::Running;
         self.updated_at = unix_now();
@@ -951,13 +1016,14 @@ impl TeamRun {
     /// which is precisely what `Paused` describes — and the next action is a pure
     /// function of the record, so the work is genuinely resumable. Throwing
     /// that away would discard finished sub-tasks over a stop that took two tries.
-    pub fn resolve_as_paused(&mut self, reason: impl Into<String>) -> bool {
+    pub fn resolve_as_paused(&mut self, reason: impl Into<String>, kind: TeamPauseKind) -> bool {
         if !matches!(self.status, TeamRunStatus::Resolving) {
             return false;
         }
         self.pause_requested = false;
         self.stopping = false;
         self.pause_reason = Some(reason.into());
+        self.pause_kind = Some(kind);
         self.in_flight_thread = None;
         self.status = TeamRunStatus::Paused;
         self.updated_at = unix_now();
@@ -1066,6 +1132,9 @@ impl TeamRun {
                 task.status = SubTaskStatus::Pending;
                 task.rounds_used = 0;
                 task.digested = false;
+                // The reviewer gate reads this. Left standing, the rerun's
+                // reviewer runs on the previous attempt's landed turn.
+                task.dev_turns_landed = 0;
                 // The session holds the attempt being rejected. Dropped from the
                 // slot but left in `owned_thread_ids`: it still has to be drained.
                 task.dev_thread_id = None;
@@ -1393,10 +1462,11 @@ mod tests {
         );
         assert!(run.pause_requested);
 
-        assert!(run.settle_paused("boundary reached"));
+        assert!(run.settle_paused("boundary reached", TeamPauseKind::Boundary));
         assert_eq!(run.status, TeamRunStatus::Paused);
         assert!(!run.pause_requested, "the request is consumed by settling");
         assert_eq!(run.pause_reason.as_deref(), Some("boundary reached"));
+        assert_eq!(run.pause_kind, Some(TeamPauseKind::Boundary));
     }
 
     #[test]
@@ -1478,9 +1548,10 @@ mod tests {
             Some("the team lead replied with nothing"),
             "the reason is still recorded — it is just not the run's verdict"
         );
-        assert!(stopping.settle_paused("stopped by the user"));
+        assert!(stopping.settle_paused("stopped by the user", TeamPauseKind::User));
         assert_eq!(stopping.status, TeamRunStatus::Paused);
         assert!(!stopping.stopping, "settling ends the drain");
+        assert_eq!(stopping.pause_kind, Some(TeamPauseKind::User));
 
         // A graceful PAUSE stops nothing, so a turn that fails during one failed
         // on its own. Suppressing it here would strand the run in `PausePending`
@@ -1545,7 +1616,7 @@ mod tests {
         // and every settlement below has just PROVEN quiescence.
         let mut paused = run_with(TeamPhase::SubTasks, vec![]);
         paused.in_flight_thread = Some("thread-1".to_string());
-        assert!(paused.settle_paused("boundary"));
+        assert!(paused.settle_paused("boundary", TeamPauseKind::Boundary));
         assert!(paused.in_flight_thread.is_none());
 
         let mut cancelled = run_with(TeamPhase::SubTasks, vec![]);
@@ -1557,7 +1628,7 @@ mod tests {
         recovered.in_flight_thread = Some("thread-1".to_string());
         recovered.block("a drain that did not confirm");
         assert!(recovered.begin_resolving_blocked());
-        assert!(recovered.resolve_as_paused("recovered"));
+        assert!(recovered.resolve_as_paused("recovered", TeamPauseKind::User));
         assert!(recovered.in_flight_thread.is_none());
     }
 
@@ -1574,7 +1645,10 @@ mod tests {
             "a second recovery must not drain the same threads again"
         );
 
-        assert!(run.resolve_as_paused("recovered by stopping every owned turn"));
+        assert!(run.resolve_as_paused(
+            "recovered by stopping every owned turn",
+            TeamPauseKind::User
+        ));
         assert_eq!(
             run.status,
             TeamRunStatus::Paused,
@@ -1587,7 +1661,7 @@ mod tests {
             "finished sub-tasks survive the recovery"
         );
         assert!(
-            !run.resolve_as_paused("again"),
+            !run.resolve_as_paused("again", TeamPauseKind::User),
             "only a Resolving run can be resolved"
         );
     }
@@ -1614,7 +1688,7 @@ mod tests {
         let mut run = run_with(TeamPhase::SubTasks, vec![]);
         run.request_pause("device-9");
         run.set_status(TeamRunStatus::Cancelled);
-        assert!(!run.settle_paused("too late"));
+        assert!(!run.settle_paused("too late", TeamPauseKind::Boundary));
         assert_eq!(run.status, TeamRunStatus::Cancelled);
     }
 
@@ -1869,6 +1943,34 @@ mod tests {
             run.sub_tasks[0].owned_thread_ids,
             vec!["dev-1".to_string()],
             "the old thread still has to be drained, so it stays owned"
+        );
+    }
+
+    /// The reviewer gate refuses to start a reviewer turn while this is zero —
+    /// there is nothing to review until a dev turn lands. A rerun starts over on
+    /// an unchanged branch, so inheriting the last attempt's count opens that
+    /// gate before the rerun's dev has done anything.
+    #[test]
+    fn a_revived_sub_task_has_no_landed_dev_turn() {
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![
+                spent_sub_task("st-1", SubTaskStatus::Escalated),
+                spent_sub_task("st-2", SubTaskStatus::Escalated),
+            ],
+        );
+        run.sub_tasks[0].dev_turns_landed = 2;
+        run.sub_tasks[1].dev_turns_landed = 1;
+
+        assert!(run.revive_sub_tasks(Some(&["st-1".to_string()])));
+
+        assert_eq!(
+            run.sub_tasks[0].dev_turns_landed, 0,
+            "the rerun's reviewer must wait on the rerun's own dev turn"
+        );
+        assert_eq!(
+            run.sub_tasks[1].dev_turns_landed, 1,
+            "a sub-task this revive did not take keeps its landed count"
         );
     }
 

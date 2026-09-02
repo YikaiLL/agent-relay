@@ -306,6 +306,10 @@ async fn main() {
         info!("beta features are ON for this launch (SEALWIRE_BETA)");
     }
 
+    // One place where startup's background loops begin, so tests compose it the
+    // same way. Placement is free: the team driver is shared between clones.
+    state.spawn_configured_watchdogs();
+
     let web_assets = default_web_assets();
     log_web_assets(&web_assets);
     let context = AppContext {
