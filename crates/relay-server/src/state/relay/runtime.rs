@@ -27,6 +27,23 @@ pub(crate) struct TurnFailure {
     pub(crate) reason: String,
 }
 
+/// What a provider said one finished turn cost.
+///
+/// Same shape and same discipline as [`TurnFailure`]: written by the single
+/// usage funnel (`RelayState::record_token_usage`), never cleared, so a reader
+/// must match `turn_id` against the turn IT dispatched rather than check
+/// presence — an unmatched id would let an earlier turn's figure speak for a
+/// later one.
+///
+/// The absence of a record is NOT the same as `billed == 0`. Zero means the
+/// provider reported a figure and it was nothing; absent means it reported no
+/// figure at all, which several paths legitimately do.
+#[derive(Debug, Clone)]
+pub(crate) struct TurnSpend {
+    pub(crate) turn_id: String,
+    pub(crate) billed: u64,
+}
+
 /// How a provider said a turn failed — the one classification space both bridges
 /// map onto. `None` means unclassified, which is an ordinary failure.
 ///
@@ -113,6 +130,9 @@ pub(crate) struct ThreadRuntime {
     /// [`TurnFailure`] on why a reader must match `turn_id` rather than
     /// presence alone.
     pub(crate) last_turn_failure: Option<TurnFailure>,
+    /// Written by `RelayState::record_token_usage` for the turn it is billing;
+    /// never cleared — see [`TurnSpend`] on matching `turn_id`.
+    pub(crate) last_turn_spend: Option<TurnSpend>,
 }
 
 impl ThreadRuntime {
@@ -160,6 +180,7 @@ impl ThreadRuntime {
             last_update_at: now,
             workspace_missing: None,
             last_turn_failure: None,
+            last_turn_spend: None,
         }
     }
 
@@ -199,6 +220,7 @@ impl ThreadRuntime {
             last_update_at: now,
             workspace_missing: None,
             last_turn_failure: None,
+            last_turn_spend: None,
         }
     }
 
@@ -270,6 +292,7 @@ impl ThreadRuntime {
             last_update_at: now,
             workspace_missing: None,
             last_turn_failure: None,
+            last_turn_spend: None,
         }
     }
 

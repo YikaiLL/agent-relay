@@ -230,9 +230,16 @@ fn an_empty_codex_notification_bills_nothing() {
             "total": { "totalTokens": 0 },
         }
     }));
+    // The tracker REPORTS the zero rather than swallowing it. Swallowing made a
+    // reported zero indistinguishable from no report at all, which is the
+    // difference the reviewer gate turns on (`state/app/team.rs`). Keeping it
+    // out of the ledger is `record_token_usage`'s job, and its `is_empty` guard
+    // — unchanged — is what still does that.
+    let observed = observed.expect("a reported zero is still an observation");
     assert!(
-        observed.is_none(),
-        "a zero observation must not become a ledger row"
+        observed.usage.is_empty(),
+        "and what it reports is nothing: {:?}",
+        observed.usage
     );
 }
 

@@ -1205,6 +1205,167 @@ async fn a_dev_turn_that_exhausts_the_session_budget_halts_the_run_before_any_re
     assert_ne!(run.sub_tasks[0].status, crate::state::SubTaskStatus::Escalated);
 }
 
+/// `Replied` proves the agent SPOKE, not that it worked. A dev that answers
+/// "I couldn't do this" and spends nothing must not open the reviewer gate —
+/// otherwise a reviewer runs against an unchanged branch, burns both rounds and
+/// escalates, which is the false failure this whole feature exists to stop.
+#[tokio::test]
+async fn a_dev_turn_that_replies_but_bills_nothing_leaves_the_gate_shut() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    // The provider reports a figure, and that figure is zero.
+    providers
+        .get("codex")
+        .unwrap()
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((0, None));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    // A gate refusal settles the run `Paused` at a boundary, the same terminal
+    // `a_reviewer_turn_is_refused_without_a_landed_dev_turn` waits for.
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    assert!(
+        matches!(
+            dev_outcome.lock().await.clone(),
+            Some(relay_api::team::TeamTurnOutcome::Replied(_))
+        ),
+        "the premise: the dev DID reply, it just did no work"
+    );
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 0,
+        "a turn that billed nothing has not landed"
+    );
+    match reviewer_outcomes.lock().await.first() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => assert!(
+            reason.contains("no landed dev turn"),
+            "the reviewer must be refused by the gate: {reason}"
+        ),
+        other => panic!("the reviewer must not run against an unchanged branch: {other:?}"),
+    }
+    assert_eq!(run.sub_tasks[0].rounds_used, 0, "no review budget was spent");
+    assert_ne!(run.sub_tasks[0].status, crate::state::SubTaskStatus::Escalated);
+}
+
+/// The other half: real spend opens the gate, so ordinary work still reviews.
+#[tokio::test]
+async fn a_dev_turn_that_bills_tokens_opens_the_reviewer_gate() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((1_200, None));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 1,
+        "a turn that billed tokens has landed"
+    );
+    assert!(
+        !matches!(
+            reviewer_outcomes.lock().await.first(),
+            Some(relay_api::team::TeamTurnOutcome::Failed(reason)) if reason.contains("no landed dev turn")
+        ),
+        "the gate must not refuse a dev turn that really spent"
+    );
+}
+
+/// The FALLBACK, pinned so it can never become a silent one. Not every path
+/// reports usage; requiring a figure would refuse every reviewer turn forever
+/// on such a provider and deadlock the run. No figure means the old `Replied`
+/// rule stands.
+#[tokio::test]
+async fn a_dev_turn_with_no_usage_figure_at_all_still_counts_as_landed() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    // Deliberately NOT setting `report_turn_usage`: nothing is reported.
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+    let _ = &providers;
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 1,
+        "with no figure to judge by, a reply still lands"
+    );
+}
+
+/// The record is never cleared, so a reader that checked mere presence would let
+/// an EARLIER turn's figure decide this one. A leftover zero must not shut the
+/// gate on a turn that reported nothing of its own.
+#[tokio::test]
+async fn a_spend_figure_from_another_turn_does_not_shut_the_gate() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    // Zero tokens, billed against a turn id this run never dispatched.
+    providers
+        .get("codex")
+        .unwrap()
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((0, Some("turn-from-an-earlier-life".to_string())));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 1,
+        "a figure for a different turn is not this turn's evidence"
+    );
+}
+
 #[tokio::test]
 async fn a_reviewer_turn_is_refused_without_a_landed_dev_turn() {
     let (_repo, root) = init_team_repo().await;

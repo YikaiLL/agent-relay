@@ -12364,6 +12364,13 @@ mod review_tests {
         // failed. Distinct from every `fail_*` knob above: those fail before or
         // during `start_turn`; this fails a turn that already returned `Ok`.
         fail_completed_turn_with: Arc<Mutex<Option<(String, Option<String>)>>>,
+        // What the provider reports this turn cost, through the same funnel a
+        // real bridge uses (`record_token_usage`). `None` reports NOTHING at
+        // all, which is a real provider path and the harness default, so every
+        // existing test keeps the behaviour it was written against.
+        // `Some((tokens, turn_override))` reports a figure; the override bills
+        // it against another turn's id, modelling a leftover from an earlier one.
+        report_turn_usage: Arc<Mutex<Option<(u64, Option<String>)>>>,
         next_id: Arc<AtomicU64>,
     }
 
@@ -12420,6 +12427,7 @@ mod review_tests {
                 settle_turn_before_start_returns: Arc::new(AtomicBool::new(false)),
                 promoted_thread_ids: Arc::new(Mutex::new(HashMap::new())),
                 fail_completed_turn_with: Arc::new(Mutex::new(None)),
+                report_turn_usage: Arc::new(Mutex::new(None)),
                 next_id: Arc::new(AtomicU64::new(1)),
             }
         }
@@ -12870,6 +12878,7 @@ mod review_tests {
             // Taken (one-shot) before spawning, like the other fix-turn knobs above:
             // this turn's outcome is decided synchronously here, not re-checked later.
             let fail_completed_turn = self.fail_completed_turn_with.lock().await.take();
+            let report_usage = self.report_turn_usage.lock().await.take();
             // A reviewer turn ends with the verdict the test queued (default needs-changes).
             let scripted = self.scripted_replies.lock().await.pop_front();
             let reply_text = if let Some(scripted) = scripted {
@@ -13057,6 +13066,24 @@ mod review_tests {
                             user_text.clone(),
                             turn.clone(),
                         );
+                        // Through the SAME funnel a real bridge uses, so the
+                        // record under test is the production one.
+                        if let Some((tokens, ref turn_override)) = report_usage {
+                            relay.record_token_usage(
+                                &thread_id,
+                                Some(turn_override.clone().unwrap_or_else(|| turn.clone())),
+                                "fake",
+                                crate::usage::TokenUsage {
+                                    output: tokens,
+                                    total: tokens,
+                                    ..Default::default()
+                                },
+                                None,
+                                None,
+                                None,
+                                false,
+                            );
+                        }
                         if let Some((reason, kind)) = fail_completed_turn.clone() {
                             // The shape a REAL failed terminal leaves (see
                             // claude.rs/codex/rpc.rs): the bridge's own classification,
@@ -13099,6 +13126,24 @@ mod review_tests {
                             turn.clone(),
                             now,
                         );
+                        // Through the SAME funnel a real bridge uses, so the
+                        // record under test is the production one.
+                        if let Some((tokens, ref turn_override)) = report_usage {
+                            relay.record_token_usage(
+                                &thread_id,
+                                Some(turn_override.clone().unwrap_or_else(|| turn.clone())),
+                                "fake",
+                                crate::usage::TokenUsage {
+                                    output: tokens,
+                                    total: tokens,
+                                    ..Default::default()
+                                },
+                                None,
+                                None,
+                                None,
+                                false,
+                            );
+                        }
                         if let Some((reason, kind)) = fail_completed_turn.clone() {
                             relay.set_last_turn_failure(
                                 &thread_id,

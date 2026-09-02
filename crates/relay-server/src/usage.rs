@@ -170,10 +170,11 @@ impl CodexUsageTracker {
             (None, _) => last?,
         };
 
-        if usage.is_empty() {
-            return None;
-        }
-
+        // An all-zero delta is still an OBSERVATION: the provider answered, and
+        // it answered "nothing". Dropping it here would make it indistinguishable
+        // from a turn that reported no figure at all, and the reviewer gate
+        // (`state/app/team.rs`) has to tell those apart. Billing is unaffected —
+        // `record_token_usage` drops empty usage before it writes a ledger row.
         Some(CodexUsageObservation {
             thread_id,
             turn_id,

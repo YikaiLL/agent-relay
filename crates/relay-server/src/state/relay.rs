@@ -38,7 +38,7 @@ pub(crate) use self::push::{
     is_acceptable_push_endpoint, load_or_generate_vapid, vapid_key_path, PushAttentionTracker,
     PushDispatcher, PushJob, PushKind, PushSubscription, PushSubscriptionInput,
 };
-pub(crate) use self::runtime::{ThreadRuntime, TurnFailure, TurnFailureKind};
+pub(crate) use self::runtime::{ThreadRuntime, TurnFailure, TurnFailureKind, TurnSpend};
 pub(crate) use self::transcript::TranscriptRecord;
 
 const REMOTE_ACTION_REPLAY_TTL_SECS: u64 = 600;
@@ -931,6 +931,45 @@ impl RelayState {
     pub(crate) fn last_turn_failure(&self, thread_id: &str) -> Option<&TurnFailure> {
         self.runtime_for_thread(thread_id)
             .and_then(|runtime| runtime.last_turn_failure.as_ref())
+    }
+
+    /// Note what a provider said one turn cost. See [`TurnSpend`] — the record
+    /// exists so a reader can tell a reported zero from no report at all.
+    ///
+    /// ACCUMULATES within a turn: both bridges report more than once per turn
+    /// (Claude per model, Codex per model request), so overwriting would let a
+    /// later zero erase spend already reported for the same turn.
+    fn note_turn_spend(
+        &mut self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        usage: &crate::usage::TokenUsage,
+    ) {
+        // Usage with no turn id cannot be matched to a dispatched turn, and a
+        // reader that cannot match must fall back rather than guess.
+        let Some(turn_id) = turn_id else {
+            return;
+        };
+        let billed = usage.total.max(usage.sum_of_parts());
+        let Some(runtime) = self.runtimes.get_mut(thread_id) else {
+            return;
+        };
+        match runtime.last_turn_spend.as_mut() {
+            Some(spend) if spend.turn_id == turn_id => {
+                spend.billed = spend.billed.saturating_add(billed);
+            }
+            _ => {
+                runtime.last_turn_spend = Some(TurnSpend {
+                    turn_id: turn_id.to_string(),
+                    billed,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn last_turn_spend(&self, thread_id: &str) -> Option<&TurnSpend> {
+        self.runtime_for_thread(thread_id)
+            .and_then(|runtime| runtime.last_turn_spend.as_ref())
     }
 
     pub(crate) fn thread_turn_revision(&self, thread_id: &str) -> u64 {
@@ -2111,6 +2150,11 @@ impl RelayState {
         model_hint: Option<String>,
         failed: bool,
     ) {
+        // BEFORE the empty-usage return below, on purpose. "The provider said
+        // zero" and "the provider said nothing" are different facts, and the
+        // reviewer gate has to tell them apart; dropping the zero here would
+        // collapse them back together.
+        self.note_turn_spend(thread_id, turn_id.as_deref(), &usage);
         if usage.is_empty() {
             return;
         }

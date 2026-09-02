@@ -1761,17 +1761,53 @@ over on resume"
         // or uncertain (`Blocked`) one does, which is why this sits after every
         // early `Failed`/`Blocked` return above and matches on `Replied` alone
         // rather than "non-failed".
+        //
+        // Replying is necessary but NOT sufficient: a dev that answers "I
+        // couldn't do this" and spends nothing has produced nothing to review,
+        // so the spend the provider reported decides it.
         if role == TeamRole::Dev && matches!(outcome, TeamTurnOutcome::Replied(_)) {
             if let TeamThreadSlot::SubTaskDev(index) = slot {
-                let mut relay = self.relay.write().await;
-                relay.update_team_run(run_id, |run| {
-                    if let Some(task) = run.sub_tasks.get_mut(index) {
-                        task.dev_turns_landed = task.dev_turns_landed.saturating_add(1);
-                    }
-                });
+                if self
+                    .turn_billed_work(&thread_id, sent_turn_id.as_deref())
+                    .await
+                {
+                    let mut relay = self.relay.write().await;
+                    relay.update_team_run(run_id, |run| {
+                        if let Some(task) = run.sub_tasks.get_mut(index) {
+                            task.dev_turns_landed = task.dev_turns_landed.saturating_add(1);
+                        }
+                    });
+                }
             }
         }
         outcome
+    }
+
+    /// Did the provider bill anything for the turn we just dispatched?
+    ///
+    /// Three answers, and the third is the one that matters:
+    /// - a figure above zero → yes, real work was paid for;
+    /// - a figure of exactly zero → no, and the reviewer gate stays shut;
+    /// - NO figure for this turn → **fall back to yes**.
+    ///
+    /// That fallback is deliberate and load-bearing. Not every provider path
+    /// reports usage, and usage without a turn id cannot be attributed to the
+    /// turn we sent. Demanding a figure there would refuse every reviewer turn
+    /// forever and deadlock the run — strictly worse than the over-counting
+    /// this check exists to fix.
+    ///
+    /// Matches `turn_id` against the turn WE sent, never mere presence: the
+    /// record is never cleared, so an earlier turn's figure would otherwise
+    /// decide this one.
+    async fn turn_billed_work(&self, thread_id: &str, sent_turn_id: Option<&str>) -> bool {
+        let Some(turn_id) = sent_turn_id else {
+            return true;
+        };
+        let relay = self.relay.read().await;
+        match relay.last_turn_spend(thread_id) {
+            Some(spend) if spend.turn_id == turn_id => spend.billed > 0,
+            _ => true,
+        }
     }
 
     async fn set_in_flight_thread(&self, run_id: &str, thread_id: Option<String>) {
