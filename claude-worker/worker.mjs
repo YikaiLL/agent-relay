@@ -73,6 +73,8 @@ import {
 
 const DEFAULT_SETTING_SOURCES = ["user", "project", "local"];
 
+// Each session pins its own ~250MB `claude` child. Explicit release is the
+// primary reclaim path; this cap is the backstop for threads nobody returns.
 const SESSION_LIMIT = 8;
 const DEFAULT_CANCEL_DRAIN_TIMEOUT_MS = 10_000;
 const configuredCancelDrainTimeout = Number.parseInt(
@@ -550,6 +552,9 @@ function createSessionEntry({ key, providerSessionId = null, cmd, pendingStartRe
     stopGeneration: 0,
     stopOperation: null,
     lastUsedAt: Date.now(),
+    // Non-empty means closing this session would destroy work no resume can
+    // recover. Mirrored from `background_tasks_changed`.
+    backgroundTasks: [],
     cwd: cmd.cwd ?? process.cwd(),
     model: cmd.model ?? "claude-sonnet-4-6",
     pendingThreadId: cmd.pending_thread_id || null,
@@ -672,6 +677,30 @@ function closeAndRemoveSession(sessions, entry, { pendingApprovals, pendingAskUs
   }
 }
 
+// Drop the child, keep the conversation. Refuses while work is in flight: an
+// explicit protocol still has to survive a caller asking at the wrong moment.
+function releaseSession(sessions, providerSessionId, context) {
+  // A no-op, not a refusal — otherwise the relay warns every time it returns a
+  // seat whose process was already reclaimed.
+  const entry = findSessionEntry(sessions, providerSessionId);
+  if (!entry) return { released: false, noop: true, reason: "no live session for that id" };
+  if (entry.running || entry.pendingStartResponse) {
+    return { released: false, reason: "session is mid-turn" };
+  }
+  if (entry.backgroundTasks.length > 0) {
+    return { released: false, reason: "session has live background work" };
+  }
+  if (!entry.session) {
+    closeAndRemoveSession(sessions, entry, context);
+    return { released: false, noop: true, reason: "session had no live process" };
+  }
+  if (entry.stopOperation?.state === "cancelling") {
+    return { released: false, reason: "session is still stopping" };
+  }
+  closeAndRemoveSession(sessions, entry, context);
+  return { released: true };
+}
+
 function evictSessionsIfNeeded(sessions, context) {
   while (sessions.size > SESSION_LIMIT) {
     const candidates = [...sessions.values()]
@@ -758,8 +787,17 @@ function settleUnexpectedStreamEnd(sessions, entry, context) {
 // DISTINCT results for one turn is an SDK-contract violation we cannot attribute
 // — see the assumption note on decorateEvent.)
 const RESULT_REPLAY_MEMORY = 64;
+
+// Mirror the SDK's live background-task set onto the entry. REPLACE semantics:
+// the payload is every task still in flight, so `[]` means the last one landed.
+function trackBackgroundTasks(entry, msg) {
+  if (msg?.type !== "system" || msg?.subtype !== "background_tasks_changed") return;
+  entry.backgroundTasks = Array.isArray(msg.tasks) ? msg.tasks : [];
+}
+
 async function* dedupResultReplays(stream, entry) {
   for await (const msg of stream) {
+    trackBackgroundTasks(entry, msg);
     if (msg?.type === "result" && msg?.uuid) {
       const seen = (entry.seenResultUuids ??= new Set());
       if (seen.has(msg.uuid)) {
@@ -1065,6 +1103,9 @@ async function ensureLiveSession(
   entry.stopOperation = null;
   entry.cancelFlag = { current: false };
   entry.fileDiffTracker = createFileDiffTracker(entry.options.cwd || entry.cwd);
+  // The level is per-CLI-process and nothing is emitted at startup, so a fresh
+  // query must start from the empty set or it inherits the dead process's.
+  entry.backgroundTasks = [];
   entry.session = await createWorkerSession(sdk, entry.options, resumeId || undefined);
   startSessionStream(sessions, entry, context);
 }
@@ -1487,6 +1528,18 @@ async function main() {
         break;
       }
 
+      case "release_session": {
+        const sessionId = cmd.provider_session_id;
+        if (!sessionId) {
+          emitErrorResponse(cmd.id, "release_session requires provider_session_id");
+          break;
+        }
+        const result = releaseSession(sessions, sessionId, sessionContext);
+        log(`release_session ${sessionId}: ${result.released ? "released" : result.reason}`);
+        emitResponse(cmd.id, { provider_session_id: sessionId, ...result });
+        break;
+      }
+
       case "delete_session": {
         try {
           const sessionId = cmd.provider_session_id;
@@ -1554,8 +1607,11 @@ export {
   flushEvents,
   handleSessionEvent,
   promoteSessionEntry,
+  releaseSession,
+  SESSION_LIMIT,
   sessionOptionsChanged,
   settleUnexpectedStreamEnd,
+  trackBackgroundTasks,
 };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

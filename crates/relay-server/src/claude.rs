@@ -746,6 +746,35 @@ impl ProviderBridge for ClaudeCodeBridge {
         Err("ClaudeCodeBridge: archive is not supported".to_string())
     }
 
+    /// Drop the session's `claude` child; the conversation stays on disk. The
+    /// worker refuses while work is in flight, so a mistimed call loses nothing.
+    async fn release_thread(&self, thread_id: &str) -> Result<(), String> {
+        // A pending thread has no live child yet — nothing to hand back.
+        if self.pending_threads.lock().await.contains_key(thread_id) {
+            return Ok(());
+        }
+        let real_session_id = self
+            .resolve_real_session_id(thread_id)
+            .unwrap_or_else(|| thread_id.to_string());
+        let reply = self
+            .send_request(
+                "release_session",
+                json!({ "provider_session_id": real_session_id }),
+            )
+            .await?;
+        // A refusal rides a SUCCESSFUL response; a no-op means the desired state
+        // already holds. Only the former says the child is still alive.
+        let noop = reply.get("noop").and_then(Value::as_bool) == Some(true);
+        if !noop && reply.get("released").and_then(Value::as_bool) == Some(false) {
+            let reason = reply
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("worker declined without a reason");
+            return Err(format!("session not released: {reason}"));
+        }
+        Ok(())
+    }
+
     async fn delete_thread_permanently(
         &self,
         thread_id: &str,

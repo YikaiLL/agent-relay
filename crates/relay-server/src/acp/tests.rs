@@ -2693,3 +2693,49 @@ async fn a_completed_tool_update_keeps_the_kind_the_pending_call_reported() {
     );
     assert_eq!(tool.path.as_deref(), Some("/repo/src/main.rs"));
 }
+
+#[tokio::test]
+async fn forget_session_drops_runtime_state_for_a_deleted_thread() {
+    // Nothing else removes from `sessions`, so a deleted thread leaked its
+    // `tool_meta` (full tool output strings) for the relay's life.
+    let sessions: super::Sessions = Default::default();
+    sessions
+        .lock()
+        .await
+        .insert("thread-gone".to_string(), SessionRuntime::default());
+    sessions
+        .lock()
+        .await
+        .insert("thread-kept".to_string(), SessionRuntime::default());
+
+    super::forget_session(&sessions, "thread-gone").await;
+
+    let guard = sessions.lock().await;
+    assert!(!guard.contains_key("thread-gone"));
+    assert!(guard.contains_key("thread-kept"));
+}
+
+#[tokio::test]
+async fn a_failed_delete_keeps_the_runtime_intact() {
+    // A failed delete leaves the thread usable; a reset `ordinals` would restart
+    // at 1 and re-mint item ids the surviving transcript already uses.
+    let sessions: super::Sessions = Default::default();
+    let mut runtime = SessionRuntime::default();
+    runtime.ordinals.insert("user", 7);
+    sessions.lock().await.insert("t".to_string(), runtime);
+
+    super::settle_delete(
+        &sessions,
+        "t",
+        &Err::<(), _>("permission denied".to_string()),
+    )
+    .await;
+    assert_eq!(
+        sessions.lock().await.get("t").map(|r| r.ordinals["user"]),
+        Some(7),
+        "a failed delete must not drop the runtime"
+    );
+
+    super::settle_delete(&sessions, "t", &Ok(())).await;
+    assert!(!sessions.lock().await.contains_key("t"));
+}

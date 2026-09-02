@@ -285,6 +285,24 @@ impl SessionRuntime {
 
 pub(crate) type Sessions = Arc<Mutex<HashMap<String, SessionRuntime>>>;
 
+/// Drop a thread's runtime state. Nothing else removes from `sessions`, so a
+/// deleted thread would otherwise leak its `tool_meta` for the relay's life.
+pub(crate) async fn forget_session(sessions: &Sessions, thread_id: &str) {
+    sessions.lock().await.remove(thread_id);
+}
+
+/// Only once the delete succeeded: a failed one leaves the thread usable, and
+/// reset `ordinals` would re-mint item ids the surviving transcript still holds.
+pub(crate) async fn settle_delete<T>(
+    sessions: &Sessions,
+    thread_id: &str,
+    result: &Result<T, String>,
+) {
+    if result.is_ok() {
+        forget_session(sessions, thread_id).await;
+    }
+}
+
 /// Transcript captured out of a `session/load` replay instead of being applied
 /// to `RelayState`.
 ///
@@ -1424,11 +1442,14 @@ impl ProviderBridge for AcpBridge {
         let provider_name = self.provider_name;
         let display_name = self.display_name;
         let thread_id = thread_id.to_string();
-        tokio::task::spawn_blocking(move || {
+        let forget_key = thread_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
             crate::acp_local::delete_thread_permanently(provider_name, display_name, &thread_id)
         })
         .await
-        .map_err(|error| format!("local ACP session delete task failed: {error}"))?
+        .map_err(|error| format!("local ACP session delete task failed: {error}"))?;
+        settle_delete(&self.sessions, &forget_key, &result).await;
+        result
     }
 
     async fn start_turn(

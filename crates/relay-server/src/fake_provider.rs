@@ -439,6 +439,9 @@ fn validate_barrier_name(barrier: &str) -> Result<(), String> {
 pub struct FakeProviderBridge {
     state: Arc<RwLock<RelayState>>,
     threads: Arc<Mutex<HashMap<String, FakeThread>>>,
+    /// Threads handed back via `release_thread`, in call order, so a test can
+    /// assert the pool checkout actually returned.
+    released_threads: Arc<Mutex<Vec<String>>>,
     next_id: AtomicU64,
     // When set, a non-`bypass` turn parks on an approval request (a fake Bash
     // command) until respond_to_approval resolves it — letting tests exercise
@@ -488,6 +491,11 @@ impl FakeProviderBridge {
     }
 
     /// `(cwd, system_prompt)` for every thread opened with a persona.
+    /// Threads handed back via `release_thread`, in call order.
+    pub async fn released_threads(&self) -> Vec<String> {
+        self.released_threads.lock().await.clone()
+    }
+
     pub async fn recorded_system_prompts(&self) -> Vec<(String, String)> {
         self.system_prompts.lock().await.clone()
     }
@@ -515,6 +523,7 @@ impl FakeProviderBridge {
             .clamp(1, 32);
 
         Ok(Self {
+            released_threads: Arc::new(Mutex::new(Vec::new())),
             state,
             threads,
             next_id: AtomicU64::new(1),
@@ -683,6 +692,14 @@ impl ProviderBridge for FakeProviderBridge {
     // archive paths stay exercisable without a real one.
     fn supports_archive(&self) -> bool {
         true
+    }
+
+    async fn release_thread(&self, thread_id: &str) -> Result<(), String> {
+        self.released_threads
+            .lock()
+            .await
+            .push(thread_id.to_string());
+        Ok(())
     }
 
     async fn archive_thread(&self, thread_id: &str) -> Result<(), String> {

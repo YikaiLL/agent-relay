@@ -218,6 +218,12 @@ pub trait ProviderBridge: Send + Sync {
         item_id: &str,
     ) -> Result<Option<TranscriptEntryView>, String>;
     async fn archive_thread(&self, thread_id: &str) -> Result<(), String>;
+
+    /// Hand back a thread's per-session resources, keeping the conversation.
+    /// Defaults to a no-op: only Claude spends a process per session.
+    async fn release_thread(&self, _thread_id: &str) -> Result<(), String> {
+        Ok(())
+    }
     async fn delete_thread_permanently(
         &self,
         thread_id: &str,

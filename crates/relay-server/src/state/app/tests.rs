@@ -12204,6 +12204,8 @@ mod review_tests {
         // (thread_id, approval_policy, sandbox) recorded at start_thread.
         start_thread_settings: Arc<Mutex<Vec<(String, String, String)>>>,
         turns: Arc<Mutex<Vec<(String, String)>>>,
+        /// Threads handed back via `release_thread`, in call order.
+        released_threads: Arc<Mutex<Vec<String>>>,
         complete_turns: Arc<AtomicBool>,
         // When false, turns still complete (clearing the active turn) but emit no
         // assistant message — exercising the "no recap text" path.
@@ -12380,6 +12382,7 @@ mod review_tests {
     impl ReviewTestProvider {
         fn new(name: &'static str, state: Arc<RwLock<RelayState>>) -> Self {
             Self {
+                released_threads: Arc::new(Mutex::new(Vec::new())),
                 name,
                 state,
                 threads: Arc::new(Mutex::new(HashMap::new())),
@@ -12522,8 +12525,22 @@ mod review_tests {
         }
     }
 
+    impl ReviewTestProvider {
+        pub(crate) async fn released_threads(&self) -> Vec<String> {
+            self.released_threads.lock().await.clone()
+        }
+    }
+
     #[async_trait::async_trait]
     impl ProviderBridge for ReviewTestProvider {
+        async fn release_thread(&self, thread_id: &str) -> Result<(), String> {
+            self.released_threads
+                .lock()
+                .await
+                .push(thread_id.to_string());
+            Ok(())
+        }
+
         async fn list_threads(&self, limit: usize) -> Result<Vec<ThreadSummaryView>, String> {
             let mut threads = self
                 .threads

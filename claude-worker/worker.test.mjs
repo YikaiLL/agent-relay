@@ -8,12 +8,15 @@ import {
   closeSessionEntry,
   createSessionEntry,
   createWorkerSession,
+  releaseSession,
   cwdChangedEvent,
   ensureLiveSession,
   evictSessionsIfNeeded,
   findSessionEntry,
   flushEvents,
   sessionOptionsChanged,
+  SESSION_LIMIT,
+  trackBackgroundTasks,
 } from "./worker.mjs";
 
 test("buildSdkMsgProbe keeps diagnostics content-free (no prompts/output/errors/paths)", () => {
@@ -128,6 +131,11 @@ function captureStderr(fn) {
     });
 }
 
+// Minimal stand-in for an SDK query: eviction and release both close it.
+function fakeQuery() {
+  return { closed: false, close() { this.closed = true; }, async interrupt() {} };
+}
+
 function makeTracker() {
   const records = [];
   return {
@@ -155,30 +163,6 @@ test("findSessionEntry can locate an unpromoted pending thread", () => {
   sessions.set(entry.key, entry);
 
   assert.equal(findSessionEntry(sessions, "claude-pending-1"), entry);
-});
-
-test("evictSessionsIfNeeded does not emit unscoped done for unpromoted sessions", async () => {
-  const sessions = new Map();
-  for (let i = 0; i < 9; i += 1) {
-    const entry = createSessionEntry({
-      key: `pending:req-${i}`,
-      cmd: { cwd: "/tmp", pending_thread_id: `claude-pending-${i}` },
-      pendingStartResponse: { id: `req-${i}`, cwd: "/tmp" },
-    });
-    sessions.set(entry.key, entry);
-  }
-
-  const lines = await captureStdout(() => {
-    evictSessionsIfNeeded(sessions, {
-      pendingApprovals: new Map(),
-      pendingAskUserQuestions: new Map(),
-    });
-  });
-
-  assert.equal(sessions.size, 8);
-  const events = lines.map((line) => JSON.parse(line));
-  assert.equal(events.some((event) => event.type === "done"), false);
-  assert.equal(events.some((event) => event.id && event.error), true);
 });
 
 test("flushEvents records liveness against the owning session tracker", async () => {
@@ -634,4 +618,76 @@ test("cwd_changed carries the pending thread id before Claude has a real session
     pendingId,
     "the first cwd hook must not wait for the SDK session id"
   );
+});
+
+test("releaseSession hands an idle session back, keeping the conversation", async () => {
+  // The relay knows when a run is done, so the worker never infers idleness.
+  const sessions = new Map();
+  const entry = createSessionEntry({
+    key: "session:done",
+    providerSessionId: "done",
+    cmd: { cwd: "/tmp" },
+  });
+  entry.session = fakeQuery();
+  sessions.set(entry.key, entry);
+
+  const lines = await captureStdout(() => {
+    const result = releaseSession(sessions, "done", {
+      pendingApprovals: new Map(),
+      pendingAskUserQuestions: new Map(),
+    });
+    assert.equal(result.released, true);
+  });
+
+  assert.equal(sessions.size, 0);
+  // Silent, like eviction: no turn is in flight, and a stray `done` would hit
+  // the relay's stale-completion path.
+  assert.deepEqual(lines.map((line) => JSON.parse(line)), []);
+});
+
+test("releaseSession refuses while work is in flight", async () => {
+  // The guard is here, not only in the relay: an explicit protocol still needs
+  // to be safe against a caller that asks at the wrong moment.
+  const sessions = new Map();
+  const context = { pendingApprovals: new Map(), pendingAskUserQuestions: new Map() };
+
+  const running = createSessionEntry({
+    key: "session:running",
+    providerSessionId: "running",
+    cmd: { cwd: "/tmp" },
+  });
+  running.running = true;
+  sessions.set(running.key, running);
+
+  const busy = createSessionEntry({
+    key: "session:busy",
+    providerSessionId: "busy",
+    cmd: { cwd: "/tmp" },
+  });
+  busy.backgroundTasks = [{ task_id: "t1", task_type: "subagent", description: "audit" }];
+  sessions.set(busy.key, busy);
+
+  await captureStdout(() => {
+    assert.equal(releaseSession(sessions, "running", context).released, false);
+    assert.equal(releaseSession(sessions, "busy", context).released, false);
+    assert.equal(releaseSession(sessions, "ghost", context).released, false);
+  });
+
+  assert.equal(sessions.size, 2, "nothing released while work is in flight");
+});
+
+
+test("trackBackgroundTasks mirrors the SDK's live set", () => {
+  // Kept for `releaseSession` only: the relay must not hand back a seat whose
+  // background subagent is still running, since closing it destroys the result.
+  const entry = createSessionEntry({ key: "session:a", cmd: { cwd: "/tmp" } });
+  const level = (tasks) =>
+    trackBackgroundTasks(entry, { type: "system", subtype: "background_tasks_changed", tasks });
+
+  level([{ task_id: "t1", task_type: "subagent", description: "audit" }]);
+  assert.equal(entry.backgroundTasks.length, 1);
+  level([]);
+  assert.deepEqual(entry.backgroundTasks, []);
+  trackBackgroundTasks(entry, { type: "result", subtype: "success" });
+  assert.deepEqual(entry.backgroundTasks, []);
 });

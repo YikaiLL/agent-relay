@@ -234,6 +234,37 @@ pub(crate) fn acp_error_message(error: &Value) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Record each unhandled ACP method once. Both drop sites were silent, so an
+/// activity or wake-up method the agent already sends would go unnoticed.
+async fn log_unhandled_once(
+    state: &Arc<RwLock<RelayState>>,
+    provider_key: &'static str,
+    kind: &str,
+    method: &str,
+) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    // Bounded: ever-changing method names must not grow this without limit. Past
+    // the cap we stop deduping and logging — the vocabulary is sampled anyway.
+    const MAX_SEEN_METHODS: usize = 256;
+    let seen = SEEN.get_or_init(Default::default);
+    {
+        let Ok(mut guard) = seen.lock() else { return };
+        if guard.len() >= MAX_SEEN_METHODS {
+            return;
+        }
+        if !guard.insert(format!("{provider_key}:{kind}:{method}")) {
+            return;
+        }
+    }
+    let mut relay = state.write().await;
+    relay.push_log(
+        "warn",
+        format!("{provider_key} ACP: unhandled {kind} `{method}` (dropped)"),
+    );
+    relay.notify();
+}
+
 async fn handle_notification(
     payload: Value,
     stdin: &super::Outbound,
@@ -244,6 +275,7 @@ async fn handle_notification(
 ) {
     let method = payload.get("method").and_then(Value::as_str).unwrap_or("");
     if method != "session/update" {
+        log_unhandled_once(state, provider_key, "notification", method).await;
         return;
     }
     let Some(params) = payload.get("params") else {
@@ -949,6 +981,7 @@ async fn handle_server_request(
         // resulting error into silent *success*. Before answering a new
         // blocking `cursor/*` method this way, check what the agent does with
         // the reply.
+        log_unhandled_once(state, provider_key, "request", method).await;
         let mut stdin = stdin.lock().await;
         let _ = write_line(
             &mut **stdin,

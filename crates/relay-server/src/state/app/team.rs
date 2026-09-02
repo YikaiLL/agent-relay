@@ -1027,6 +1027,9 @@ over on resume"
             relay.notify();
         }
         guard.disarm();
+        // Drain was already confirmed above, so the seats are quiescent — the
+        // same condition every other settled path releases under.
+        self.release_seats_when_settled(&run_id, TeamRunStatus::Paused);
         Ok(TeamRunStatus::Paused)
     }
 
@@ -1179,6 +1182,45 @@ over on resume"
             other => run.set_status(other),
         });
         relay.notify();
+        drop(relay);
+
+        // Safe for `Paused` too, and most valuable there: releasing only drops
+        // the process, and a paused run may sit for hours.
+        self.release_seats_when_settled(run_id, status);
+    }
+
+    /// Every writer of a settled status calls this — wiring only `settle_team_run`
+    /// let a finished task keep its children. Fire-and-forget, and idempotent.
+    fn release_seats_when_settled(&self, run_id: &str, status: TeamRunStatus) {
+        if !(status.is_terminal() || status.is_settled_without_driver()) {
+            return;
+        }
+        let app = self.clone();
+        let run_id = run_id.to_string();
+        tokio::spawn(async move {
+            app.release_team_threads(&run_id).await;
+        });
+    }
+
+    /// Release every seat of a settled run, one failure never stopping the rest.
+    async fn release_team_threads(&self, run_id: &str) {
+        for thread_id in self.team_owned_threads(run_id).await {
+            let Ok((_, bridge)) = self.find_thread_provider(&thread_id).await else {
+                continue;
+            };
+            if let Err(error) = bridge.release_thread(&thread_id).await {
+                // Never load-bearing: a session we failed to hand back is still
+                // evictable at the cap, so this is a log line, not a failure.
+                let mut relay = self.relay.write().await;
+                relay.push_log(
+                    "warn",
+                    format!("Could not release task thread {thread_id}: {error}"),
+                );
+                // Without this the only diagnostic for a refused release waits
+                // for some unrelated state change before a client ever sees it.
+                relay.notify();
+            }
+        }
     }
 
     /// Hold the drive gate across a git mutation of the task worktree.
@@ -1235,13 +1277,16 @@ over on resume"
             .collect()
     }
 
-    async fn update_team_status(&self, run_id: &str, status: TeamRunStatus) {
-        let mut relay = self.relay.write().await;
-        relay.update_team_run(run_id, |run| run.set_status(status));
-        relay.notify();
+    pub(crate) async fn update_team_status(&self, run_id: &str, status: TeamRunStatus) {
+        {
+            let mut relay = self.relay.write().await;
+            relay.update_team_run(run_id, |run| run.set_status(status));
+            relay.notify();
+        }
+        self.release_seats_when_settled(run_id, status);
     }
 
-    async fn fail_team_run(&self, run_id: &str, error: impl Into<String>) {
+    pub(crate) async fn fail_team_run(&self, run_id: &str, error: impl Into<String>) {
         let error = error.into();
         let mut relay = self.relay.write().await;
         let mut changed = false;
@@ -1253,6 +1298,10 @@ over on resume"
         if changed {
             relay.push_log("warn", format!("Task {run_id} failed: {error}"));
             relay.notify();
+        }
+        drop(relay);
+        if changed {
+            self.release_seats_when_settled(run_id, TeamRunStatus::Failed);
         }
     }
 
@@ -1311,6 +1360,7 @@ over on resume"
                 "warn",
                 format!("Task {run_id}: driver lost; marked interrupted"),
             );
+            self.release_seats_when_settled(run_id, TeamRunStatus::Interrupted);
             relay.notify();
         }
     }
