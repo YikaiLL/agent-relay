@@ -1285,32 +1285,33 @@ mod tests {
         );
     }
 
-    /// A crash that reconciled a live run to `Interrupted` must still be reopenable:
-    /// the branch and sub-task progress are on disk, and "driver lost" is not a
-    /// verdict the user should have to abandon.
+    /// A crash that reconciled a live run to `Interrupted`, or a planning turn
+    /// that `Failed` without settling the run, must still be reopenable.
     #[tokio::test]
-    async fn an_interrupted_run_can_be_reopened() {
+    async fn an_interrupted_or_failed_run_can_be_reopened() {
         let project = TempDir::new().expect("tempdir");
         let cwd = project.path().to_string_lossy().to_string();
-        let (app, run_id) = app_with_a_live_run(&cwd).await;
-        {
-            let mut relay = app.relay.write().await;
-            relay.update_team_run(&run_id, |run| {
-                run.status = relay_api::team::TeamRunStatus::Interrupted;
-                run.error = Some(
-                    "the task team's driver was lost; re-run to continue from the last completed step"
-                        .to_string(),
-                );
-            });
-        }
+        for (status, label) in [
+            (relay_api::team::TeamRunStatus::Interrupted, "interrupted"),
+            (relay_api::team::TeamRunStatus::Failed, "failed"),
+        ] {
+            let (app, run_id) = app_with_a_live_run(&cwd).await;
+            {
+                let mut relay = app.relay.write().await;
+                relay.update_team_run(&run_id, |run| {
+                    run.status = status;
+                    run.error = Some(format!("simulated {label} stop"));
+                });
+            }
 
-        app.call_orchestrator_tool(
-            "propose_reopen",
-            &json!({ "text": "Pick up where the crash cut off." }),
-            Some("device-1".to_string()),
-        )
-        .await
-        .expect("propose_reopen on an interrupted run");
+            app.call_orchestrator_tool(
+                "propose_reopen",
+                &json!({ "text": "Pick up where it stopped." }),
+                Some("device-1".to_string()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("propose_reopen on a {label} run"));
+        }
     }
 
     /// A note is the user asking for another go, so it has to buy one. Without

@@ -146,10 +146,13 @@ impl TeamRunStatus {
 
     /// Whether a terminal run may be put back to work on its existing branch.
     ///
-    /// `Interrupted` qualifies: the worktree and partial progress are on disk,
-    /// and a crash that lost the driver is not a reason to forbid continuing.
+    /// `Interrupted` and `Failed` qualify when work is on disk but the driver
+    /// stopped without a user verdict — a lost driver or a planning parse miss.
     pub fn is_reopenable(self) -> bool {
-        matches!(self, Self::Done | Self::Escalated | Self::Interrupted)
+        matches!(
+            self,
+            Self::Done | Self::Escalated | Self::Interrupted | Self::Failed
+        )
     }
 
     /// Whether the run holds its threads and worktree with no driver entitled to
