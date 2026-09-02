@@ -18346,6 +18346,57 @@ forwarded: a Claude turn on a codex id fails and tears down the SDK session \
     }
 
     #[tokio::test]
+    async fn a_foreign_model_is_dropped_even_when_its_own_providers_catalog_is_cold() {
+        // The restart race the sibling test above hides by warming codex first.
+        // Ownership needs positive evidence — "some OTHER provider publishes this id"
+        // — so a codex catalog that has not been loaded yet leaves a persisted
+        // `codex-model` on a Claude thread looking like a legitimate unlisted
+        // override, and it goes out verbatim. Nothing here warms codex.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        let claude = providers.get("claude_code").unwrap();
+
+        let claude_thread = claude.summary("claude-bg", cwd);
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(claude_thread.id.clone(), claude_thread.clone());
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("claude_code".to_string());
+            relay.current_cwd = cwd.to_string();
+            relay.threads = vec![claude_thread.clone()];
+            // What an older build persisted, and what a restart faithfully restores.
+            relay.remember_thread_settings(
+                &claude_thread.id,
+                "on-request",
+                "workspace-write",
+                "medium",
+                "codex-model",
+            );
+        }
+
+        app.send_message_to_thread(&claude_thread.id, "go", None, None)
+            .await
+            .expect("claude send");
+
+        let turn_models = claude.turn_models.lock().await.clone();
+        let sent = turn_models
+            .iter()
+            .filter(|(id, _, _)| id == &claude_thread.id)
+            .last()
+            .map(|(_, model, _)| model.clone())
+            .expect("the claude thread should have run a turn");
+        assert_eq!(
+            sent, "claude_code-model",
+            "whether a persisted id is foreign cannot depend on whether its owner's \
+catalog happens to be warm — the answer is the same either way ({turn_models:?})"
+        );
+    }
+
+    #[tokio::test]
     async fn a_cold_catalog_falls_back_to_the_providers_own_default_not_the_global() {
         // Right after a restart every catalog is cold, and that is exactly when the
         // ownership guard goes blind too: `resolve_provider_model` reaches the

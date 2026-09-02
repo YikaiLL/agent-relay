@@ -996,9 +996,68 @@ in thread {thread_id}: {error}"
         if own.iter().any(|option| option.model == model) {
             return false;
         }
+        Self::any_catalog_claims(&catalogs, provider_name, model)
+    }
+
+    /// The same question, for the path that SENDS.
+    ///
+    /// The cache-only form above answers "no" both when an id is a legitimate
+    /// unlisted override and when its owner is a provider nobody has asked yet —
+    /// so which one you get depends on warm-up order, and after a restart a
+    /// persisted foreign id sails through. Before sending, spend the one-off
+    /// `list_models` to tell those apart. Kept off `model_belongs_to_another_provider`
+    /// because that one runs on the polled transcript read, where an uncached
+    /// provider RPC per poll would be its own bug.
+    async fn model_belongs_to_another_provider_asking(
+        &self,
+        provider_name: &str,
+        model: &str,
+    ) -> bool {
+        if self
+            .model_belongs_to_another_provider(provider_name, model)
+            .await
+        {
+            return true;
+        }
+        {
+            // Nothing to settle unless this provider's own catalog is known and does
+            // not list the id — same precondition as above.
+            let catalogs = self.provider_model_catalogs.read().await;
+            match catalogs.get(provider_name).filter(|own| !own.is_empty()) {
+                Some(own) if !own.iter().any(|option| option.model == model) => {}
+                _ => return false,
+            }
+        }
+        self.load_unasked_provider_catalogs(provider_name).await;
+        let catalogs = self.provider_model_catalogs.read().await;
+        Self::any_catalog_claims(&catalogs, provider_name, model)
+    }
+
+    fn any_catalog_claims(
+        catalogs: &HashMap<String, Vec<ModelOptionView>>,
+        except: &str,
+        model: &str,
+    ) -> bool {
         catalogs.iter().any(|(other, catalog)| {
-            other != provider_name && catalog.iter().any(|option| option.model == model)
+            other != except && catalog.iter().any(|option| option.model == model)
         })
+    }
+
+    /// Load every configured provider's catalog we have not got yet, skipping one.
+    /// A provider that fails stays absent and will be asked again — the alternative
+    /// is caching "unknown", which would make a transient failure permanent.
+    async fn load_unasked_provider_catalogs(&self, skip: &str) {
+        let unasked: Vec<(String, Arc<dyn ProviderBridge>)> = {
+            let catalogs = self.provider_model_catalogs.read().await;
+            self.providers
+                .iter()
+                .filter(|(name, _)| name.as_str() != skip && !catalogs.contains_key(name.as_str()))
+                .map(|(name, bridge)| (name.clone(), bridge.clone()))
+                .collect()
+        };
+        for (name, bridge) in unasked {
+            self.load_provider_model_catalog(&name, &bridge).await;
+        }
     }
 
     async fn expire_stale_controller_if_needed(&self) {

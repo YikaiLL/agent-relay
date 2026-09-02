@@ -1568,7 +1568,6 @@ started ({error}); finishing with round {round}'s findings."
         model: Option<&str>,
         effort: Option<&str>,
     ) -> Result<DispatchedTurn, ThreadDriveError> {
-        let defaults = self.defaults().await;
         // When the caller doesn't pin a model/effort, use the TARGET thread's OWN
         // remembered settings — not the active session's — passed as the EXPLICIT
         // model so it's honored verbatim (resolve_provider_model otherwise prefers the
@@ -1606,7 +1605,7 @@ started ({error}); finishing with round {round}'s findings."
         let target_model = match target_model {
             Some(model)
                 if self
-                    .model_belongs_to_another_provider(&provider_name, &model)
+                    .model_belongs_to_another_provider_asking(&provider_name, &model)
                     .await =>
             {
                 None
