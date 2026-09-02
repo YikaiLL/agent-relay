@@ -3963,3 +3963,44 @@ async fn a_native_fork_sends_the_resolved_model_to_the_provider() {
     );
     assert_eq!(fork["params"]["threadId"], "thread-src");
 }
+
+// Which Codex failures are LIMITS — the ones that pause a task run instead of
+// ending it. A pause is resumable, so the branch, worktree and sub-task
+// progress survive until the limit lifts; an ordinary failure throws them away.
+#[test]
+fn codex_classifies_both_session_limits_and_nothing_else() {
+    for limit in ["usageLimitExceeded", "sessionBudgetExceeded"] {
+        assert_eq!(
+            codex_error_info_kind(&json!(limit)),
+            Some(TurnFailureKind::UsageLimit),
+            "{limit:?} is a session limit and must pause the run, not end it"
+        );
+        // The same variant arrives object-wrapped too, and this mapper reads
+        // both — a classification that depended on the shape would be a
+        // coin-flip on whichever form the provider happened to send.
+        assert_eq!(
+            codex_error_info_kind(&json!({ limit: {} })),
+            Some(TurnFailureKind::UsageLimit),
+            "{limit:?} must classify the same object-wrapped as bare"
+        );
+    }
+
+    // A transient, not a limit. Pausing would park the run as "waiting for
+    // quota" when the answer is simply to try again.
+    for ordinary in [
+        "serverOverloaded",
+        "contextWindowExceeded",
+        "unauthorized",
+        "badRequest",
+        "internalServerError",
+        "other",
+        "someUnknownFutureVariant",
+    ] {
+        assert_eq!(
+            codex_error_info_kind(&json!(ordinary)),
+            None,
+            "{ordinary:?} must stay an ordinary failure"
+        );
+        assert_eq!(codex_error_info_kind(&json!({ ordinary: {} })), None);
+    }
+}

@@ -992,10 +992,10 @@ pub(crate) fn codex_turn_failure_reason(turn: &Value) -> Option<String> {
     Some(label.unwrap_or_else(|| "The turn ended with an error.".to_string()))
 }
 
-/// Map codex's `codexErrorInfo` onto the shared [`TurnFailureKind`]. Only a
-/// genuine usage-limit block is classified; every other variant (including
-/// `sessionBudgetExceeded` and `serverOverloaded`) yields `None` and stays an
-/// ordinary failure — the enum's table says why each omission is deliberate.
+/// Map codex's `codexErrorInfo` onto the shared [`TurnFailureKind`]. Codex's two
+/// session limits classify; every other variant — `serverOverloaded` included —
+/// yields `None` and stays an ordinary failure. The enum's table says why each
+/// omission is deliberate.
 pub(crate) fn codex_error_info_kind(info: &Value) -> Option<TurnFailureKind> {
     let variant = match info {
         Value::String(variant) => variant.as_str(),
@@ -1003,7 +1003,7 @@ pub(crate) fn codex_error_info_kind(info: &Value) -> Option<TurnFailureKind> {
         _ => return None,
     };
     match variant {
-        "usageLimitExceeded" => Some(TurnFailureKind::UsageLimit),
+        "usageLimitExceeded" | "sessionBudgetExceeded" => Some(TurnFailureKind::UsageLimit),
         _ => None,
     }
 }

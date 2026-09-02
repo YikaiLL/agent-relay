@@ -1131,6 +1131,80 @@ async fn an_unrecognised_failure_kind_fails_the_turn_without_pausing_the_run() {
     );
 }
 
+/// The same policy as the usage-limit halt, reached from Codex's OTHER session
+/// limit. Ending a session-budget failure terminally throws away the branch,
+/// the worktree and every finished sub-task; paused, they are all still there
+/// when the budget is raised.
+#[tokio::test]
+async fn a_dev_turn_that_exhausts_the_session_budget_halts_the_run_before_any_review() {
+    // Asserted, not assumed: the harness below speaks the Claude worker's wire
+    // string, so without this the test would ride the usage-limit path and
+    // prove nothing about Codex's session-budget variant.
+    let kind = crate::codex::codex_error_info_kind(&serde_json::json!("sessionBudgetExceeded"))
+        .expect("a session budget is a session limit and must be classified");
+    assert!(
+        kind.halts_the_run(),
+        "a classified session limit must pause the run rather than end it"
+    );
+
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .fail_completed_turn_with
+        .lock()
+        .await
+        .replace((
+            "Session budget exhausted".to_string(),
+            Some("usage_limit".to_string()),
+        ));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 0,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    match dev_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => {
+            assert!(
+                reason.contains("Session budget exhausted"),
+                "the dev turn's own reason should say so: {reason}"
+            );
+        }
+        other => panic!("the dev turn should have failed on the session budget: {other:?}"),
+    }
+    assert!(
+        run.pause_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Session budget exhausted")),
+        "pause_reason must name the limit, got {:?}",
+        run.pause_reason
+    );
+    assert_eq!(
+        run.pause_kind,
+        Some(relay_api::team::TeamPauseKind::Provider)
+    );
+    assert!(
+        reviewer_outcomes.lock().await.is_empty(),
+        "the reviewer thread must never be given a turn after a provider halt"
+    );
+    assert_eq!(
+        run.sub_tasks[0].rounds_used, 0,
+        "a paused run has spent no review budget"
+    );
+    assert_ne!(run.sub_tasks[0].status, crate::state::SubTaskStatus::Escalated);
+}
+
 #[tokio::test]
 async fn a_reviewer_turn_is_refused_without_a_landed_dev_turn() {
     let (_repo, root) = init_team_repo().await;

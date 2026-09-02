@@ -34,15 +34,18 @@ pub(crate) struct TurnFailure {
 /// |---|---|---|
 /// | Claude worker `done.failure_kind = "usage_limit"` | `UsageLimit` | halt, settle `Paused` |
 /// | Codex `codexErrorInfo: usageLimitExceeded` | `UsageLimit` | halt, settle `Paused` |
-/// | Codex `sessionBudgetExceeded` | none | ordinary failure |
+/// | Codex `codexErrorInfo: sessionBudgetExceeded` | `UsageLimit` | halt, settle `Paused` |
 /// | Codex `serverOverloaded` | none | ordinary failure |
 /// | every other Codex variant (`unauthorized`, `badRequest`, …) | none | ordinary failure |
 /// | an unrecognised kind string from a newer worker | none | ordinary failure |
 ///
-/// Those omissions are deliberate. Halting converts a failure into a RESUMABLE
-/// `Paused` run, which is only honest for a block that lifts on a clock: a
-/// session budget needs a bigger budget and an overloaded server needs a retry,
-/// and an auth or request error is not "waiting for quota" at all. Widening this
+/// The line is whether the run is worth keeping until the block lifts. Halting
+/// converts a failure into a RESUMABLE `Paused` run, so the branch, worktree and
+/// finished sub-tasks survive — right for a spend limit, whether it resets on a
+/// clock or when someone raises it. The omissions are equally deliberate:
+/// `serverOverloaded` is a transient the caller should retry, and an auth or
+/// request error is not "waiting for quota" at all — parking either would
+/// describe a run as waiting for something that is never coming. Widening this
 /// enum widens that promise, so [`Self::halts_the_run`] is an exhaustive match —
 /// a new variant has to state its policy rather than inherit one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
