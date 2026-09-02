@@ -2603,6 +2603,34 @@ impl relay_api::TeamPort for AppState {
             .map_err(|error| TeamPortError::Failed(error.to_string()))
     }
 
+    async fn resume_or_start_thread(
+        &self,
+        run_id: &str,
+        role: TeamRole,
+        candidates: &[String],
+    ) -> Result<String, TeamPortError> {
+        for candidate in candidates.iter().filter(|id| !id.is_empty()) {
+            // Routing is not enough: the relay's thread cache outlives the
+            // session, so an archived one still resolves. Only the provider knows.
+            let usable = match self.find_thread_provider(candidate).await {
+                Ok((_, bridge)) => bridge.session_can_take_a_turn(candidate).await,
+                Err(_) => false,
+            };
+            if usable {
+                return Ok(candidate.clone());
+            }
+            self.relay.write().await.push_log(
+                "info",
+                format!(
+                    "Task {run_id}: the {} session {candidate} can no longer be opened; \
+trying the next seat",
+                    role.as_str()
+                ),
+            );
+        }
+        relay_api::TeamPort::start_thread(self, run_id, role).await
+    }
+
     async fn record_run_thread(&self, run_id: &str, thread_id: &str) -> TeamThreadSlot {
         self.record_run_thread(run_id, thread_id).await
     }

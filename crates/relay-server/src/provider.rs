@@ -205,6 +205,13 @@ pub trait ProviderBridge: Send + Sync {
         sandbox: &str,
     ) -> Result<(), String>;
     async fn read_thread(&self, thread_id: &str) -> Result<ThreadSyncData, String>;
+    /// Whether a recorded session can still be given a turn.
+    ///
+    /// Reading the history back is the general test but a stricter one: an agent
+    /// may refuse to replay a session it can still be prompted with.
+    async fn session_can_take_a_turn(&self, thread_id: &str) -> bool {
+        self.read_thread(thread_id).await.is_ok()
+    }
     async fn read_thread_transcript_page(
         &self,
         _thread_id: &str,

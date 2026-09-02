@@ -573,6 +573,12 @@ pub struct SubTask {
     /// private driver writes and a public gate must not depend on.
     #[serde(default)]
     pub dev_turns_landed: u32,
+    /// Which reopen cycle is WORKING this sub-task, from `reopened_count`.
+    ///
+    /// A reopen keeps the last cycle's finished sub-tasks, so status alone cannot
+    /// say whose work a session holds. Legacy 0 costs sharing, not correctness.
+    #[serde(default)]
+    pub cycle: u32,
 }
 
 /// One TL session in the succession chain.
@@ -605,9 +611,13 @@ pub enum TeamThreadSlot {
     Tl,
     SubTaskDev(usize),
     SubTaskReviewer(usize),
-    /// Index into `run_owned_thread_ids` — the design reviewer, an MR reviewer,
-    /// or the MR-revision dev.
+    /// Index into `run_owned_thread_ids` — the design reviewer or an MR reviewer.
     RunOwned(usize),
+    /// The dev seat that addresses MR-gate findings, wherever it came from.
+    ///
+    /// Named, not indexed: `run_owned_thread_ids` keeps every dead seat, so
+    /// picking "the dev in it" reaches a session from two cycles ago.
+    MrDev,
 }
 
 /// One seat in the task-team runtime.
@@ -728,6 +738,13 @@ pub struct TeamRun {
     /// still known, so its spend does not land in the report under no role.
     #[serde(default)]
     pub run_owned_thread_roles: BTreeMap<String, String>,
+
+    /// The dev session that last addressed MR-gate findings, if there is one.
+    ///
+    /// Remembered rather than derived, because `run_owned_thread_ids` would
+    /// answer with the oldest. Kept across a reopen: same code, same session.
+    #[serde(default)]
+    pub mr_dev_thread_id: Option<String>,
 
     /// Instructions left for the team to pick up on its next turn. The driver
     /// drains these; they are notes TO the team, never from it.
@@ -1123,6 +1140,9 @@ impl TeamRun {
     /// reset a sub-task whose turn is still running and lose the work in flight.
     pub fn revive_sub_tasks(&mut self, only: Option<&[String]>) -> bool {
         let mut revived = false;
+        // A revived sub-task is worked NOW, whatever cycle wrote it down; a
+        // stale stamp hides its developer from the run's session topology.
+        let working_cycle = self.reopened_count;
         for task in &mut self.sub_tasks {
             let selected = match only {
                 None => task.status == SubTaskStatus::Escalated,
@@ -1139,6 +1159,7 @@ impl TeamRun {
                 // slot but left in `owned_thread_ids`: it still has to be drained.
                 task.dev_thread_id = None;
                 task.reruns += 1;
+                task.cycle = working_cycle;
                 revived = true;
             }
         }
@@ -1176,6 +1197,9 @@ impl TeamRun {
             if self.sub_tasks.iter().any(|kept| kept.id == task.id) {
                 task.id = mint_sub_task_id();
             }
+            // The last cycle's finished sub-tasks stay in the list beside these,
+            // and nothing else tells the two apart.
+            task.cycle = self.reopened_count;
             self.sub_tasks.push(task);
         }
         self.updated_at = unix_now();
@@ -1237,6 +1261,9 @@ impl TeamRun {
         for thread_id in self.run_owned_thread_ids.iter_mut() {
             swap(thread_id);
         }
+        if let Some(mr_dev) = self.mr_dev_thread_id.as_mut() {
+            swap(mr_dev);
+        }
         for task in self.sub_tasks.iter_mut() {
             if let Some(dev) = task.dev_thread_id.as_mut() {
                 swap(dev);
@@ -1247,6 +1274,13 @@ impl TeamRun {
             for thread_id in task.owned_thread_ids.iter_mut() {
                 swap(thread_id);
             }
+        }
+        // Left behind, the seat bills under no role and reads as one nobody
+        // ever started.
+        if let Some(role) = self.run_owned_thread_roles.remove(pending_id) {
+            self.run_owned_thread_roles
+                .insert(real_id.to_string(), role);
+            changed = true;
         }
         if let Some(in_flight) = self.in_flight_thread.as_mut() {
             if in_flight == pending_id {
@@ -1278,6 +1312,7 @@ impl TeamRun {
                 self.sub_tasks.get(index)?.reviewer_thread_id.clone()?
             }
             TeamThreadSlot::RunOwned(index) => self.run_owned_thread_ids.get(index)?.clone(),
+            TeamThreadSlot::MrDev => self.mr_dev_thread_id.clone()?,
         };
         (!id.is_empty()).then_some(id)
     }
@@ -1319,6 +1354,9 @@ impl TeamRun {
                     .map(|generation| generation.thread_id.as_str()),
             )
             .chain(self.run_owned_thread_ids.iter().map(String::as_str))
+            // This seat WRITES, so a drain that missed it would keep changing
+            // files after the run's locks were released.
+            .chain(self.mr_dev_thread_id.as_deref())
             .chain(self.sub_tasks.iter().flat_map(|task| {
                 task.owned_thread_ids
                     .iter()

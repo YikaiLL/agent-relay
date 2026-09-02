@@ -2739,3 +2739,105 @@ async fn a_failed_delete_keeps_the_runtime_intact() {
     super::settle_delete(&sessions, "t", &Ok(())).await;
     assert!(!sessions.lock().await.contains_key("t"));
 }
+
+/// An agent without `loadSession` refuses to replay a session it can still be
+/// prompted with; reading that refusal as "dead" throws away a live seat.
+#[tokio::test]
+async fn a_live_session_can_take_a_turn_even_when_its_history_cannot_be_read() {
+    let state = relay_state();
+    let (outbound, _outbound_peer) = tokio::io::duplex(8192);
+    let (_inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state, outbound, inbound, "cursor");
+    bridge.seed_session_for_test("t1", "/tmp/project").await;
+    bridge.mark_session_content_for_test("t1").await;
+
+    assert!(
+        crate::provider::ProviderBridge::read_thread(&bridge, "t1")
+            .await
+            .is_err(),
+        "without loadSession the history genuinely cannot be replayed"
+    );
+    assert!(
+        crate::provider::ProviderBridge::session_can_take_a_turn(&bridge, "t1").await,
+        "but the session is in this process, and start_turn needs no such capability"
+    );
+    assert!(
+        !crate::provider::ProviderBridge::session_can_take_a_turn(&bridge, "gone").await,
+        "a session the bridge has no copy of really is beyond reuse"
+    );
+}
+
+/// A listing caches a cwd for a later load, not an open session — and after a
+/// restart it is how a team seat is found, so "in the map" would fail the turn.
+#[tokio::test]
+async fn a_session_known_only_from_a_listing_is_not_treated_as_loaded() {
+    let state = relay_state();
+    let (outbound, _outbound_peer) = tokio::io::duplex(8192);
+    let (_inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state, outbound, inbound, "cursor");
+
+    bridge
+        .absorb_listing_for_test("t-cold", "/tmp/project")
+        .await;
+
+    assert!(
+        !crate::provider::ProviderBridge::session_can_take_a_turn(&bridge, "t-cold").await,
+        "a cold session has to be loaded before it can be prompted, and this \
+agent cannot load one at all"
+    );
+}
+
+/// The load IS what makes a cold session promptable, so it is not refused —
+/// and it is recorded, or the next MR round replays the whole thing again.
+#[tokio::test]
+async fn a_cold_session_is_loaded_once_and_then_known_to_be_attached() {
+    let state = relay_state();
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = std::sync::Arc::new(AcpBridge::for_test(state, outbound, inbound, "cursor"));
+    bridge.allow_session_load_for_test().await;
+    bridge
+        .absorb_listing_for_test("t-cold", "/tmp/project")
+        .await;
+
+    let probing = {
+        let bridge = bridge.clone();
+        tokio::spawn(async move {
+            crate::provider::ProviderBridge::session_can_take_a_turn(&*bridge, "t-cold").await
+        })
+    };
+
+    let request = next_wire_line(&mut outbound_peer).await;
+    assert_eq!(
+        request["method"],
+        json!("session/load"),
+        "a cold session an agent can load is loaded, not written off"
+    );
+    let mut writer = inbound_writer;
+    let reply = json!({"jsonrpc": "2.0", "id": request["id"], "result": {}});
+    tokio::io::AsyncWriteExt::write_all(&mut writer, format!("{reply}\n").as_bytes())
+        .await
+        .expect("write");
+    tokio::io::AsyncWriteExt::flush(&mut writer)
+        .await
+        .expect("flush");
+
+    assert!(
+        probing.await.expect("the probe finishes"),
+        "a session that loaded can take a turn"
+    );
+
+    assert!(
+        crate::provider::ProviderBridge::session_can_take_a_turn(&*bridge, "t-cold").await,
+        "and it stays usable"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::io::AsyncReadExt::read(&mut outbound_peer, &mut vec![0_u8; 1024]),
+        )
+        .await
+        .is_err(),
+        "the second probe must not put another session/load on the wire"
+    );
+}

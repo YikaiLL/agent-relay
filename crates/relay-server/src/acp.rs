@@ -156,6 +156,11 @@ pub(crate) struct SessionRuntime {
     pub(crate) model: String,
     /// The mode the session is actually in, per the agent's own reporting.
     pub(crate) mode: String,
+    /// Whether THIS connection has the session open.
+    ///
+    /// Not the same as being in the map — `absorb_thread_cwds` puts every listed
+    /// session there, cold. A prompt sent to a cold one fails.
+    pub(crate) attached: bool,
     /// Whether this session has ever carried a turn.
     ///
     /// Measured: Cursor cannot load a session with no content — it answers
@@ -773,6 +778,8 @@ impl AcpBridge {
             SessionRuntime {
                 cwd: cwd.to_string(),
                 approval_policy: "on-request".to_string(),
+                // Every caller of this helper then drives a turn on it.
+                attached: true,
                 ..Default::default()
             },
         );
@@ -797,9 +804,38 @@ impl AcpBridge {
             SessionRuntime {
                 cwd: cwd.to_string(),
                 approval_policy: approval_policy.to_string(),
+                attached: true,
                 ..Default::default()
             },
         );
+    }
+
+    /// Absorb a thread the way a `session/list` response does: a cwd cached for
+    /// a LATER `session/load`, not a session this connection has opened.
+    #[cfg(test)]
+    pub(crate) async fn absorb_listing_for_test(&self, thread_id: &str, cwd: &str) {
+        let listed = ThreadSummaryView {
+            workspace_trusted: false,
+            id: thread_id.to_string(),
+            name: None,
+            preview: String::new(),
+            cwd: cwd.to_string(),
+            updated_at: crate::state::unix_now(),
+            source: "cursor".to_string(),
+            status: "idle".to_string(),
+            model_provider: "cursor".to_string(),
+            provider: "cursor".to_string(),
+            forked_from: None,
+            renamed: false,
+        };
+        absorb_thread_cwds(&mut *self.sessions.lock().await, &[listed]);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn mark_session_content_for_test(&self, thread_id: &str) {
+        if let Some(session) = self.sessions.lock().await.get_mut(thread_id) {
+            session.has_content = true;
+        }
     }
 
     #[cfg(test)]
@@ -1190,6 +1226,8 @@ impl ProviderBridge for AcpBridge {
             let mut runtime = SessionRuntime {
                 cwd: cwd.to_string(),
                 approval_policy: approval_policy.to_string(),
+                // `session/new` just opened it on this connection.
+                attached: true,
                 ..Default::default()
             };
             // Whatever `session/new` chose, until the relay says otherwise.
@@ -1284,6 +1322,8 @@ impl ProviderBridge for AcpBridge {
                 let session = sessions.entry(thread_id.to_string()).or_default();
                 absorb_session_settings(session, &result);
                 session.has_content = true;
+                // The replay landed, so this connection now holds it.
+                session.attached = true;
             }
         }
 
@@ -1298,6 +1338,17 @@ impl ProviderBridge for AcpBridge {
             .or_default()
             .approval_policy = approval_policy.to_string();
         Ok(())
+    }
+
+    /// An attached session is promptable whatever the agent says about replaying
+    /// it. A cold one really does need the load, so it falls through.
+    async fn session_can_take_a_turn(&self, thread_id: &str) -> bool {
+        if let Some(session) = self.sessions.lock().await.get(thread_id) {
+            if session.attached {
+                return true;
+            }
+        }
+        self.read_thread(thread_id).await.is_ok()
     }
 
     async fn read_thread(&self, thread_id: &str) -> Result<ThreadSyncData, String> {
@@ -1375,6 +1426,8 @@ impl ProviderBridge for AcpBridge {
             let session = sessions.entry(thread_id.to_string()).or_default();
             absorb_session_settings(session, &result);
             session.has_content = true;
+            // Without this the next probe pays for the whole replay again.
+            session.attached = true;
         }
 
         let preview = transcript
