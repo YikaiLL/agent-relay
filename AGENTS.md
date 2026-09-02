@@ -34,6 +34,16 @@ fake) to web/mobile frontends. Rust workspace + Node worker + Vite frontend.
 
 ## Driving the relay from a script
 
+**Do not stop, kill, or restart the user's relay** (`relay-server` on port 8787
+or whatever `npm run dev:full` is using) unless they explicitly ask you to. A
+running relay holds live team drivers, provider sessions, and in-memory state
+that a restart disrupts; patching `~/.agent-relay/session.json` while it is up
+also races the debounced writer and your edits get overwritten. Prefer the HTTP
+API (`revise`, `confirm`, `dismiss`, orchestrator tools) against the live
+instance. To test changes in isolation, spin up a **separate** relay on another
+port with its own `RELAY_STATE_PATH` (see below) — never touch the one the user
+is working through.
+
 The relay is a plain JSON HTTP API on `127.0.0.1:8787` (`npm run dev:full`), so
 an agent can drive it without a browser. On loopback with no `RELAY_API_TOKEN`
 set, send `X-Agent-Relay-CSRF: 1` and nothing else; with a token, send
