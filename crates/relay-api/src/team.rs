@@ -1121,6 +1121,9 @@ impl TeamRun {
                 task.status = SubTaskStatus::Pending;
                 task.rounds_used = 0;
                 task.digested = false;
+                // The reviewer gate reads this. Left standing, the rerun's
+                // reviewer runs on the previous attempt's landed turn.
+                task.dev_turns_landed = 0;
                 // The session holds the attempt being rejected. Dropped from the
                 // slot but left in `owned_thread_ids`: it still has to be drained.
                 task.dev_thread_id = None;
@@ -1929,6 +1932,34 @@ mod tests {
             run.sub_tasks[0].owned_thread_ids,
             vec!["dev-1".to_string()],
             "the old thread still has to be drained, so it stays owned"
+        );
+    }
+
+    /// The reviewer gate refuses to start a reviewer turn while this is zero —
+    /// there is nothing to review until a dev turn lands. A rerun starts over on
+    /// an unchanged branch, so inheriting the last attempt's count opens that
+    /// gate before the rerun's dev has done anything.
+    #[test]
+    fn a_revived_sub_task_has_no_landed_dev_turn() {
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![
+                spent_sub_task("st-1", SubTaskStatus::Escalated),
+                spent_sub_task("st-2", SubTaskStatus::Escalated),
+            ],
+        );
+        run.sub_tasks[0].dev_turns_landed = 2;
+        run.sub_tasks[1].dev_turns_landed = 1;
+
+        assert!(run.revive_sub_tasks(Some(&["st-1".to_string()])));
+
+        assert_eq!(
+            run.sub_tasks[0].dev_turns_landed, 0,
+            "the rerun's reviewer must wait on the rerun's own dev turn"
+        );
+        assert_eq!(
+            run.sub_tasks[1].dev_turns_landed, 1,
+            "a sub-task this revive did not take keeps its landed count"
         );
     }
 
