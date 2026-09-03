@@ -18,7 +18,10 @@ use crate::{
         ThreadSummaryView, ToolCallView, TranscriptContentState, TranscriptEntryKind,
         TranscriptEntryView,
     },
-    state::{ApprovalKind, PendingApproval, RelayState},
+    state::{
+        ApprovalKind, BrokerPendingMessage, PendingApproval, PendingTranscriptDelta, RelayState,
+        TranscriptDeltaKind,
+    },
 };
 
 use super::{protocol, Captures, PendingResponses, SessionRuntime, Sessions};
@@ -681,13 +684,28 @@ pub(crate) fn apply_op(
             delta,
             text,
         } => {
+            // No per-chunk `start`: it wipes the accumulated text before every
+            // append (upsert_transcript_item_for_thread:122), pinning text_offset at 0.
             if background {
-                relay.bg_start_agent_message(thread_id, item_id.clone(), turn.clone(), now);
                 relay.bg_append_agent_delta(thread_id, &item_id, &delta, &turn, now);
                 relay.bg_complete_agent_message(thread_id, item_id, text, turn, now);
             } else {
-                relay.start_agent_message_for_thread(thread_id, item_id.clone(), turn.clone());
-                relay.append_agent_delta_for_thread(thread_id, &item_id, &delta, &turn);
+                let mutation =
+                    relay.append_agent_delta_for_thread(thread_id, &item_id, &delta, &turn);
+                relay.queue_broker_message(BrokerPendingMessage::TranscriptDelta(
+                    PendingTranscriptDelta {
+                        thread_id: thread_id.to_string(),
+                        base_revision: mutation.base_revision,
+                        revision: mutation.revision,
+                        entry_seq: mutation.entry_seq,
+                        server_time: mutation.server_time,
+                        item_id: item_id.clone(),
+                        turn_id: Some(turn.clone()),
+                        delta,
+                        kind: TranscriptDeltaKind::AgentText,
+                        text_offset: mutation.text_offset,
+                    },
+                ));
                 relay.complete_agent_message_for_thread(thread_id, item_id, text, turn);
                 relay.touch_thread_progress(thread_id, Some("responding"), None);
             }
