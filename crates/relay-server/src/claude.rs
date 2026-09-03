@@ -4747,6 +4747,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_worker_eviction_mid_turn_records_a_failure_that_does_not_halt_the_run() {
+        // worker.mjs `evictSessionsIfNeeded`: its own concurrency cap (distinct
+        // from an Anthropic usage limit), reclaiming the LRU session even if a
+        // turn is in flight. Before this shape was reported with `failed`/
+        // `reason`/`failure_kind`, the turn settled as a clean `done` and an
+        // evicted dev that had already emitted text read as Replied, able to
+        // open review on a branch nothing more was ever going to land on.
+        let state = new_test_state();
+        {
+            let mut relay = state.write().await;
+            relay.set_provider_name("claude_code".to_string());
+            relay.active_thread_id = Some("claude-thread".to_string());
+            relay.set_active_turn(Some("turn-1".to_string()));
+            relay.set_thread_status("claude-thread", "active".to_string(), Vec::new());
+        }
+
+        handle_worker_event(
+            json!({
+                "type": "done",
+                "provider_session_id": "claude-thread",
+                "turn_id": "turn-1",
+                "failed": true,
+                "reason": "Claude background session was evicted because the session limit was reached",
+                "failure_kind": "session_capacity"
+            }),
+            &state,
+        )
+        .await;
+
+        let relay = state.read().await;
+        assert_eq!(relay.active_turn_id, None);
+        let failure = relay
+            .snapshot()
+            .transcript
+            .into_iter()
+            .find(|entry| entry.kind == TranscriptEntryKind::Error)
+            .expect("an evicted mid-turn must leave a durable failure entry, not a clean done");
+        assert_eq!(failure.status, "failed");
+        assert_eq!(failure.turn_id.as_deref(), Some("turn-1"));
+        assert!(failure
+            .text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("session limit was reached"));
+        // Distinct from the Anthropic quota: `TurnFailureKind::from_wire` does
+        // not recognise "session_capacity", so it degrades to an ordinary
+        // failure rather than halting the run the way `usage_limit` does.
+        assert_eq!(
+            relay
+                .last_turn_failure("claude-thread")
+                .and_then(|f| f.kind),
+            None,
+            "the worker's own capacity eviction must not be read as a provider limit"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_background_done_surfaces_failure_after_switching_back() {
         // A turn that fails while its thread is in the BACKGROUND must still
         // surface the failure when the user later switches back to that thread.

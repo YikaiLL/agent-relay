@@ -676,6 +676,47 @@ test("releaseSession refuses while work is in flight", async () => {
   assert.equal(sessions.size, 2, "nothing released while work is in flight");
 });
 
+test("an eviction mid-turn reports the turn failed, not a clean done", async () => {
+  // A dev that had already emitted text, then got evicted at the session cap,
+  // used to settle via a bare `done` — indistinguishable from a real success,
+  // so the relay read it as Replied and could open review on nothing.
+  const sessions = new Map();
+  const context = { pendingApprovals: new Map(), pendingAskUserQuestions: new Map() };
+  for (let i = 0; i < SESSION_LIMIT + 1; i += 1) {
+    const entry = createSessionEntry({
+      key: `session:${i}`,
+      providerSessionId: `session-${i}`,
+      cmd: { cwd: "/tmp" },
+    });
+    entry.running = true;
+    entry.currentTurnId = `turn-${i}`;
+    entry.lastUsedAt = i; // ascending: session-0 is the oldest, evicted first
+    entry.session = fakeQuery();
+    sessions.set(entry.key, entry);
+  }
+
+  const lines = await captureStdout(() => {
+    evictSessionsIfNeeded(sessions, context);
+  });
+
+  assert.equal(sessions.size, SESSION_LIMIT, "exactly one session was evicted");
+  const events = lines.map((line) => JSON.parse(line));
+  const done = events.find((event) => event.type === "done");
+  assert.ok(done, `expected a done event among: ${JSON.stringify(events)}`);
+  assert.equal(done.provider_session_id, "session-0");
+  assert.equal(done.turn_id, "turn-0");
+  assert.equal(
+    done.failed,
+    true,
+    "an evicted mid-turn session must settle as a FAILED turn, not a clean \
+done, or a dev that already emitted text reads as Replied and can consume \
+review rounds"
+  );
+  assert.ok(
+    typeof done.reason === "string" && done.reason.length > 0,
+    "the failure needs a reason the relay can show, not just failed:true",
+  );
+});
 
 test("trackBackgroundTasks mirrors the SDK's live set", () => {
   // Kept for `releaseSession` only: the relay must not hand back a seat whose

@@ -712,17 +712,28 @@ function evictSessionsIfNeeded(sessions, context) {
     const evict = idle || nonPending || candidates[0];
     if (!evict) break;
     const providerSessionId = evict.providerSessionId;
+    const evictedTurnId = evict.currentTurnId;
     closeAndRemoveSession(sessions, evict, context);
     if (providerSessionId) {
+      const message = "Claude background session was evicted because the session limit was reached";
       emit({
         type: "error",
-        message: "Claude background session was evicted because the session limit was reached",
+        message,
         provider_session_id: providerSessionId,
       });
       emit({
         type: "done",
         provider_session_id: providerSessionId,
-        turn_id: evict.currentTurnId,
+        turn_id: evictedTurnId,
+        // A turn was actually in flight (not just an idle session reclaimed):
+        // it must settle FAILED, not a clean done, or a dev that had already
+        // emitted text reads as Replied and can still consume review rounds.
+        // Distinct from "usage_limit" — this is the worker's own concurrency
+        // cap, not a provider quota, and must not halt the run the way that
+        // does; an unrecognised kind already degrades to an ordinary failure.
+        ...(evictedTurnId
+          ? { failed: true, reason: message, failure_kind: "session_capacity" }
+          : {}),
       });
     }
   }

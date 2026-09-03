@@ -2312,6 +2312,32 @@ untouched, not be reset to Pending"
 by the gate's Boundary kind"
     );
     assert_eq!(run.pause_reason.as_deref(), Some("stopped by the user"));
+
+    // Beyond `TeamRun` fields: a settled run must cost nothing extra either.
+    // `latest_assistant_entry` falls through to a provider round-trip when the
+    // thread has no cached transcript entry yet — exactly this reviewer
+    // thread's situation, since its turn never actually ran.
+    let reviewer_thread_id = run.sub_tasks[0]
+        .reviewer_thread_id
+        .clone()
+        .expect("reviewer thread recorded");
+    assert!(
+        !providers
+            .get("codex")
+            .unwrap()
+            .read_thread_calls()
+            .await
+            .contains(&reviewer_thread_id),
+        "a turn that must not run on a settled task must not probe the \
+provider for it either"
+    );
+    assert!(
+        !app.relay
+            .read()
+            .await
+            .team_turn_phase_stamped(&reviewer_thread_id),
+        "a turn that never runs must not stamp bookkeeping for one"
+    );
 }
 
 /// `settle_team_run` releases every owned thread's provider seat after

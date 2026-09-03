@@ -1837,8 +1837,11 @@ over on resume"
         // would fall to the no-landed branch below and reset the sub-task —
         // discarding progress the settle just preserved (and `block()`'s
         // terminal-only guard would let it flip a settled `Paused` run to
-        // `Blocked`). `team_turn_preflight` refuses a non-`Running` run on its
-        // own, so `None` here still ends in `Failed`, with nothing written.
+        // `Blocked`). `team_turn`'s own settled check already catches this
+        // before the FIRST call reaches here; this is the GATED call's own
+        // backstop for a settle landing in between — `team_turn_preflight`
+        // runs right after with nothing in between, so `None` here still ends
+        // in `Failed`, with nothing written.
         if run.status.is_terminal() || run.status.is_settled_without_driver() {
             return None;
         }
@@ -1953,6 +1956,21 @@ over on resume"
         role: TeamRole,
         prompt: &str,
     ) -> TeamTurnOutcome {
+        // Whole-run early-out, for EVERY slot (not just a reviewer's), ahead of
+        // the baseline read and the phase stamp below: a settled run must not
+        // pay for a provider round-trip or take a write lock for a turn that
+        // will never run. Best-effort only — a stop landing right after this
+        // is still caught, just later (the reviewer-only check next, then the
+        // gated `team_turn_preflight`), because closing that race is THEIR job.
+        if let Some(status) = self.team_run_snapshot(run_id).await.map(|run| run.status) {
+            if status.is_terminal() || status.is_settled_without_driver() {
+                return TeamTurnOutcome::Failed(format!(
+                    "task run {run_id} settled as {} before this turn started",
+                    status.as_str()
+                ));
+            }
+        }
+
         // Cheap early-out: refuse a reviewer turn before resolving anything at
         // all when it is already obviously refusable. NOT sufficient by itself —
         // see the repeated call under `team_drive_gate` below, which closes the

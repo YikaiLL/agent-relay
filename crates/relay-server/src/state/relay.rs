@@ -2049,6 +2049,14 @@ impl RelayState {
             .insert(thread_id.to_string(), phase.as_str().to_string());
     }
 
+    /// Whether `note_team_turn_phase` was ever called for this thread — proves
+    /// a turn that must not run (e.g. on an already-settled task) took no
+    /// bookkeeping side effect either.
+    #[cfg(test)]
+    pub(crate) fn team_turn_phase_stamped(&self, thread_id: &str) -> bool {
+        self.team_turn_phases.contains_key(thread_id)
+    }
+
     pub(crate) fn thread_attribution(&self, thread_id: &str) -> TeamAttribution {
         for run in self.team_runs.values() {
             if !run

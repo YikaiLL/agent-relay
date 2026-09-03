@@ -12252,6 +12252,10 @@ mod review_tests {
         // prove a transient `read_thread` error is surfaced as a provider failure,
         // never misdiagnosed as a cross-worktree reviewer mismatch.
         fail_read_thread_ids: Arc<Mutex<std::collections::HashSet<String>>>,
+        // Every thread id `read_thread` was called with, in call order — proves
+        // whether a provider round-trip happened at all (e.g. a settled run's
+        // turn must never probe the provider it is refusing to drive).
+        read_thread_calls: Arc<Mutex<Vec<String>>>,
         // (thread_id, model, effort) recorded at each start_turn, so a test can
         // assert the model/effort a reviewer turn actually ran with (reuse must keep
         // the reviewer's own model, not the parent's).
@@ -12408,6 +12412,7 @@ mod review_tests {
                 fail_delete: Arc::new(AtomicBool::new(false)),
                 fail_delete_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 fail_read_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                read_thread_calls: Arc::new(Mutex::new(Vec::new())),
                 turn_models: Arc::new(Mutex::new(Vec::new())),
                 list_models_fails: Arc::new(AtomicBool::new(false)),
                 suppress_reviewer_reply: Arc::new(AtomicBool::new(false)),
@@ -12529,6 +12534,10 @@ mod review_tests {
         pub(crate) async fn released_threads(&self) -> Vec<String> {
             self.released_threads.lock().await.clone()
         }
+
+        pub(crate) async fn read_thread_calls(&self) -> Vec<String> {
+            self.read_thread_calls.lock().await.clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -12639,6 +12648,10 @@ mod review_tests {
             &self,
             thread_id: &str,
         ) -> Result<crate::provider::ThreadSyncData, String> {
+            self.read_thread_calls
+                .lock()
+                .await
+                .push(thread_id.to_string());
             if self.fail_read_thread_ids.lock().await.contains(thread_id) {
                 return Err(format!(
                     "{} provider probe failed for '{thread_id}': PROBE_UNAVAILABLE",
