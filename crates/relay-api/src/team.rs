@@ -567,10 +567,9 @@ pub struct SubTask {
     /// crash between them must not lose the report.
     pub digested: bool,
     pub error: Option<String>,
-    /// How many Dev-role turns on this sub-task ended non-failed. The public
-    /// reviewer gate (`state/app/team.rs`) refuses to start a reviewer turn while
-    /// this is zero — never on `base_commit` or diff emptiness, which only the
-    /// private driver writes and a public gate must not depend on.
+    /// How many Dev-role turns on this sub-task produced matching successful
+    /// usage or nonempty work vs the checkpoint. The public reviewer gate
+    /// (`state/app/team.rs`) refuses to start a reviewer turn while this is zero.
     #[serde(default)]
     pub dev_turns_landed: u32,
     /// Which reopen cycle is WORKING this sub-task, from `reopened_count`.

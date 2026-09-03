@@ -1353,6 +1353,79 @@ impl relay_api::TeamDriver for DevThenReviewDriver {
     }
 }
 
+/// Same as [`DevThenReviewDriver`], but writes an uncommitted file in the task
+/// worktree before the dev turn so the checkpoint-diff path can be exercised
+/// without a usage figure.
+struct UncommittedWorkThenReviewDriver {
+    dev_outcome: std::sync::Arc<Mutex<Option<relay_api::team::TeamTurnOutcome>>>,
+    reviewer_outcomes: std::sync::Arc<Mutex<Vec<relay_api::team::TeamTurnOutcome>>>,
+}
+
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for UncommittedWorkThenReviewDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, port: std::sync::Arc<dyn relay_api::TeamPort>, run_id: String) {
+        let dev_thread = port
+            .start_thread(&run_id, relay_api::team::TeamRole::Dev)
+            .await
+            .expect("dev seat thread");
+        port.update_run(
+            &run_id,
+            Box::new(move |run| {
+                run.sub_tasks.push(crate::state::SubTask {
+                    id: "st-1".to_string(),
+                    dev_thread_id: Some(dev_thread),
+                    ..Default::default()
+                });
+            }),
+        )
+        .await;
+        let cwd = port.run_snapshot(&run_id).await.expect("run exists").cwd;
+        std::fs::write(
+            std::path::Path::new(&cwd).join("parser.rs"),
+            "pub fn parse() {}\n",
+        )
+        .expect("uncommitted work relative to the checkpoint");
+
+        let dev_outcome = port
+            .turn(
+                &run_id,
+                relay_api::team::TeamThreadSlot::SubTaskDev(0),
+                relay_api::team::TeamRole::Dev,
+                "write the parser",
+            )
+            .await;
+        *self.dev_outcome.lock().await = Some(dev_outcome);
+
+        let reviewer_thread = port
+            .start_thread(&run_id, relay_api::team::TeamRole::Reviewer)
+            .await
+            .expect("reviewer seat thread");
+        port.update_run(
+            &run_id,
+            Box::new(move |run| {
+                if let Some(task) = run.sub_tasks.get_mut(0) {
+                    task.reviewer_thread_id = Some(reviewer_thread);
+                }
+            }),
+        )
+        .await;
+        let outcome = port
+            .turn(
+                &run_id,
+                relay_api::team::TeamThreadSlot::SubTaskReviewer(0),
+                relay_api::team::TeamRole::Reviewer,
+                "review it",
+            )
+            .await;
+        self.reviewer_outcomes.lock().await.push(outcome);
+        port.fail_run(&run_id, "test driver done".to_string()).await;
+    }
+}
+
 #[tokio::test]
 async fn a_dev_turn_that_hits_a_usage_limit_halts_the_run_before_any_review() {
     let (_repo, root) = init_team_repo().await;
@@ -1603,13 +1676,10 @@ async fn a_dev_turn_that_hits_session_capacity_halts_the_run_before_any_review()
         run.pause_kind,
         Some(relay_api::team::TeamPauseKind::Provider)
     );
-    let reviewer_thread = relay_api::TeamPort::start_thread(
-        &app,
-        &run_id,
-        relay_api::team::TeamRole::Reviewer,
-    )
-    .await
-    .expect("a paused run still keeps its reviewer seat");
+    let reviewer_thread =
+        relay_api::TeamPort::start_thread(&app, &run_id, relay_api::team::TeamRole::Reviewer)
+            .await
+            .expect("a paused run still keeps its reviewer seat");
     let reviewer_thread_for_run = reviewer_thread.clone();
     relay_api::TeamPort::update_run(
         &app,
@@ -1702,8 +1772,7 @@ async fn a_dev_turn_that_replies_but_bills_nothing_leaves_the_gate_shut() {
     );
     match reviewer_outcomes.lock().await.first() {
         Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => assert_eq!(
-            reason,
-            "This step hasn't produced any work yet. You can resume to run it again.",
+            reason, "This step hasn't produced any work yet. You can resume to run it again.",
             "the reviewer must be refused by the gate"
         ),
         other => panic!("the reviewer must not run against an unchanged branch: {other:?}"),
@@ -1747,7 +1816,7 @@ async fn a_dev_turn_that_bills_tokens_opens_the_reviewer_gate() {
 
     assert_eq!(
         run.sub_tasks[0].dev_turns_landed, 1,
-        "a turn that billed tokens has landed"
+        "matching usage with billed tokens > 0 has landed"
     );
     assert!(
         !matches!(
@@ -1759,12 +1828,11 @@ async fn a_dev_turn_that_bills_tokens_opens_the_reviewer_gate() {
     );
 }
 
-/// The FALLBACK, pinned so it can never become a silent one. Not every path
-/// reports usage; requiring a figure would refuse every reviewer turn forever
-/// on such a provider and deadlock the run. No figure means the old `Replied`
-/// rule stands.
+/// Missing usage, a mismatched turn id, and an absent record are all empty.
+/// A reply without matching successful spend and without work vs the
+/// checkpoint must not open review or burn rounds into Escalated.
 #[tokio::test]
-async fn a_dev_turn_with_no_usage_figure_at_all_still_counts_as_landed() {
+async fn a_dev_turn_with_no_usage_figure_at_all_leaves_the_gate_shut() {
     let (_repo, root) = init_team_repo().await;
     let (app, providers) = build_review_app(&root, &["codex"]).await;
     // Deliberately NOT setting `report_turn_usage`: nothing is reported.
@@ -1781,29 +1849,39 @@ async fn a_dev_turn_with_no_usage_figure_at_all_still_counts_as_landed() {
     let mut input = team_input(&root);
     input.dev_provider = "codex".to_string();
     let run_id = app.start_team_run(input).await.expect("start");
-    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
 
     assert_eq!(
-        run.sub_tasks[0].dev_turns_landed, 1,
-        "with no figure to judge by, a reply still lands"
+        run.sub_tasks[0].dev_turns_landed, 0,
+        "absent usage is empty, not a fallback yes"
+    );
+    match reviewer_outcomes.lock().await.first() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => assert_eq!(
+            reason, "This step hasn't produced any work yet. You can resume to run it again.",
+            "the reviewer must be refused by the gate"
+        ),
+        other => panic!("empty output must not schedule a reviewer: {other:?}"),
+    }
+    assert_eq!(run.sub_tasks[0].rounds_used, 0);
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
     );
 }
 
-/// The record is never cleared, so a reader that checked mere presence would let
-/// an EARLIER turn's figure decide this one. A leftover zero must not shut the
-/// gate on a turn that reported nothing of its own.
+/// The record is never cleared, so a leftover figure for another turn is not
+/// this turn's evidence. Mismatched ids are empty, same as a missing record.
 #[tokio::test]
-async fn a_spend_figure_from_another_turn_does_not_shut_the_gate() {
+async fn a_spend_figure_from_another_turn_is_empty_output() {
     let (_repo, root) = init_team_repo().await;
     let (app, providers) = build_review_app(&root, &["codex"]).await;
-    // Zero tokens, billed against a turn id this run never dispatched.
     providers
         .get("codex")
         .unwrap()
         .report_turn_usage
         .lock()
         .await
-        .replace((0, Some("turn-from-an-earlier-life".to_string())));
+        .replace((1_200, Some("turn-from-an-earlier-life".to_string())));
 
     let dev_outcome = std::sync::Arc::new(Mutex::new(None));
     let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -1817,11 +1895,57 @@ async fn a_spend_figure_from_another_turn_does_not_shut_the_gate() {
     let mut input = team_input(&root);
     input.dev_provider = "codex".to_string();
     let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 0,
+        "a figure for a different turn is not this turn's evidence"
+    );
+    match reviewer_outcomes.lock().await.first() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => assert_eq!(
+            reason,
+            "This step hasn't produced any work yet. You can resume to run it again."
+        ),
+        other => panic!("mismatched usage must not schedule a reviewer: {other:?}"),
+    }
+    assert_eq!(run.sub_tasks[0].rounds_used, 0);
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
+}
+
+/// Uncommitted work relative to the checkpoint is real output. The gate must
+/// not demand a commit, and must not demand a usage figure once the tree moved.
+#[tokio::test]
+async fn a_dev_turn_with_an_uncommitted_diff_opens_the_reviewer_gate() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let _ = &providers;
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(UncommittedWorkThenReviewDriver {
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
     let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
 
     assert_eq!(
         run.sub_tasks[0].dev_turns_landed, 1,
-        "a figure for a different turn is not this turn's evidence"
+        "an uncommitted nonempty diff relative to the checkpoint has landed"
+    );
+    assert!(
+        !matches!(
+            reviewer_outcomes.lock().await.first(),
+            Some(relay_api::team::TeamTurnOutcome::Failed(reason))
+                if reason == "This step hasn't produced any work yet. You can resume to run it again."
+        ),
+        "the gate must not refuse work that is sitting uncommitted in the tree"
     );
 }
 
@@ -1882,7 +2006,14 @@ zero-landed gate rather than the provider-halt one"
 #[tokio::test]
 async fn a_stop_mid_run_refuses_the_next_reviewer_turn() {
     let (_repo, root) = init_team_repo().await;
-    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((1_200, None));
 
     let dev_outcome = std::sync::Arc::new(Mutex::new(None));
     let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -2025,7 +2156,10 @@ impl relay_api::TeamDriver for RaceWindowDriver {
                 "review it",
             )
             .await;
-        let refused = matches!(reviewer_outcome, relay_api::team::TeamTurnOutcome::Failed(_));
+        let refused = matches!(
+            reviewer_outcome,
+            relay_api::team::TeamTurnOutcome::Failed(_)
+        );
         *self.reviewer_outcome.lock().await = Some(reviewer_outcome);
         if refused {
             // The refusal may not have settled the run itself (F2: a draining
@@ -2061,7 +2195,14 @@ impl relay_api::TeamDriver for RaceWindowDriver {
 async fn a_stop_landing_between_the_reviewer_gates_early_check_and_the_drive_gate_is_still_caught()
 {
     let (_repo, root) = init_team_repo().await;
-    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((1_200, None));
 
     let dev_outcome = std::sync::Arc::new(Mutex::new(None));
     let reviewer_outcome = std::sync::Arc::new(Mutex::new(None));
@@ -2483,7 +2624,11 @@ async fn a_refused_reviewer_turn_that_settles_the_run_releases_its_seats() {
     let run_id = app.start_team_run(team_input(&root)).await.expect("start");
     let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
     let owned = run.owned_thread_ids();
-    assert_eq!(owned.len(), 2, "a dev and a reviewer thread must both be owned");
+    assert_eq!(
+        owned.len(),
+        2,
+        "a dev and a reviewer thread must both be owned"
+    );
 
     for _ in 0..600 {
         if codex.released_threads().await.len() >= owned.len() {
@@ -2507,7 +2652,14 @@ same as `settle_team_run` does: {thread_id} missing from {released:?}"
 #[tokio::test]
 async fn a_landed_dev_turn_and_two_reviewer_rejections_still_escalate() {
     let (_repo, root) = init_team_repo().await;
-    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((1_200, None));
 
     let dev_outcome = std::sync::Arc::new(Mutex::new(None));
     let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -2787,8 +2939,12 @@ impl relay_api::TeamDriver for ActionTableDriver {
                     let refused = matches!(outcome, relay_api::team::TeamTurnOutcome::Failed(_));
                     self.reviewer_outcomes.lock().await.push(outcome);
                     if !refused {
-                        port.settle_run(&run_id, crate::state::TeamRunStatus::Done, "test driver done")
-                            .await;
+                        port.settle_run(
+                            &run_id,
+                            crate::state::TeamRunStatus::Done,
+                            "test driver done",
+                        )
+                        .await;
                         return;
                     }
                     // A refused reviewer turn already settled (or is deferring
@@ -2835,8 +2991,9 @@ async fn a_refused_review_resets_the_sub_task_so_a_resume_drives_dev_not_review(
 sends straight back into another refused review on resume"
     );
 
-    // The resumed dev turn actually lands this time.
+    // The resumed dev turn actually lands this time: it replies AND bills.
     codex.emit_assistant.store(true, Ordering::Relaxed);
+    codex.report_turn_usage.lock().await.replace((1_200, None));
     app.resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
         .await
         .expect("a paused task can be resumed");
@@ -2849,7 +3006,10 @@ sends straight back into another refused review on resume"
         "the resume must drive a second DEV turn, not another refused review: {dev_outcomes:?}"
     );
     assert!(
-        matches!(dev_outcomes[1], relay_api::team::TeamTurnOutcome::Replied(_)),
+        matches!(
+            dev_outcomes[1],
+            relay_api::team::TeamTurnOutcome::Replied(_)
+        ),
         "the resumed dev turn must actually land, proving real progress: {:?}",
         dev_outcomes[1]
     );
@@ -2861,7 +3021,10 @@ sends straight back into another refused review on resume"
         "the dev turn landing must unlock a real review this time: {reviewer_outcomes:?}"
     );
     assert!(
-        !matches!(reviewer_outcomes[1], relay_api::team::TeamTurnOutcome::Failed(_)),
+        !matches!(
+            reviewer_outcomes[1],
+            relay_api::team::TeamTurnOutcome::Failed(_)
+        ),
         "the second review must not be refused now that dev work landed: {:?}",
         reviewer_outcomes[1]
     );
@@ -2906,9 +3069,9 @@ async fn a_graceful_pause_that_refuses_a_reviewer_turn_settles_paused_not_failed
     );
     match reviewer_outcome.lock().await.clone() {
         Some(relay_api::team::TeamTurnOutcome::Failed(_)) => {}
-        other => panic!(
-            "a reviewer turn requested during a graceful pause must be refused: {other:?}"
-        ),
+        other => {
+            panic!("a reviewer turn requested during a graceful pause must be refused: {other:?}")
+        }
     }
     assert_eq!(
         run.pause_kind,

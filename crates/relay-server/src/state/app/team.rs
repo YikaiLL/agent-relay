@@ -1808,9 +1808,9 @@ over on resume"
     /// or a reviewer slot that may proceed.
     ///
     /// Refuses if the run is pausing/stopping, or the sub-task's dev work has
-    /// not landed. `base_commit`/diff emptiness are NOT used here: only the
-    /// private driver writes `base_commit`, and a public gate must not depend
-    /// on a private invariant.
+    /// not landed. Landing is decided when the Dev turn finishes (matching
+    /// successful usage, or a nonempty tree vs the checkpoint); this gate only
+    /// reads that counter.
     ///
     /// Deciding and acting used to be two steps — a read here, then a separate
     /// reset/settle after. That gap is exactly what a concurrent `request_stop`/
@@ -2184,22 +2184,20 @@ over on resume"
             _ => TeamTurnOutcome::Silent,
         };
         // The independent review gate's other half: count a Dev turn as "landed"
-        // only when it actually REPLIED. `Silent` means the turn completed but
-        // said nothing a reviewer could act on (the `emit_assistant = false`
-        // shape) — that must not license a reviewer turn any more than a failed
-        // or uncertain (`Blocked`) one does, which is why this sits after every
-        // early `Failed`/`Blocked` return above and matches on `Replied` alone
-        // rather than "non-failed".
-        //
-        // Replying is necessary but NOT sufficient: a dev that answers "I
-        // couldn't do this" and spends nothing has produced nothing to review,
-        // so the spend the provider reported decides it.
-        if role == TeamRole::Dev && matches!(outcome, TeamTurnOutcome::Replied(_)) {
+        // only when it produced matching successful usage or nonempty work vs
+        // the checkpoint. `Silent` with a dirty tree still counts (tool-only
+        // edits); a reply with neither spend nor a diff does not.
+        if role == TeamRole::Dev
+            && matches!(
+                outcome,
+                TeamTurnOutcome::Replied(_) | TeamTurnOutcome::Silent
+            )
+        {
             if let TeamThreadSlot::SubTaskDev(index) = slot {
-                if self
+                let billed = self
                     .turn_billed_work(&thread_id, sent_turn_id.as_deref())
-                    .await
-                {
+                    .await;
+                if billed || self.turn_has_checkpoint_work(run_id, index).await {
                     let mut relay = self.relay.write().await;
                     relay.update_team_run(run_id, |run| {
                         if let Some(task) = run.sub_tasks.get_mut(index) {
@@ -2212,30 +2210,43 @@ over on resume"
         outcome
     }
 
-    /// Did the provider bill anything for the turn we just dispatched?
+    /// Did the provider bill a successful matching figure for the turn we just
+    /// dispatched?
     ///
-    /// Three answers, and the third is the one that matters:
-    /// - a figure above zero → yes, real work was paid for;
-    /// - a figure of exactly zero → no, and the reviewer gate stays shut;
-    /// - NO figure for this turn → **fall back to yes**.
-    ///
-    /// That fallback is deliberate and load-bearing. Not every provider path
-    /// reports usage, and usage without a turn id cannot be attributed to the
-    /// turn we sent. Demanding a figure there would refuse every reviewer turn
-    /// forever and deadlock the run — strictly worse than the over-counting
-    /// this check exists to fix.
-    ///
-    /// Matches `turn_id` against the turn WE sent, never mere presence: the
-    /// record is never cleared, so an earlier turn's figure would otherwise
-    /// decide this one.
+    /// Matching `turn_id` with billed tokens > 0 is yes. Missing usage, a
+    /// mismatched id, an absent record, or no dispatched turn id are empty —
+    /// never a fallback yes. Failed terminals never reach this: they return
+    /// through `last_turn_failure` first (`failed=0` here).
     async fn turn_billed_work(&self, thread_id: &str, sent_turn_id: Option<&str>) -> bool {
         let Some(turn_id) = sent_turn_id else {
-            return true;
+            return false;
         };
         let relay = self.relay.read().await;
         match relay.last_turn_spend(thread_id) {
             Some(spend) if spend.turn_id == turn_id => spend.billed > 0,
-            _ => true,
+            _ => false,
+        }
+    }
+
+    /// Non-empty work vs the sub-task or run checkpoint, including uncommitted
+    /// and untracked files. A git error or a missing tree is empty.
+    async fn turn_has_checkpoint_work(&self, run_id: &str, index: usize) -> bool {
+        let Some(run) = self.team_run_snapshot(run_id).await else {
+            return false;
+        };
+        let checkpoint = run
+            .sub_tasks
+            .get(index)
+            .map(|task| task.base_commit.as_str())
+            .filter(|commit| !commit.is_empty())
+            .map(str::to_string)
+            .or_else(|| (!run.base_commit.is_empty()).then(|| run.base_commit.clone()));
+        let Some(workspace) = self.team_workspace(run_id).await else {
+            return false;
+        };
+        match collect_workspace_diff_against(&workspace, checkpoint.as_deref()).await {
+            Ok(diff) => !diff.diff.trim().is_empty() || !diff.file_changes.is_empty(),
+            Err(_) => false,
         }
     }
 
