@@ -2841,3 +2841,60 @@ async fn a_cold_session_is_loaded_once_and_then_known_to_be_attached() {
         "the second probe must not put another session/load on the wire"
     );
 }
+
+// `TranscriptOp::AgentChunk` must stream local deltas with a correct text_offset.
+
+#[tokio::test]
+async fn a_foreground_agent_chunk_queues_a_transcript_delta() {
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("t1".to_string());
+    }
+    let mut deltas = state.read().await.subscribe_transcript_deltas();
+
+    let mut runtime = session();
+    let op = plan_update(&agent("hello"), &mut runtime);
+    {
+        let mut relay = state.write().await;
+        crate::acp::rpc::apply_op(&mut relay, "t1", Some("turn-1".to_string()), op, "cursor");
+    }
+
+    let event = deltas
+        .try_recv()
+        .expect("a foreground AgentChunk must queue a local transcript delta");
+    assert_eq!(event.thread_id, "t1");
+    assert_eq!(event.delta, "hello");
+}
+
+#[tokio::test]
+async fn a_foreground_agent_chunks_second_delta_offset_follows_the_first() {
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("t1".to_string());
+    }
+    let mut deltas = state.read().await.subscribe_transcript_deltas();
+    let mut runtime = session();
+
+    {
+        let mut relay = state.write().await;
+        let op = plan_update(&agent("hello "), &mut runtime);
+        crate::acp::rpc::apply_op(&mut relay, "t1", Some("turn-1".to_string()), op, "cursor");
+    }
+    let first = deltas.try_recv().expect("first chunk must queue a delta");
+    assert_eq!(first.text_offset, Some(0));
+
+    {
+        let mut relay = state.write().await;
+        let op = plan_update(&agent("world"), &mut runtime);
+        crate::acp::rpc::apply_op(&mut relay, "t1", Some("turn-1".to_string()), op, "cursor");
+    }
+    let second = deltas.try_recv().expect("second chunk must queue a delta");
+    assert_eq!(
+        second.text_offset,
+        Some("hello ".encode_utf16().count() as u64),
+        "a per-chunk `start` wipes the accumulated text before this append, so a \
+         naive fix ships text_offset: 0 and the client refuses the delta as a gap"
+    );
+}
