@@ -437,6 +437,7 @@ async fn handle_notification_for_provider(
                         // is not silently a Claude-only figure.
                         if let Some(turn) = completed_turn.as_deref() {
                             relay.usage_store.mark_turn_failed(turn);
+                            relay.mark_turn_spend_failed(&bg_thread_id, turn);
                         }
                         // Operator log keeps the RAW provider message when present
                         // (never rides remote snapshots).
@@ -516,6 +517,9 @@ async fn handle_notification_for_provider(
                         // is not silently a Claude-only figure.
                         if let Some(turn) = completed_turn.as_deref() {
                             relay.usage_store.mark_turn_failed(turn);
+                            if let Some(thread_id) = relay.active_thread_id.clone() {
+                                relay.mark_turn_spend_failed(&thread_id, turn);
+                            }
                         }
                         // Operator log keeps the RAW provider message when present
                         // (never rides remote snapshots).

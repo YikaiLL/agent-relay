@@ -12377,9 +12377,10 @@ mod review_tests {
         // real bridge uses (`record_token_usage`). `None` reports NOTHING at
         // all, which is a real provider path and the harness default, so every
         // existing test keeps the behaviour it was written against.
-        // `Some((tokens, turn_override))` reports a figure; the override bills
-        // it against another turn's id, modelling a leftover from an earlier one.
-        report_turn_usage: Arc<Mutex<Option<(u64, Option<String>)>>>,
+        // `Some((tokens, turn_override, failed))` reports a figure; the override
+        // bills it against another turn's id, modelling a leftover from an
+        // earlier one. `failed` is the ledger flag the reviewer gate must see.
+        report_turn_usage: Arc<Mutex<Option<(u64, Option<String>, bool)>>>,
         next_id: Arc<AtomicU64>,
     }
 
@@ -13105,7 +13106,7 @@ mod review_tests {
                         );
                         // Through the SAME funnel a real bridge uses, so the
                         // record under test is the production one.
-                        if let Some((tokens, ref turn_override)) = report_usage {
+                        if let Some((tokens, ref turn_override, failed)) = report_usage {
                             relay.record_token_usage(
                                 &thread_id,
                                 Some(turn_override.clone().unwrap_or_else(|| turn.clone())),
@@ -13118,7 +13119,7 @@ mod review_tests {
                                 None,
                                 None,
                                 None,
-                                false,
+                                failed,
                             );
                         }
                         if let Some((reason, kind)) = fail_completed_turn.clone() {
@@ -13165,7 +13166,7 @@ mod review_tests {
                         );
                         // Through the SAME funnel a real bridge uses, so the
                         // record under test is the production one.
-                        if let Some((tokens, ref turn_override)) = report_usage {
+                        if let Some((tokens, ref turn_override, failed)) = report_usage {
                             relay.record_token_usage(
                                 &thread_id,
                                 Some(turn_override.clone().unwrap_or_else(|| turn.clone())),
@@ -13178,7 +13179,7 @@ mod review_tests {
                                 None,
                                 None,
                                 None,
-                                false,
+                                failed,
                             );
                         }
                         if let Some((reason, kind)) = fail_completed_turn.clone() {

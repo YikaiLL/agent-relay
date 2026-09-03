@@ -943,15 +943,17 @@ impl RelayState {
     ///
     /// ACCUMULATES within a turn: both bridges report more than once per turn
     /// (Claude per model, Codex per model request), so overwriting would let a
-    /// later zero erase spend already reported for the same turn.
+    /// later zero erase spend already reported for the same turn. `failed` is
+    /// sticky once true: a later successful chunk must not clear it.
     fn note_turn_spend(
         &mut self,
         thread_id: &str,
         turn_id: Option<&str>,
         usage: &crate::usage::TokenUsage,
+        failed: bool,
     ) {
         // Usage with no turn id cannot be matched to a dispatched turn, and a
-        // reader that cannot match must fall back rather than guess.
+        // reader that cannot match must treat it as empty rather than guess.
         let Some(turn_id) = turn_id else {
             return;
         };
@@ -962,12 +964,32 @@ impl RelayState {
         match runtime.last_turn_spend.as_mut() {
             Some(spend) if spend.turn_id == turn_id => {
                 spend.billed = spend.billed.saturating_add(billed);
+                spend.failed = spend.failed || failed;
             }
             _ => {
                 runtime.last_turn_spend = Some(TurnSpend {
                     turn_id: turn_id.to_string(),
                     billed,
+                    failed,
                 });
+            }
+        }
+    }
+
+    /// Stamp the in-memory spend record failed, matching
+    /// [`crate::usage::store::UsageStore::mark_turn_failed`] for bridges that
+    /// bill before they know the outcome.
+    pub(crate) fn mark_turn_spend_failed(&mut self, thread_id: &str, turn_id: &str) {
+        if turn_id.is_empty() {
+            return;
+        }
+        if let Some(spend) = self
+            .runtimes
+            .get_mut(thread_id)
+            .and_then(|runtime| runtime.last_turn_spend.as_mut())
+        {
+            if spend.turn_id == turn_id {
+                spend.failed = true;
             }
         }
     }
@@ -2167,7 +2189,7 @@ impl RelayState {
         // zero" and "the provider said nothing" are different facts, and the
         // reviewer gate has to tell them apart; dropping the zero here would
         // collapse them back together.
-        self.note_turn_spend(thread_id, turn_id.as_deref(), &usage);
+        self.note_turn_spend(thread_id, turn_id.as_deref(), &usage, failed);
         if usage.is_empty() {
             return;
         }

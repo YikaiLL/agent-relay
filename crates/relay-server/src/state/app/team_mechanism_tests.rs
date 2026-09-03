@@ -1372,11 +1372,19 @@ impl relay_api::TeamDriver for UncommittedWorkThenReviewDriver {
             .start_thread(&run_id, relay_api::team::TeamRole::Dev)
             .await
             .expect("dev seat thread");
+        // The private driver checkpoints the sub-task at start. Without this,
+        // falling back to the run base would let prior run work open the gate.
+        let checkpoint = port
+            .checkpoint_commit(&run_id)
+            .await
+            .expect("checkpoint")
+            .expect("the task worktree has a HEAD");
         port.update_run(
             &run_id,
             Box::new(move |run| {
                 run.sub_tasks.push(crate::state::SubTask {
                     id: "st-1".to_string(),
+                    base_commit: checkpoint,
                     dev_thread_id: Some(dev_thread),
                     ..Default::default()
                 });
@@ -1399,6 +1407,88 @@ impl relay_api::TeamDriver for UncommittedWorkThenReviewDriver {
             )
             .await;
         *self.dev_outcome.lock().await = Some(dev_outcome);
+
+        let reviewer_thread = port
+            .start_thread(&run_id, relay_api::team::TeamRole::Reviewer)
+            .await
+            .expect("reviewer seat thread");
+        port.update_run(
+            &run_id,
+            Box::new(move |run| {
+                if let Some(task) = run.sub_tasks.get_mut(0) {
+                    task.reviewer_thread_id = Some(reviewer_thread);
+                }
+            }),
+        )
+        .await;
+        let outcome = port
+            .turn(
+                &run_id,
+                relay_api::team::TeamThreadSlot::SubTaskReviewer(0),
+                relay_api::team::TeamRole::Reviewer,
+                "review it",
+            )
+            .await;
+        self.reviewer_outcomes.lock().await.push(outcome);
+        port.fail_run(&run_id, "test driver done".to_string()).await;
+    }
+}
+
+/// Commits prior run work, then drives a sub-task with an empty checkpoint and
+/// no new tree change — the shape that wrongly lands if the gate falls back to
+/// `run.base_commit`.
+struct PriorRunWorkEmptyCheckpointDriver {
+    reviewer_outcomes: std::sync::Arc<Mutex<Vec<relay_api::team::TeamTurnOutcome>>>,
+}
+
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for PriorRunWorkEmptyCheckpointDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, port: std::sync::Arc<dyn relay_api::TeamPort>, run_id: String) {
+        let cwd = port.run_snapshot(&run_id).await.expect("run exists").cwd;
+        std::fs::write(
+            std::path::Path::new(&cwd).join("prior.rs"),
+            "fn prior() {}\n",
+        )
+        .expect("prior run work");
+        // Commit so HEAD moves past run.base_commit — visible if someone diffs
+        // the run base, invisible if the empty sub-task checkpoint is respected.
+        assert!(
+            port.commit(&run_id, "prior work")
+                .await
+                .expect("commit prior work"),
+            "prior run work must land on the branch"
+        );
+
+        let dev_thread = port
+            .start_thread(&run_id, relay_api::team::TeamRole::Dev)
+            .await
+            .expect("dev seat thread");
+        port.update_run(
+            &run_id,
+            Box::new(move |run| {
+                run.sub_tasks.push(crate::state::SubTask {
+                    id: "st-1".to_string(),
+                    // Deliberately empty — the bug under test.
+                    base_commit: String::new(),
+                    dev_thread_id: Some(dev_thread),
+                    ..Default::default()
+                });
+            }),
+        )
+        .await;
+
+        let _ = port
+            .turn(
+                &run_id,
+                relay_api::team::TeamThreadSlot::SubTaskDev(0),
+                relay_api::team::TeamRole::Dev,
+                "write the parser",
+            )
+            .await;
 
         let reviewer_thread = port
             .start_thread(&run_id, relay_api::team::TeamRole::Reviewer)
@@ -1741,7 +1831,7 @@ async fn a_dev_turn_that_replies_but_bills_nothing_leaves_the_gate_shut() {
         .report_turn_usage
         .lock()
         .await
-        .replace((0, None));
+        .replace((0, None, false));
 
     let dev_outcome = std::sync::Arc::new(Mutex::new(None));
     let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -1798,7 +1888,7 @@ async fn a_dev_turn_that_bills_tokens_opens_the_reviewer_gate() {
         .report_turn_usage
         .lock()
         .await
-        .replace((1_200, None));
+        .replace((1_200, None, false));
 
     let dev_outcome = std::sync::Arc::new(Mutex::new(None));
     let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -1881,7 +1971,7 @@ async fn a_spend_figure_from_another_turn_is_empty_output() {
         .report_turn_usage
         .lock()
         .await
-        .replace((1_200, Some("turn-from-an-earlier-life".to_string())));
+        .replace((1_200, Some("turn-from-an-earlier-life".to_string()), false));
 
     let dev_outcome = std::sync::Arc::new(Mutex::new(None));
     let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -1940,12 +2030,115 @@ async fn a_dev_turn_with_an_uncommitted_diff_opens_the_reviewer_gate() {
         "an uncommitted nonempty diff relative to the checkpoint has landed"
     );
     assert!(
+        !run.sub_tasks[0].base_commit.is_empty(),
+        "this path must exercise a real sub-task checkpoint, not a run-base fallback"
+    );
+    assert!(
         !matches!(
             reviewer_outcomes.lock().await.first(),
             Some(relay_api::team::TeamTurnOutcome::Failed(reason))
                 if reason == "This step hasn't produced any work yet. You can resume to run it again."
         ),
         "the gate must not refuse work that is sitting uncommitted in the tree"
+    );
+}
+
+/// Billed tokens that the funnel itself flagged `failed` are waste, not
+/// successful usage. A reply that only spent on a failed turn must not open
+/// review — matching `failed=0, billed>0` from the brief.
+#[tokio::test]
+async fn a_dev_turn_with_billed_but_failed_usage_leaves_the_gate_shut() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((1_200, None, true));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    assert!(
+        matches!(
+            dev_outcome.lock().await.clone(),
+            Some(relay_api::team::TeamTurnOutcome::Replied(_))
+        ),
+        "the premise: the turn replied; only its spend was flagged failed"
+    );
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 0,
+        "failed usage is not successful usage"
+    );
+    match reviewer_outcomes.lock().await.first() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => assert_eq!(
+            reason,
+            "This step hasn't produced any work yet. You can resume to run it again."
+        ),
+        other => panic!("failed usage must not schedule a reviewer: {other:?}"),
+    }
+    assert_eq!(run.sub_tasks[0].rounds_used, 0);
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
+}
+
+/// Prior run work vs `run.base_commit` must not land an empty current
+/// sub-task. With no sub-task checkpoint, the tree is empty for this step —
+/// falling back to the run base would schedule review on someone else's diff.
+#[tokio::test]
+async fn prior_run_work_does_not_land_a_sub_task_without_its_own_checkpoint() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let _ = &providers;
+
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(PriorRunWorkEmptyCheckpointDriver {
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    assert!(
+        run.sub_tasks[0].base_commit.is_empty(),
+        "the premise: this sub-task has no checkpoint of its own"
+    );
+    assert!(
+        !run.base_commit.is_empty(),
+        "the run still has a base — the unsafe fallback's temptation"
+    );
+    assert_eq!(
+        run.sub_tasks[0].dev_turns_landed, 0,
+        "prior run work must not count as this sub-task's output"
+    );
+    match reviewer_outcomes.lock().await.first() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => assert_eq!(
+            reason,
+            "This step hasn't produced any work yet. You can resume to run it again."
+        ),
+        other => panic!("empty sub-task checkpoint must not schedule a reviewer: {other:?}"),
+    }
+    assert_eq!(run.sub_tasks[0].rounds_used, 0);
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
     );
 }
 
@@ -2013,7 +2206,7 @@ async fn a_stop_mid_run_refuses_the_next_reviewer_turn() {
         .report_turn_usage
         .lock()
         .await
-        .replace((1_200, None));
+        .replace((1_200, None, false));
 
     let dev_outcome = std::sync::Arc::new(Mutex::new(None));
     let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -2202,7 +2395,7 @@ async fn a_stop_landing_between_the_reviewer_gates_early_check_and_the_drive_gat
         .report_turn_usage
         .lock()
         .await
-        .replace((1_200, None));
+        .replace((1_200, None, false));
 
     let dev_outcome = std::sync::Arc::new(Mutex::new(None));
     let reviewer_outcome = std::sync::Arc::new(Mutex::new(None));
@@ -2659,7 +2852,7 @@ async fn a_landed_dev_turn_and_two_reviewer_rejections_still_escalate() {
         .report_turn_usage
         .lock()
         .await
-        .replace((1_200, None));
+        .replace((1_200, None, false));
 
     let dev_outcome = std::sync::Arc::new(Mutex::new(None));
     let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -2993,7 +3186,11 @@ sends straight back into another refused review on resume"
 
     // The resumed dev turn actually lands this time: it replies AND bills.
     codex.emit_assistant.store(true, Ordering::Relaxed);
-    codex.report_turn_usage.lock().await.replace((1_200, None));
+    codex
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((1_200, None, false));
     app.resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
         .await
         .expect("a paused task can be resumed");

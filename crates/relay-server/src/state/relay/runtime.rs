@@ -38,10 +38,16 @@ pub(crate) struct TurnFailure {
 /// The absence of a record is NOT the same as `billed == 0`. Zero means the
 /// provider reported a figure and it was nothing; absent means it reported no
 /// figure at all, which several paths legitimately do.
+///
+/// `failed` is the same flag the ledger stores: written at record time, and
+/// corrected later by [`RelayState::mark_turn_spend_failed`] when a bridge only
+/// learns the outcome after billing (Codex). The reviewer gate requires
+/// `!failed && billed > 0`.
 #[derive(Debug, Clone)]
 pub(crate) struct TurnSpend {
     pub(crate) turn_id: String,
     pub(crate) billed: u64,
+    pub(crate) failed: bool,
 }
 
 /// How a provider said a turn failed — the one classification space both bridges

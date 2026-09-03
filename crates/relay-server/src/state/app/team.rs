@@ -2213,38 +2213,40 @@ over on resume"
     /// Did the provider bill a successful matching figure for the turn we just
     /// dispatched?
     ///
-    /// Matching `turn_id` with billed tokens > 0 is yes. Missing usage, a
-    /// mismatched id, an absent record, or no dispatched turn id are empty —
-    /// never a fallback yes. Failed terminals never reach this: they return
-    /// through `last_turn_failure` first (`failed=0` here).
+    /// Matching `turn_id` with billed tokens > 0 and `failed = false` is yes.
+    /// Missing usage, a mismatched id, an absent record, no dispatched turn id,
+    /// or a billed-but-failed figure are empty — never a fallback yes.
     async fn turn_billed_work(&self, thread_id: &str, sent_turn_id: Option<&str>) -> bool {
         let Some(turn_id) = sent_turn_id else {
             return false;
         };
         let relay = self.relay.read().await;
         match relay.last_turn_spend(thread_id) {
-            Some(spend) if spend.turn_id == turn_id => spend.billed > 0,
+            Some(spend) if spend.turn_id == turn_id => !spend.failed && spend.billed > 0,
             _ => false,
         }
     }
 
-    /// Non-empty work vs the sub-task or run checkpoint, including uncommitted
-    /// and untracked files. A git error or a missing tree is empty.
+    /// Non-empty work vs THIS sub-task's checkpoint, including uncommitted and
+    /// untracked files. An empty/missing sub-task checkpoint is empty — never
+    /// fall back to the run base, or prior sub-task work would open review.
     async fn turn_has_checkpoint_work(&self, run_id: &str, index: usize) -> bool {
         let Some(run) = self.team_run_snapshot(run_id).await else {
             return false;
         };
-        let checkpoint = run
+        let Some(checkpoint) = run
             .sub_tasks
             .get(index)
             .map(|task| task.base_commit.as_str())
             .filter(|commit| !commit.is_empty())
             .map(str::to_string)
-            .or_else(|| (!run.base_commit.is_empty()).then(|| run.base_commit.clone()));
+        else {
+            return false;
+        };
         let Some(workspace) = self.team_workspace(run_id).await else {
             return false;
         };
-        match collect_workspace_diff_against(&workspace, checkpoint.as_deref()).await {
+        match collect_workspace_diff_against(&workspace, Some(checkpoint.as_str())).await {
             Ok(diff) => !diff.diff.trim().is_empty() || !diff.file_changes.is_empty(),
             Err(_) => false,
         }
