@@ -895,6 +895,8 @@ export function createLifecycleController(ctx) {
     // Additive: entries present in the snapshot are merged in, none are dropped,
     // so a snapshot that lost a race cannot un-cache a detail either.
     syncLiveTranscriptEntryDetailsFromSnapshot(state, snapshot);
+    // Stashed raw (pre-merge) for hydration to read — see selectHydrationSnapshot.
+    state.rawSessionSnapshot = snapshot;
     const merged = restoreHydratedTranscript(state, snapshot);
     renderSession(merged);
   }
