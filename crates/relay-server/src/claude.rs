@@ -4747,7 +4747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_worker_eviction_mid_turn_records_a_failure_that_does_not_halt_the_run() {
+    async fn a_worker_eviction_mid_turn_records_a_classified_capacity_failure() {
         // worker.mjs `evictSessionsIfNeeded`: its own concurrency cap (distinct
         // from an Anthropic usage limit), reclaiming the LRU session even if a
         // turn is in flight. Before this shape was reported with `failed`/
@@ -4791,15 +4791,14 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("session limit was reached"));
-        // Distinct from the Anthropic quota: `TurnFailureKind::from_wire` does
-        // not recognise "session_capacity", so it degrades to an ordinary
-        // failure rather than halting the run the way `usage_limit` does.
+        // Distinct from the Anthropic quota, but the same halt: keep the run
+        // resumable until a seat is free, rather than ending it as Failed.
         assert_eq!(
             relay
                 .last_turn_failure("claude-thread")
                 .and_then(|f| f.kind),
-            None,
-            "the worker's own capacity eviction must not be read as a provider limit"
+            Some(TurnFailureKind::SessionCapacity),
+            "the worker's own capacity eviction must halt the run like a usage limit"
         );
     }
 

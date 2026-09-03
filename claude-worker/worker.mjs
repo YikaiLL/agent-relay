@@ -729,8 +729,9 @@ function evictSessionsIfNeeded(sessions, context) {
         // it must settle FAILED, not a clean done, or a dev that had already
         // emitted text reads as Replied and can still consume review rounds.
         // Distinct from "usage_limit" — this is the worker's own concurrency
-        // cap, not a provider quota, and must not halt the run the way that
-        // does; an unrecognised kind already degrades to an ordinary failure.
+        // cap, not a provider quota — but it still maps onto the same
+        // recoverable halt in the relay so the run stays resumable until a
+        // seat is free again.
         ...(evictedTurnId
           ? { failed: true, reason: message, failure_kind: "session_capacity" }
           : {}),

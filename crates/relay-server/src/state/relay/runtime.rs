@@ -50,6 +50,7 @@ pub(crate) struct TurnSpend {
 /// | provider signal | kind | policy |
 /// |---|---|---|
 /// | Claude worker `done.failure_kind = "usage_limit"` | `UsageLimit` | halt, settle `Paused` |
+/// | Claude worker `done.failure_kind = "session_capacity"` | `SessionCapacity` | halt, settle `Paused` |
 /// | Codex `codexErrorInfo: usageLimitExceeded` | `UsageLimit` | halt, settle `Paused` |
 /// | Codex `codexErrorInfo: sessionBudgetExceeded` | `UsageLimit` | halt, settle `Paused` |
 /// | Codex `serverOverloaded` | none | ordinary failure |
@@ -59,7 +60,8 @@ pub(crate) struct TurnSpend {
 /// The line is whether the run is worth keeping until the block lifts. Halting
 /// converts a failure into a RESUMABLE `Paused` run, so the branch, worktree and
 /// finished sub-tasks survive — right for a spend limit, whether it resets on a
-/// clock or when someone raises it. The omissions are equally deliberate:
+/// clock or when someone raises it, and for the worker reclaiming a seat when
+/// its own concurrency cap is hit. The omissions are equally deliberate:
 /// `serverOverloaded` is a transient the caller should retry, and an auth or
 /// request error is not "waiting for quota" at all — parking either would
 /// describe a run as waiting for something that is never coming. Widening this
@@ -68,6 +70,7 @@ pub(crate) struct TurnSpend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TurnFailureKind {
     UsageLimit,
+    SessionCapacity,
 }
 
 impl TurnFailureKind {
@@ -78,6 +81,7 @@ impl TurnFailureKind {
     pub(crate) fn from_wire(kind: &str) -> Option<Self> {
         match kind {
             "usage_limit" => Some(Self::UsageLimit),
+            "session_capacity" => Some(Self::SessionCapacity),
             _ => None,
         }
     }
@@ -85,7 +89,7 @@ impl TurnFailureKind {
     /// Whether this kind settles the run `Paused` rather than failing it.
     pub(crate) fn halts_the_run(self) -> bool {
         match self {
-            Self::UsageLimit => true,
+            Self::UsageLimit | Self::SessionCapacity => true,
         }
     }
 }

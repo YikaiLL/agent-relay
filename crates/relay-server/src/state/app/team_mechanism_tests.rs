@@ -1540,6 +1540,122 @@ async fn a_dev_turn_that_exhausts_the_session_budget_halts_the_run_before_any_re
     );
 }
 
+/// The worker's own concurrency eviction (`failure_kind: "session_capacity"`),
+/// not an Anthropic spend limit. Same halt as a usage/session budget: the run
+/// must stay resumable so the branch, worktree and finished sub-tasks survive
+/// until a seat is free again. Ending it `Failed` would throw those away, and
+/// treating a bare `done` as success would open review on a branch nothing more
+/// will land on.
+#[tokio::test]
+async fn a_dev_turn_that_hits_session_capacity_halts_the_run_before_any_review() {
+    let kind = crate::state::TurnFailureKind::from_wire("session_capacity")
+        .expect("the worker's capacity eviction must be classified");
+    assert!(
+        kind.halts_the_run(),
+        "a classified capacity eviction must pause the run rather than end it"
+    );
+
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .fail_completed_turn_with
+        .lock()
+        .await
+        .replace((
+            "Claude background session was evicted because the session limit was reached"
+                .to_string(),
+            Some("session_capacity".to_string()),
+        ));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 0,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+
+    match dev_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => {
+            assert!(
+                reason.contains("session limit was reached"),
+                "the dev turn's own reason should say so: {reason}"
+            );
+        }
+        other => panic!("the dev turn should have failed on the capacity eviction: {other:?}"),
+    }
+    assert!(
+        run.pause_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("session limit was reached")),
+        "pause_reason must name the eviction, got {:?}",
+        run.pause_reason
+    );
+    assert_eq!(
+        run.pause_kind,
+        Some(relay_api::team::TeamPauseKind::Provider)
+    );
+    let reviewer_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Reviewer,
+    )
+    .await
+    .expect("a paused run still keeps its reviewer seat");
+    let reviewer_thread_for_run = reviewer_thread.clone();
+    relay_api::TeamPort::update_run(
+        &app,
+        &run_id,
+        Box::new(move |run| {
+            if let Some(task) = run.sub_tasks.get_mut(0) {
+                task.reviewer_thread_id = Some(reviewer_thread_for_run.clone());
+            }
+        }),
+    )
+    .await;
+    let reviewer_outcome = relay_api::TeamPort::turn(
+        &app,
+        &run_id,
+        relay_api::team::TeamThreadSlot::SubTaskReviewer(0),
+        relay_api::team::TeamRole::Reviewer,
+        "review it",
+    )
+    .await;
+    match reviewer_outcome {
+        relay_api::team::TeamTurnOutcome::Failed(_) => {}
+        other => panic!("the reviewer attempt must be refused once the run is paused: {other:?}"),
+    }
+    let codex_turns = providers.get("codex").unwrap().turns.lock().await.clone();
+    assert!(
+        codex_turns.len() == 1 && codex_turns[0].1 == "write the parser",
+        "the provider must see only the dev turn, never a reviewer turn: {codex_turns:?}"
+    );
+    assert!(
+        app.relay
+            .read()
+            .await
+            .last_turn_spend(&reviewer_thread)
+            .is_none(),
+        "a refused reviewer attempt must not bill tokens"
+    );
+    assert_eq!(
+        run.sub_tasks[0].rounds_used, 0,
+        "a paused run has spent no review budget"
+    );
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
+}
+
 /// `Replied` proves the agent SPOKE, not that it worked. A dev that answers
 /// "I couldn't do this" and spends nothing must not open the reviewer gate —
 /// otherwise a reviewer runs against an unchanged branch, burns both rounds and
