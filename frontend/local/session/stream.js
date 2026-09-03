@@ -276,6 +276,8 @@ export function createStreamController(ctx) {
     }
     sink.push({
       itemId: observation.itemId,
+      threadId: observation.threadId || null,
+      turnId: observation.turnId || null,
       textLengthBefore: observation.textLengthBefore,
       textLengthAfter: observation.textLengthAfter,
     });
@@ -332,6 +334,8 @@ export function createStreamController(ctx) {
       if (applied) {
         observeAppliedActiveThreadDelta({
           itemId: event.item_id,
+          threadId: currentThreadId,
+          turnId: event.turn_id || null,
           textLengthBefore,
           textLengthAfter: (state.transcriptHydrationEntries.get(event.item_id)?.text ?? "").length,
         });
@@ -399,6 +403,8 @@ export function createStreamController(ctx) {
         ];
     observeAppliedActiveThreadDelta({
       itemId: event.item_id,
+      threadId: currentThreadId,
+      turnId: event.turn_id || null,
       textLengthBefore,
       textLengthAfter: textLengthBefore + appendText.length,
     });

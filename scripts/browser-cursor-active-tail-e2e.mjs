@@ -65,6 +65,30 @@ const PROMPT =
   + "Do not use any tools, do not read or write any files, do not add any "
   + "extra text before or after the lines.";
 
+export function parseSseEventBlock(raw) {
+  if (!String(raw ?? "").trim()) {
+    return null;
+  }
+  let eventType = "message";
+  const dataLines = [];
+  for (const line of String(raw ?? "").replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n")) {
+    if (!line || line.startsWith(":")) {
+      continue;
+    }
+    if (line.startsWith("event:")) {
+      eventType = line.slice("event:".length).trim() || "message";
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trimStart());
+    }
+  }
+  if (!dataLines.length) {
+    return null;
+  }
+  return { type: eventType, data: dataLines.join("\n") };
+}
+
 /// Count SSE frames whose event name is `transcript_entry_delta`.
 ///
 /// The relay names the event on the `event:` line.  The JSON body has
@@ -75,29 +99,13 @@ export function countTranscriptEntryDeltas(text) {
   let count = 0;
   let lastItemId = null;
   for (const raw of normalized.split("\n\n")) {
-    if (!raw.trim()) {
-      continue;
-    }
-    let eventType = "message";
-    const dataLines = [];
-    for (const line of raw.split("\n")) {
-      if (!line || line.startsWith(":")) {
-        continue;
-      }
-      if (line.startsWith("event:")) {
-        eventType = line.slice("event:".length).trim() || "message";
-        continue;
-      }
-      if (line.startsWith("data:")) {
-        dataLines.push(line.slice("data:".length).trimStart());
-      }
-    }
-    if (eventType !== "transcript_entry_delta") {
+    const frame = parseSseEventBlock(raw);
+    if (frame?.type !== "transcript_entry_delta") {
       continue;
     }
     count += 1;
     try {
-      const obj = JSON.parse(dataLines.join("\n"));
+      const obj = JSON.parse(frame.data);
       if (obj?.item_id) {
         lastItemId = obj.item_id;
       }
@@ -124,6 +132,85 @@ export function findReducerAppliedCrossing(observations, cap = PREVIEW_CAP) {
       && after > cap
     ) {
       return observation;
+    }
+  }
+  return null;
+}
+
+function liveSampleMatches(sample, { threadId, turnId = null, documentUid = null }) {
+  if (!sample?.itemId || !sample.nodeUid || !sample.inViewport) {
+    return false;
+  }
+  if (documentUid && sample.documentUid !== documentUid) {
+    return false;
+  }
+  if (sample.activeThreadId !== threadId || !sample.activeTurnId) {
+    return false;
+  }
+  if (turnId && sample.activeTurnId !== turnId) {
+    return false;
+  }
+  return true;
+}
+
+function postSampleStillLive(sample, { threadId, turnId = null }) {
+  if (!("postActiveThreadId" in sample) && !("postActiveTurnId" in sample)) {
+    return false;
+  }
+  if (sample.postActiveThreadId !== threadId || !sample.postActiveTurnId) {
+    return false;
+  }
+  if (turnId && sample.postActiveTurnId !== turnId) {
+    return false;
+  }
+  return true;
+}
+
+/// Find proof that one live DOM element, not merely one item id, was visible on
+/// both sides of the preview cap.
+export function findLiveDomNodeEvidence(
+  samples,
+  { itemId, threadId, turnId = null, cap = PREVIEW_CAP, documentUid = null, requirePostSampleLive = false } = {}
+) {
+  if (!itemId || !threadId) {
+    return null;
+  }
+  const byNode = new Map();
+  for (const sample of samples || []) {
+    if (
+      sample?.itemId !== itemId
+      || !liveSampleMatches(sample, { threadId, turnId, documentUid })
+    ) {
+      continue;
+    }
+    const bucket = byNode.get(sample.nodeUid) || [];
+    bucket.push(sample);
+    byNode.set(sample.nodeUid, bucket);
+  }
+
+  for (const bucket of byNode.values()) {
+    bucket.sort((a, b) => (Number(a.sampledAt) || 0) - (Number(b.sampledAt) || 0));
+    for (const below of bucket) {
+      if (!(Number(below.textLength) <= cap)) {
+        continue;
+      }
+      for (const above of bucket) {
+        if (!(Number(above.textLength) > cap)) {
+          continue;
+        }
+        const belowAt = Number(below.sampledAt);
+        const aboveAt = Number(above.sampledAt);
+        if (Number.isFinite(belowAt) && Number.isFinite(aboveAt) && belowAt > aboveAt) {
+          continue;
+        }
+        if (below.activeTurnId !== above.activeTurnId) {
+          continue;
+        }
+        if (requirePostSampleLive && !postSampleStillLive(above, { threadId, turnId })) {
+          continue;
+        }
+        return { below, above };
+      }
     }
   }
   return null;
@@ -234,20 +321,94 @@ async function main() {
     // reducer only pushes when the sink is already an array.  The local page
     // opens /api/stream via fetch (not EventSource).  We still tee that body
     // for diagnostics, but SSE counts cannot satisfy the assertion.
-    await page.addInitScript(({ parserSource, replyMarker }) => {
-      const countTranscriptEntryDeltas = (0, eval)(`(${parserSource})`);
+    await page.addInitScript(({ parserSource, replyMarker, cloneId }) => {
+      const parseSseEventBlock = (0, eval)(`(${parserSource})`);
       window.__localDeltaCount = 0;
       window.__lastDeltaItemId = null;
       window.__documentUid = Math.random().toString(36).slice(2);
       window.__streamConnected = false;
+      window.__relayObservedSession = {
+        activeThreadId: null,
+        activeTurnId: null,
+        source: null,
+        observedAt: 0,
+      };
       window.__appliedLocalTranscriptDeltas = [];
       window.__domLiveSamples = [];
+      const nodeUids = new WeakMap();
+      const sampleKeys = new Map();
+      let nextNodeUid = 1;
+
+      function recordRelaySessionSnapshot(snapshot, source) {
+        if (!snapshot || typeof snapshot !== "object") {
+          return;
+        }
+        window.__relayObservedSession = {
+          activeThreadId: snapshot.active_thread_id || null,
+          activeTurnId: snapshot.active_turn_id || null,
+          source,
+          observedAt: Date.now(),
+        };
+      }
+      window.__recordRelaySessionSnapshot = recordRelaySessionSnapshot;
+
+      function currentObservedSession() {
+        const session = window.__relayObservedSession || {};
+        return {
+          activeThreadId: session.activeThreadId || null,
+          activeTurnId: session.activeTurnId || null,
+          sessionSource: session.source || null,
+          sessionObservedAt: session.observedAt || 0,
+        };
+      }
+      window.__currentObservedRelaySession = currentObservedSession;
+
+      async function refreshObservedSession(source) {
+        try {
+          const response = await fetch("/api/session", { cache: "no-store" });
+          const payload = await response.json();
+          recordRelaySessionSnapshot(payload?.data || payload, source);
+        } catch (_) {}
+        return currentObservedSession();
+      }
+      window.__refreshObservedRelaySession = refreshObservedSession;
+
+      function nodeUidFor(node) {
+        let uid = nodeUids.get(node);
+        if (!uid) {
+          uid = `node-${nextNodeUid}`;
+          nextNodeUid += 1;
+          nodeUids.set(node, uid);
+        }
+        return uid;
+      }
+
+      function recordDomSample(sample) {
+        const key = [
+          sample.itemId,
+          sample.nodeUid,
+          sample.textLength,
+          sample.inViewport,
+          sample.activeThreadId,
+          sample.activeTurnId,
+          sample.documentUid,
+        ].join("|");
+        if (sampleKeys.get(sample.nodeUid) === key) {
+          return;
+        }
+        sampleKeys.set(sample.nodeUid, key);
+        if (window.__domLiveSamples.length < 4000) {
+          window.__domLiveSamples.push(sample);
+        }
+      }
 
       function sampleVisibleAssistantNodes() {
         const nodes = [
           ...document.querySelectorAll('[data-transcript-entry-kind="agent_text"]'),
           ...document.querySelectorAll('[data-transcript-entry-kind="msg"]'),
         ];
+        const observed = currentObservedSession();
+        const samples = [];
         for (const node of nodes) {
           const text = node.textContent || "";
           if (!text.includes(replyMarker)) {
@@ -267,33 +428,82 @@ async function main() {
             && rect.top < window.innerHeight;
           const sample = {
             itemId,
+            nodeUid: nodeUidFor(node),
             textLength: text.length,
             inViewport,
+            top: Math.round(rect.top),
+            height: Math.round(rect.height),
+            width: Math.round(rect.width),
             documentUid: window.__documentUid,
+            sampledAt: Date.now(),
+            activeThreadId: observed.activeThreadId,
+            activeTurnId: observed.activeTurnId,
+            sessionSource: observed.sessionSource,
+            sessionObservedAt: observed.sessionObservedAt,
+            liveForClone: observed.activeThreadId === cloneId && Boolean(observed.activeTurnId),
           };
-          const last = window.__domLiveSamples[window.__domLiveSamples.length - 1];
-          if (
-            !last
-            || last.itemId !== sample.itemId
-            || last.textLength !== sample.textLength
-            || last.inViewport !== sample.inViewport
-          ) {
-            if (window.__domLiveSamples.length < 4000) {
-              window.__domLiveSamples.push(sample);
-            }
-          }
+          samples.push(sample);
+          recordDomSample(sample);
         }
-        requestAnimationFrame(sampleVisibleAssistantNodes);
+        return samples;
       }
-      requestAnimationFrame(sampleVisibleAssistantNodes);
+      window.__sampleVisibleAssistantNodes = sampleVisibleAssistantNodes;
 
-      const _fetch = window.fetch;
-      window.fetch = function interceptedFetch(input) {
+      function sampleOnAnimationFrame() {
+        sampleVisibleAssistantNodes();
+        requestAnimationFrame(sampleOnAnimationFrame);
+      }
+      requestAnimationFrame(sampleOnAnimationFrame);
+
+      function observeStreamPart(part) {
+        const frame = parseSseEventBlock(part);
+        if (!frame) {
+          return;
+        }
+        if (frame.type === "session") {
+          try {
+            recordRelaySessionSnapshot(JSON.parse(frame.data), "stream");
+          } catch (_) {}
+          return;
+        }
+        if (frame.type !== "transcript_entry_delta") {
+          return;
+        }
+        window.__localDeltaCount += 1;
+        try {
+          const obj = JSON.parse(frame.data);
+          if (obj?.item_id) {
+            window.__lastDeltaItemId = obj.item_id;
+          }
+        } catch (_) {}
+      }
+
+      function pathnameForFetchInput(input) {
         const url = typeof input === "string" ? input
           : input instanceof URL ? input.toString()
           : (input?.url ?? "");
+        try {
+          return new URL(url, window.location.href).pathname;
+        } catch (_) {
+          return "";
+        }
+      }
+
+      const _fetch = window.fetch;
+      window.fetch = function interceptedFetch(input) {
+        const pathname = pathnameForFetchInput(input);
         const promise = _fetch.apply(this, arguments);
-        if (!url.includes("/api/stream")) {
+        if (pathname === "/api/session") {
+          return promise.then((response) => {
+            try {
+              response.clone().json()
+                .then((payload) => recordRelaySessionSnapshot(payload?.data || payload, "session-fetch"))
+                .catch(() => {});
+            } catch (_) {}
+            return response;
+          });
+        }
+        if (pathname !== "/api/stream") {
           return promise;
         }
         return promise.then((response) => {
@@ -316,11 +526,7 @@ async function main() {
                   const parts = buf.split("\n\n");
                   buf = parts.pop() ?? "";
                   for (const part of parts) {
-                    const counted = countTranscriptEntryDeltas(`${part}\n\n`);
-                    window.__localDeltaCount += counted.count;
-                    if (counted.lastItemId) {
-                      window.__lastDeltaItemId = counted.lastItemId;
-                    }
+                    observeStreamPart(part);
                   }
                   pump();
                 }).catch(() => {});
@@ -338,8 +544,9 @@ async function main() {
         });
       };
     }, {
-      parserSource: countTranscriptEntryDeltas.toString(),
+      parserSource: parseSseEventBlock.toString(),
       replyMarker: REPLY_MARKER,
+      cloneId: CLONE_ID,
     });
 
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
@@ -400,7 +607,7 @@ async function main() {
     assert.equal(sent.ok, true, `sending the long prompt failed: ${sent.error?.message}`);
 
     const turnStartedAt = Date.now();
-    const liveGrowth = await waitForLiveGrowth(page, relayPort, {
+    const liveGrowth = await waitForLiveGrowth(page, {
       timeoutMs: TURN_TIMEOUT_MS,
     });
 
@@ -425,6 +632,7 @@ async function main() {
       entryMeasureBelow: liveGrowth.domBelow,
       entryMeasureAbove: liveGrowth.measure,
       activeTurnIdWhileGrowing: liveGrowth.activeTurnId,
+      activeTurnIdAfterAboveSample: liveGrowth.measure.postActiveTurnId,
       activeThreadId: finalSession.active_thread_id,
       activeTurnId: finalSession.active_turn_id,
     });
@@ -460,6 +668,20 @@ async function main() {
       + `(below=${JSON.stringify(liveGrowth.domBelow)})`
     );
 
+    assert.equal(
+      liveGrowth.domBelow.nodeUid,
+      liveGrowth.measure.nodeUid,
+      `the below-cap sample was node ${liveGrowth.domBelow.nodeUid}, but the above-cap `
+      + `sample was node ${liveGrowth.measure.nodeUid}`
+    );
+
+    assert.equal(
+      liveGrowth.domBelow.activeTurnId,
+      liveGrowth.measure.activeTurnId,
+      `the below-cap sample was captured during turn ${liveGrowth.domBelow.activeTurnId}, `
+      + `but the above-cap sample was captured during turn ${liveGrowth.measure.activeTurnId}`
+    );
+
     assert.ok(
       liveGrowth.measure.textLength > PREVIEW_CAP,
       `the live assistant node is only ${liveGrowth.measure.textLength} characters, `
@@ -470,6 +692,20 @@ async function main() {
       liveGrowth.activeTurnId,
       "the node crossed the preview cap after the relay's turn had already ended "
       + "— that is post-turn hydration, not foreground deltas"
+    );
+
+    assert.equal(
+      liveGrowth.crossing.turnId,
+      liveGrowth.activeTurnId,
+      `the reducer crossing was turn ${liveGrowth.crossing.turnId}, but the above-cap `
+      + `DOM sample was captured during ${liveGrowth.activeTurnId}`
+    );
+
+    assert.equal(
+      liveGrowth.measure.postActiveTurnId,
+      liveGrowth.activeTurnId,
+      `the relay no longer reported turn ${liveGrowth.activeTurnId} after the above-cap `
+      + `DOM sample (post=${liveGrowth.measure.postActiveTurnId || "none"})`
     );
 
     assert.equal(
@@ -519,7 +755,9 @@ async function main() {
           entryTextLengthBelow: liveGrowth.domBelow?.textLength ?? null,
           entryTextLength: liveGrowth.measure.textLength,
           entryInViewport: liveGrowth.measure.inViewport,
+          entryNodeUid: liveGrowth.measure.nodeUid,
           activeTurnIdWhileGrowing: liveGrowth.activeTurnId,
+          activeTurnIdAfterAboveSample: liveGrowth.measure.postActiveTurnId,
           activeThreadId: finalSession.active_thread_id,
           artifacts: artifacts.dir,
         },
@@ -548,128 +786,109 @@ async function main() {
 /// Poll the page and the relay together.  Growth after `active_turn_id`
 /// clears is hydration and must not satisfy the assertion.  SSE arrival
 /// without a reducer-applied cap crossing also must not satisfy it.
-async function waitForLiveGrowth(page, relayPort, { timeoutMs }) {
+async function waitForLiveGrowth(page, { timeoutMs }) {
   const deadline = Date.now() + timeoutMs;
   let sawLiveTurn = false;
   let lastMeasure = { found: false };
   let appliedDeltas = [];
-  const belowByItem = new Map();
-  const aboveByItem = new Map();
-
-  function noteLiveDomSample(sample) {
-    if (!sample?.itemId || !sample.inViewport) {
-      return;
-    }
-    if (sample.textLength <= PREVIEW_CAP && !belowByItem.has(sample.itemId)) {
-      belowByItem.set(sample.itemId, sample);
-    }
-    if (sample.textLength > PREVIEW_CAP && !aboveByItem.has(sample.itemId)) {
-      aboveByItem.set(sample.itemId, sample);
-    }
-  }
 
   while (Date.now() < deadline) {
-    const session = await sessionData(relayPort);
+    const currentCrossing = findReducerAppliedCrossing(appliedDeltas);
+    const stream = await page.evaluate(
+      async (preferredItemId) => {
+        const beforeSession = typeof window.__refreshObservedRelaySession === "function"
+          ? await window.__refreshObservedRelaySession("driver-before-sample")
+          : { activeThreadId: null, activeTurnId: null };
+        const samples = typeof window.__sampleVisibleAssistantNodes === "function"
+          ? window.__sampleVisibleAssistantNodes()
+          : [];
+        const measure = (
+          preferredItemId
+            ? samples.find((sample) => sample.itemId === preferredItemId)
+            : null
+        ) || samples.reduce((best, sample) => {
+          if (!best) {
+            return sample;
+          }
+          return sample.textLength > best.textLength ? sample : best;
+        }, null);
+        const afterSession = typeof window.__refreshObservedRelaySession === "function"
+          ? await window.__refreshObservedRelaySession("driver-after-sample")
+          : beforeSession;
+        const measured = measure
+          ? {
+            ...measure,
+            found: true,
+            postActiveThreadId: afterSession.activeThreadId || null,
+            postActiveTurnId: afterSession.activeTurnId || null,
+            postSessionSource: afterSession.sessionSource || null,
+            postSessionObservedAt: afterSession.sessionObservedAt || 0,
+          }
+          : {
+            found: false,
+            itemId: null,
+            nodeUid: null,
+            textLength: 0,
+            inViewport: false,
+            activeThreadId: beforeSession.activeThreadId || null,
+            activeTurnId: beforeSession.activeTurnId || null,
+            postActiveThreadId: afterSession.activeThreadId || null,
+            postActiveTurnId: afterSession.activeTurnId || null,
+          };
+        return {
+          deltaCount: window.__localDeltaCount || 0,
+          lastDeltaItemId: window.__lastDeltaItemId || null,
+          streamConnected: Boolean(window.__streamConnected),
+          documentUid: window.__documentUid || null,
+          observedSession: afterSession,
+          appliedDeltas: Array.isArray(window.__appliedLocalTranscriptDeltas)
+            ? window.__appliedLocalTranscriptDeltas.slice()
+            : [],
+          domSamples: Array.isArray(window.__domLiveSamples)
+            ? window.__domLiveSamples.slice()
+            : [],
+          measure: measured,
+        };
+      },
+      currentCrossing?.itemId || appliedDeltas.at(-1)?.itemId || null
+    );
     const liveTurn =
-      Boolean(session.active_turn_id) && session.active_thread_id === CLONE_ID;
+      Boolean(stream.observedSession?.activeTurnId)
+      && stream.observedSession?.activeThreadId === CLONE_ID;
     if (liveTurn) {
       sawLiveTurn = true;
     }
-
-    const stream = await page.evaluate(() => ({
-      deltaCount: window.__localDeltaCount || 0,
-      lastDeltaItemId: window.__lastDeltaItemId || null,
-      streamConnected: Boolean(window.__streamConnected),
-      appliedDeltas: Array.isArray(window.__appliedLocalTranscriptDeltas)
-        ? window.__appliedLocalTranscriptDeltas.slice()
-        : [],
-      domSamples: Array.isArray(window.__domLiveSamples)
-        ? window.__domLiveSamples.slice()
-        : [],
-    }));
     appliedDeltas = stream.appliedDeltas;
-
-    lastMeasure = await page.evaluate(
-      ([marker, itemId]) => {
-        const nodes = [
-          ...document.querySelectorAll('[data-transcript-entry-kind="agent_text"]'),
-          ...document.querySelectorAll('[data-transcript-entry-kind="msg"]'),
-        ];
-        const matches = nodes.filter((node) => (node.textContent || "").includes(marker));
-        let node = itemId
-          ? matches.find((candidate) =>
-            candidate.getAttribute("data-transcript-entry-id") === itemId
-          )
-          : null;
-        if (!node) {
-          node = matches.reduce((best, candidate) => {
-            if (!best) {
-              return candidate;
-            }
-            return (candidate.textContent || "").length > (best.textContent || "").length
-              ? candidate
-              : best;
-          }, null);
-        }
-        if (!node) {
-          return { found: false, itemId: null, textLength: 0, inViewport: false };
-        }
-        const rect = node.getBoundingClientRect();
-        const inViewport =
-          rect.width > 0
-          && rect.height > 0
-          && rect.right > 0
-          && rect.bottom > 0
-          && rect.left < window.innerWidth
-          && rect.top < window.innerHeight;
-        return {
-          found: true,
-          itemId: node.getAttribute("data-transcript-entry-id"),
-          textLength: (node.textContent || "").length,
-          inViewport,
-          top: Math.round(rect.top),
-          height: Math.round(rect.height),
-          width: Math.round(rect.width),
-          documentUid: window.__documentUid,
-        };
-      },
-      [REPLY_MARKER, findReducerAppliedCrossing(appliedDeltas)?.itemId || stream.lastDeltaItemId]
-    );
-
-    if (liveTurn) {
-      for (const sample of stream.domSamples) {
-        noteLiveDomSample(sample);
-      }
-      if (lastMeasure.found) {
-        noteLiveDomSample(lastMeasure);
-      }
-    }
+    lastMeasure = stream.measure;
 
     const crossing = findReducerAppliedCrossing(appliedDeltas);
-    const domBelow = crossing ? belowByItem.get(crossing.itemId) : null;
-    const domAbove = crossing ? aboveByItem.get(crossing.itemId) : null;
+    const samples = lastMeasure.found
+      ? [...stream.domSamples, lastMeasure]
+      : stream.domSamples;
+    const domEvidence = crossing
+      ? findLiveDomNodeEvidence(samples, {
+        itemId: crossing.itemId,
+        threadId: CLONE_ID,
+        turnId: crossing.turnId || null,
+        documentUid: stream.documentUid,
+        requirePostSampleLive: true,
+      })
+      : null;
     if (
       liveTurn
       && crossing
-      && lastMeasure.itemId === crossing.itemId
-      && lastMeasure.textLength > PREVIEW_CAP
-      && lastMeasure.inViewport
-      && domBelow
-      && domBelow.textLength <= PREVIEW_CAP
-      && domBelow.inViewport
-      && domAbove
-      && domAbove.textLength > PREVIEW_CAP
-      && domAbove.inViewport
+      && (!crossing.threadId || crossing.threadId === CLONE_ID)
+      && domEvidence
     ) {
       return {
-        measure: lastMeasure,
-        domBelow,
+        measure: domEvidence.above,
+        domBelow: domEvidence.below,
         crossing,
         appliedDeltas,
         deltaCount: stream.deltaCount,
         lastDeltaItemId: stream.lastDeltaItemId,
         streamConnected: stream.streamConnected,
-        activeTurnId: session.active_turn_id,
+        activeTurnId: domEvidence.above.activeTurnId,
       };
     }
 
@@ -689,7 +908,10 @@ async function waitForLiveGrowth(page, relayPort, { timeoutMs }) {
     + `applied=${appliedDeltas.length}, `
     + `crossing=${crossing ? `${crossing.itemId} ${crossing.textLengthBefore}→${crossing.textLengthAfter}` : "none"}, `
     + `last item=${lastMeasure.itemId ?? "none"} `
-    + `len=${lastMeasure.textLength ?? 0}. `
+    + `node=${lastMeasure.nodeUid ?? "none"} `
+    + `len=${lastMeasure.textLength ?? 0} `
+    + `turn=${lastMeasure.activeTurnId ?? "none"} `
+    + `postTurn=${lastMeasure.postActiveTurnId ?? "none"}. `
     + "SSE arrival or post-turn hydration must not count."
   );
 }

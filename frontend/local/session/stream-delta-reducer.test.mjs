@@ -257,7 +257,13 @@ test("accepted active-thread deltas emit applied length, refusals do not", () =>
 
     h.deliver({ delta: " world", text_offset: 5 });
     assert.deepEqual(sink, [
-      { itemId: "item-1", textLengthBefore: 5, textLengthAfter: 11 },
+      {
+        itemId: "item-1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        textLengthBefore: 5,
+        textLengthAfter: 11,
+      },
     ]);
 
     // Duplicate re-delivery: already covered by the body.
@@ -271,7 +277,15 @@ test("accepted active-thread deltas emit applied length, refusals do not", () =>
 
     assert.deepEqual(
       sink,
-      [{ itemId: "item-1", textLengthBefore: 5, textLengthAfter: 11 }],
+      [
+        {
+          itemId: "item-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          textLengthBefore: 5,
+          textLengthAfter: 11,
+        },
+      ],
       "duplicate, gapped, rejected, and other-thread frames must not emit"
     );
   });
