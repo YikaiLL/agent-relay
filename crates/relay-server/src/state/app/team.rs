@@ -1846,14 +1846,18 @@ over on resume"
         if run.stopping {
             // A draining stop settles this run itself once quiescent; settling
             // here too would race it and can discard the user's own reason.
-            return Some("the task is pausing; refusing to start a new reviewer turn".to_string());
+            return Some(
+                "The task paused before its next step began. You can resume from where it left off."
+                    .to_string(),
+            );
         }
 
         let (reason, kind, reset_sub_task) = if run.pause_requested {
             // Nothing else will settle a graceful pause, so this must — as the
             // user's own pause, not the gate's.
             (
-                "the task is pausing; refusing to start a new reviewer turn".to_string(),
+                "The task paused before its next step began. You can resume from where it left off."
+                    .to_string(),
                 TeamPauseKind::User,
                 false,
             )
@@ -1867,9 +1871,8 @@ over on resume"
                 return None;
             }
             (
-                format!(
-                    "refusing to start a reviewer turn: sub-task {index} has no landed dev turn to review"
-                ),
+                "This step hasn't produced any work yet. You can resume to run it again."
+                    .to_string(),
                 TeamPauseKind::Boundary,
                 true,
             )

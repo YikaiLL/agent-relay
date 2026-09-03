@@ -507,3 +507,26 @@ test("sidebar meta is one short line — no token counts", () => {
   assert.equal(teamListMeta(run({ status: "done" }), "pending_merge"), "Ready to merge");
   assert.doesNotMatch(teamListMeta(run({ status: "running" }), "in_progress"), /token|k\b/i);
 });
+
+test("a paused task with no sub-tasks shows Paused, not the phase it paused during", () => {
+  // Criterion 6: a provider halt or a user pause must not claim a review (or a
+  // build) is still running by falling through to the phase label.
+  assert.equal(
+    teamListMeta(run({ status: "paused", phase: "design_review", sub_tasks: [] }), "in_progress"),
+    "Paused"
+  );
+});
+
+test("a paused task that has sub-tasks still shows the fraction", () => {
+  assert.equal(
+    teamListMeta(
+      run({
+        status: "paused",
+        phase: "sub_tasks",
+        sub_tasks: [subTask(), subTask({ id: "s2", status: "done" })],
+      }),
+      "in_progress"
+    ),
+    "1/2"
+  );
+});

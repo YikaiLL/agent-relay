@@ -503,6 +503,11 @@ export function teamListMeta(run, groupId = null) {
     if (progress.total) {
       return `${progress.done}/${progress.total}`;
     }
+    // A paused run is not mid-phase — the phase label would claim a review (or
+    // a build) is still running when a halt or the user stopped it (criterion 6).
+    if (run?.status === "paused") {
+      return teamStatusLabel(run?.status);
+    }
     return teamPhaseLabel(run?.phase) || teamStatusLabel(run?.status);
   }
   if (group === "queued") {

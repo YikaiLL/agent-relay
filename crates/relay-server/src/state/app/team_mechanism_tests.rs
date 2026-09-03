@@ -1585,9 +1585,10 @@ async fn a_dev_turn_that_replies_but_bills_nothing_leaves_the_gate_shut() {
         "a turn that billed nothing has not landed"
     );
     match reviewer_outcomes.lock().await.first() {
-        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => assert!(
-            reason.contains("no landed dev turn"),
-            "the reviewer must be refused by the gate: {reason}"
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => assert_eq!(
+            reason,
+            "This step hasn't produced any work yet. You can resume to run it again.",
+            "the reviewer must be refused by the gate"
         ),
         other => panic!("the reviewer must not run against an unchanged branch: {other:?}"),
     }
@@ -1635,7 +1636,8 @@ async fn a_dev_turn_that_bills_tokens_opens_the_reviewer_gate() {
     assert!(
         !matches!(
             reviewer_outcomes.lock().await.first(),
-            Some(relay_api::team::TeamTurnOutcome::Failed(reason)) if reason.contains("no landed dev turn")
+            Some(relay_api::team::TeamTurnOutcome::Failed(reason))
+                if reason == "This step hasn't produced any work yet. You can resume to run it again."
         ),
         "the gate must not refuse a dev turn that really spent"
     );
@@ -2122,12 +2124,11 @@ must be a graceful no-op, not an error: {stop_result:?}"
         "the refusal committed before the stop could ever run; its own \
 decision must be the one that stuck"
     );
-    assert!(
-        run.pause_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("no landed dev turn")),
-        "got {:?}",
-        run.pause_reason
+    // Exact, not a substring: card copy a person reads, not the internal
+    // "sub-task N"/"landed" wording it used to leak.
+    assert_eq!(
+        run.pause_reason.as_deref(),
+        Some("This step hasn't produced any work yet. You can resume to run it again.")
     );
     assert_eq!(
         run.sub_tasks[0].status,
@@ -2772,12 +2773,10 @@ async fn a_graceful_pause_that_refuses_a_reviewer_turn_settles_paused_not_failed
         Some(relay_api::team::TeamPauseKind::User),
         "a graceful pause is the user's own request taking effect, not the gate's"
     );
-    assert!(
-        run.pause_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("pausing")),
-        "pause_reason should say the task is pausing: {:?}",
-        run.pause_reason
+    // Exact, not a substring: card copy a person reads, not log-speak.
+    assert_eq!(
+        run.pause_reason.as_deref(),
+        Some("The task paused before its next step began. You can resume from where it left off.")
     );
 
     // `fail()` is not suppressed for a graceful pause, so a bare refusal here
