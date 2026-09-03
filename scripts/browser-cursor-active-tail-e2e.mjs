@@ -8,12 +8,14 @@
 // that hides the clip no longer suppresses the authoritative tail fetch.
 //
 // What this proves:
-//   * At least one foreground TranscriptDelta was delivered and applied in the
-//     local session page (stream.js applyLocalTranscriptEntryDelta path).
-//   * The assistant item's rendered node is visible on screen (non-zero
-//     BoundingClientRect), not just present in the DOM.
-//   * The reply text exceeds PREVIEW_CAP in the live document — it grew across
-//     the cap in the original document, not a reload.
+//   * At least one SSE `transcript_entry_delta` frame was delivered (the event
+//     name, not a JSON `kind` field — the payload carries `delta_kind`).
+//   * The same assistant item that received those deltas grew past PREVIEW_CAP
+//     while the relay still reported a live turn on that thread.  Crossing the
+//     cap after `active_turn_id` clears is post-turn hydration and does not
+//     count.
+//   * That node's BoundingClientRect intersects the viewport, not merely a
+//     nonzero rectangle parked above the fold.
 //   * The document identity did not change across the reply (no navigation /
 //     reload replaced it while the turn ran).
 //   * The relay still identifies the cloned thread as the active thread after
@@ -30,6 +32,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { createArtifactWriter } from "./e2e/harness/artifacts.mjs";
@@ -45,13 +48,10 @@ const DEVICE_ID = "cursor-active-tail-e2e";
 // random ones.
 const CLONE_ID = "e2eac71v-e000-4000-8000-0000000ac71e";
 // The preview cap the LocalWeb snapshot compacts replies to.
-const PREVIEW_CAP = 1600;
-// Reply must be comfortably over the cap to survive compression artefacts.
-const REQUIRED_REPLY_LENGTH = PREVIEW_CAP + 400;
+export const PREVIEW_CAP = 1600;
 // One letter per line × this count produces a deterministic, easily-measured
-// reply longer than REQUIRED_REPLY_LENGTH.  No tools, no file reads, cheap to
-// generate.
-const LINE_COUNT = Math.ceil(REQUIRED_REPLY_LENGTH / 3);
+// reply longer than PREVIEW_CAP.  No tools, no file reads, cheap to generate.
+const LINE_COUNT = Math.ceil((PREVIEW_CAP + 400) / 3);
 // Deterministic content.  The marker lets the assertion skip accidental
 // matches against the user-prompt echo that some models include.
 const REPLY_MARKER = "cursor-active-tail-e2e-line-";
@@ -60,6 +60,66 @@ const PROMPT =
   + `"${REPLY_MARKER}<N>" where <N> is the line number starting from 1.  `
   + "Do not use any tools, do not read or write any files, do not add any "
   + "extra text before or after the lines.";
+
+/// Count SSE frames whose event name is `transcript_entry_delta`.
+///
+/// The relay names the event on the `event:` line.  The JSON body has
+/// `delta_kind` / `item_id` and no `kind` field — looking at `obj.kind` is
+/// how a first recorded run reported `deltaCount: 0` on a live stream.
+export function countTranscriptEntryDeltas(text) {
+  const normalized = String(text ?? "").replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+  let count = 0;
+  let lastItemId = null;
+  for (const raw of normalized.split("\n\n")) {
+    if (!raw.trim()) {
+      continue;
+    }
+    let eventType = "message";
+    const dataLines = [];
+    for (const line of raw.split("\n")) {
+      if (!line || line.startsWith(":")) {
+        continue;
+      }
+      if (line.startsWith("event:")) {
+        eventType = line.slice("event:".length).trim() || "message";
+        continue;
+      }
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice("data:".length).trimStart());
+      }
+    }
+    if (eventType !== "transcript_entry_delta") {
+      continue;
+    }
+    count += 1;
+    try {
+      const obj = JSON.parse(dataLines.join("\n"));
+      if (obj?.item_id) {
+        lastItemId = obj.item_id;
+      }
+    } catch {
+      // A well-formed event name still counts even if the body is damaged.
+    }
+  }
+  return { count, lastItemId };
+}
+
+/// Viewport intersection, not "any nonzero rectangle".
+///
+/// A node at `top: -5208` with height 85 has a real BoundingClientRect and is
+/// still entirely off-screen.  `innerText` / a nonzero box is not evidence.
+export function rectIntersectsViewport(rect, viewport) {
+  if (!rect || !(rect.width > 0) || !(rect.height > 0)) {
+    return false;
+  }
+  const width = Number(viewport?.width) || 0;
+  const height = Number(viewport?.height) || 0;
+  const top = Number(rect.top) || 0;
+  const left = Number(rect.left) || 0;
+  const right = left + rect.width;
+  const bottom = top + rect.height;
+  return right > 0 && bottom > 0 && left < width && top < height;
+}
 
 async function main() {
   const sessionsDir = path.join(realCursorConfigDir(), "acp-sessions");
@@ -143,62 +203,20 @@ async function main() {
     }));
     page = await context.newPage();
 
-    // Sample the DOM entry text length every 200ms while the turn is in flight.
-    // If the text reaches REQUIRED_REPLY_LENGTH before the turn ends, the entry
-    // grew via foreground deltas, not post-turn hydration.  The samples are read
-    // out after the turn and the highest length observed DURING the turn is the
-    // live-delta watermark.
-    //
-    // We use page.evaluate in a loop below after the prompt is sent, not a
-    // network interceptor, so we don't depend on the fetch instrumentation
-    // resolving.
-    let maxTextDuringTurn = 0;
-    let samplingActive = false;
-    const sampleInterval = setInterval(async () => {
-      if (!samplingActive) {
-        return;
-      }
-      try {
-        const len = await page.evaluate(([marker]) => {
-          const nodes = [
-            ...document.querySelectorAll('[data-transcript-entry-kind="agent_text"]'),
-            ...document.querySelectorAll('[data-transcript-entry-kind="msg"]'),
-          ];
-          for (const node of nodes) {
-            if ((node.textContent || "").includes(marker)) {
-              return (node.textContent || "").length;
-            }
-          }
-          return 0;
-        }, [REPLY_MARKER]).catch(() => 0);
-        if (len > maxTextDuringTurn) {
-          maxTextDuringTurn = len;
-        }
-      } catch {}
-    }, 200);
-
     // Inject observers before the page JS loads.
     //
-    // __localDeltaCount: incremented by every transcript_entry_delta SSE event
-    // received by the local session stream.  The local page opens /api/stream
-    // via fetch (not EventSource); we intercept via a XHR/fetch hook installed
-    // before page code runs.  We also hook XMLHttpRequest for completeness,
-    // but the relay client uses fetch exclusively.
-    //
-    // The relay delivers transcript deltas via the same SSE stream that carries
-    // session snapshots: each delta is an SSE event with `kind:
-    // "transcript_entry_delta"` in its JSON payload.
-    //
-    // __documentUid: set once when the observer runs, re-checked after the turn
-    // to prove no navigation replaced the document.
-    await page.addInitScript(() => {
+    // The local page opens /api/stream via fetch (not EventSource).  We tee
+    // that body and count frames whose SSE event name is
+    // `transcript_entry_delta` — the same name stream.js uses as `type`.
+    await page.addInitScript((parserSource) => {
+      const countTranscriptEntryDeltas = (0, eval)(`(${parserSource})`);
       window.__localDeltaCount = 0;
+      window.__lastDeltaItemId = null;
       window.__documentUid = Math.random().toString(36).slice(2);
       window.__streamConnected = false;
 
-      // Patch fetch so we can tee the /api/stream response and count deltas.
       const _fetch = window.fetch;
-      window.fetch = function interceptedFetch(input, init) {
+      window.fetch = function interceptedFetch(input) {
         const url = typeof input === "string" ? input
           : input instanceof URL ? input.toString()
           : (input?.url ?? "");
@@ -213,27 +231,23 @@ async function main() {
           }
           try {
             const [a, b] = response.body.tee();
-            // Scan stream b in the background.
             (function scan() {
               const reader = b.getReader();
               const dec = new TextDecoder();
               let buf = "";
               function pump() {
                 reader.read().then(({ done, value }) => {
-                  if (done) return;
+                  if (done) {
+                    return;
+                  }
                   buf += dec.decode(value, { stream: true });
-                  // Split on SSE event boundaries (\n\n).
                   const parts = buf.split("\n\n");
                   buf = parts.pop() ?? "";
                   for (const part of parts) {
-                    for (const line of part.split("\n")) {
-                      if (!line.startsWith("data:")) continue;
-                      try {
-                        const obj = JSON.parse(line.slice(5).trim());
-                        if (obj && obj.kind === "transcript_entry_delta") {
-                          window.__localDeltaCount += 1;
-                        }
-                      } catch (_) {}
+                    const counted = countTranscriptEntryDeltas(`${part}\n\n`);
+                    window.__localDeltaCount += counted.count;
+                    if (counted.lastItemId) {
+                      window.__lastDeltaItemId = counted.lastItemId;
                     }
                   }
                   pump();
@@ -251,10 +265,9 @@ async function main() {
           }
         });
       };
-    });
+    }, countTranscriptEntryDeltas.toString());
 
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
-    // Wait for the page to have booted and connected to the relay.
     await page.waitForFunction(
       () => {
         const log = document.querySelector("#client-log-root")?.textContent || "";
@@ -273,17 +286,12 @@ async function main() {
     });
     assert.equal(resumed.ok, true, `resume failed: ${resumed.error?.message}`);
 
-    // Wait until the relay's active thread is the clone.
     await waitFor(
       async () => (await sessionData(relayPort)).active_thread_id === CLONE_ID,
       TIMEOUT_MS,
       "the relay never made the clone the active thread"
     );
 
-    // The home page shows a "Open live conversation" button when an active
-    // session exists but the browser is not yet on its transcript page.
-    // Navigate to the thread view by clicking it (or directly by URL if it
-    // does not appear within a short grace period).
     const opened = await page
       .getByText("Open live conversation")
       .click({ timeout: 5000 })
@@ -291,17 +299,12 @@ async function main() {
       .catch(() => false);
 
     if (!opened) {
-      // Fall back: navigate directly to /?thread=<id>
       await page.goto(
         `http://127.0.0.1:${relayPort}/?thread=${encodeURIComponent(CLONE_ID)}`,
         { waitUntil: "domcontentloaded" }
       );
     }
 
-    // Wait for the page to render the cloned thread's transcript.  The local
-    // page shows transcript entries inside #transcript; once the SSE session
-    // snapshot arrives and hydration begins, at least one entry will be in the
-    // DOM.
     await page.waitForFunction(
       () => {
         const t = document.querySelector("#transcript");
@@ -311,136 +314,67 @@ async function main() {
       { timeout: TIMEOUT_MS }
     );
 
-    // Stamp the document uid — any reload after this point is detectable.
     const uidBefore = await page.evaluate(() => window.__documentUid);
     assert.ok(uidBefore, "document uid must be set by the init script");
 
-    // Send the long prompt.
     const sent = await postJson(relayPort, "/api/session/message", {
       text: PROMPT,
       thread_id: CLONE_ID,
       device_id: DEVICE_ID,
     });
     assert.equal(sent.ok, true, `sending the long prompt failed: ${sent.error?.message}`);
-    samplingActive = true;
 
     const turnStartedAt = Date.now();
-
-    // Wait for the transcript to contain a COMPLETED assistant reply that grew
-    // past the preview cap.
-    //
-    // We look for an agent_text (or msg) kind entry node that:
-    //   (a) contains the reply marker (to distinguish the assistant reply from
-    //       the user prompt, which also contains the marker text), and
-    //   (b) has enough textContent to prove it grew past PREVIEW_CAP.
-    //
-    // Using data-transcript-entry-kind to distinguish user vs. agent entries is
-    // the right filter; textContent.length is fine for measuring the reply
-    // length in the DOM (not innerText, which is affected by CSS visibility).
-    await page.waitForFunction(
-      ([marker, required]) => {
-        const nodes = [
-          ...document.querySelectorAll('[data-transcript-entry-kind="agent_text"]'),
-          ...document.querySelectorAll('[data-transcript-entry-kind="msg"]'),
-        ];
-        for (const node of nodes) {
-          const text = node.textContent || "";
-          if (text.includes(marker) && text.length >= required) {
-            return true;
-          }
-        }
-        return false;
-      },
-      [REPLY_MARKER, REQUIRED_REPLY_LENGTH],
-      { timeout: TURN_TIMEOUT_MS }
-    );
-
-    const turnEndedAt = Date.now();
-    samplingActive = false;
-    clearInterval(sampleInterval);
-
-    // Immediately capture the entry measurement while the text is at its peak
-    // (before the turn ends and the final compacted snapshot is applied).
-    const entryMeasurePeak = await page.evaluate(([marker]) => {
-      const nodes = [
-        ...document.querySelectorAll('[data-transcript-entry-kind="agent_text"]'),
-        ...document.querySelectorAll('[data-transcript-entry-kind="msg"]'),
-      ];
-      // Find the LONGEST entry containing the marker — that is the live reply,
-      // not an older history entry that might incidentally contain the marker.
-      let best = null;
-      for (const node of nodes) {
-        const text = node.textContent || "";
-        if (!text.includes(marker)) {
-          continue;
-        }
-        if (!best || text.length > (best.textLength ?? 0)) {
-          const rect = node.getBoundingClientRect();
-          best = {
-            found: true,
-            textLength: text.length,
-            visible: rect.width > 0 && rect.height > 0,
-            top: Math.round(rect.top),
-            height: Math.round(rect.height),
-          };
-        }
-      }
-      return best ?? { found: false };
-    }, [REPLY_MARKER]);
+    const liveGrowth = await waitForLiveGrowth(page, relayPort, {
+      timeoutMs: TURN_TIMEOUT_MS,
+    });
 
     await screenshot(page, artifacts, "turn-complete.png");
 
-    // Wait for the relay to mark the turn as finished.
     await waitFor(
       async () => (await sessionData(relayPort)).active_turn_id == null,
       TURN_TIMEOUT_MS,
       "the relay turn never completed"
     );
 
-    // Give the page a beat to process the final session frame.
-    await delay(1000);
-
-    // --- measurements ---------------------------------------------------------
     const uidAfter = await page.evaluate(() => window.__documentUid);
-    const deltaCount = await page.evaluate(() => window.__localDeltaCount);
-    const streamConnected = await page.evaluate(() => window.__streamConnected);
-    clearInterval(sampleInterval);
-    // entryMeasurePeak was captured while the text was still at peak length.
-    // Use it for the visibility and text-length assertions.
-    const entryMeasure = entryMeasurePeak;
-
     const finalSession = await sessionData(relayPort);
 
     await artifacts.writeJson("measurements.json", {
-      turnMs: turnEndedAt - turnStartedAt,
-      deltaCount,
-      streamConnected,
-      maxTextDuringTurn,
-      entryMeasure,
+      turnMs: Date.now() - turnStartedAt,
+      deltaCount: liveGrowth.deltaCount,
+      lastDeltaItemId: liveGrowth.lastDeltaItemId,
+      streamConnected: liveGrowth.streamConnected,
+      entryMeasure: liveGrowth.measure,
+      activeTurnIdWhileGrowing: liveGrowth.activeTurnId,
       activeThreadId: finalSession.active_thread_id,
       activeTurnId: finalSession.active_turn_id,
     });
 
-    // --- assertions -----------------------------------------------------------
-    // Foreground deltas were applied if the entry text was already growing
-    // while the turn was in flight.  The sampler measured the longest entry
-    // text observed DURING the turn (before `active_turn_id` cleared).  If
-    // that watermark exceeds PREVIEW_CAP the text grew live — post-turn
-    // hydration can only happen AFTER active_turn_id clears, which is AFTER
-    // turnEndedAt.
-    //
-    // The in-page fetch hook is additional evidence; it counts SSE
-    // transcript_entry_delta frames directly from the stream.  Both measures
-    // point at the same thing; either alone is sufficient.
     assert.ok(
-      maxTextDuringTurn > PREVIEW_CAP || deltaCount > 0,
-      `no evidence of foreground delta delivery during the turn. `
-      + `maxTextDuringTurn=${maxTextDuringTurn} (need >${PREVIEW_CAP}), `
-      + `page SSE deltaCount=${deltaCount}. `
-      + `The ACP foreground delta path (93be26b6) must stream text past the preview cap `
-      + `before active_turn_id clears. `
-      + `streamConnected=${streamConnected}. `
-      + `Turn took ${Math.round((turnEndedAt - turnStartedAt) / 1000)}s.`
+      liveGrowth.deltaCount > 0,
+      `no SSE transcript_entry_delta frames were parsed. `
+      + `streamConnected=${liveGrowth.streamConnected}. `
+      + "The hook must count the SSE event name, not JSON kind."
+    );
+
+    assert.equal(
+      liveGrowth.lastDeltaItemId,
+      liveGrowth.measure.itemId,
+      `foreground deltas applied to ${liveGrowth.lastDeltaItemId}, but the node `
+      + `that grew past the cap is ${liveGrowth.measure.itemId}`
+    );
+
+    assert.ok(
+      liveGrowth.measure.textLength > PREVIEW_CAP,
+      `the live assistant node is only ${liveGrowth.measure.textLength} characters, `
+      + `not past PREVIEW_CAP=${PREVIEW_CAP}`
+    );
+
+    assert.ok(
+      liveGrowth.activeTurnId,
+      "the node crossed the preview cap after the relay's turn had already ended "
+      + "— that is post-turn hydration, not foreground deltas"
     );
 
     assert.equal(
@@ -451,25 +385,10 @@ async function main() {
     );
 
     assert.ok(
-      entryMeasure.found,
-      `no [data-transcript-entry-id] node carrying the reply marker was found `
-      + `after the turn.  The reply may have been lost or the entry never rendered.  `
-      + `transcript entry count=${entryMeasure.transcriptEntryCount ?? "?"}, `
-      + `transcript text length=${entryMeasure.transcriptTextLength ?? "?"}`
-    );
-
-    assert.ok(
-      entryMeasure.visible,
-      `the assistant entry node is in the DOM but its BoundingClientRect is zero `
-      + `(top=${entryMeasure.top}, height=${entryMeasure.height}). `
-      + "The node is not visible to the user."
-    );
-
-    assert.ok(
-      entryMeasure.textLength >= REQUIRED_REPLY_LENGTH,
-      `the assistant entry text is only ${entryMeasure.textLength} characters, `
-      + `below the required ${REQUIRED_REPLY_LENGTH}. `
-      + "The reply did not grow past the 1,600-char preview cap in the live document."
+      liveGrowth.measure.inViewport,
+      `the assistant entry that grew past the cap does not intersect the viewport `
+      + `(top=${liveGrowth.measure.top}, height=${liveGrowth.measure.height}). `
+      + "A nonzero rectangle off-screen is not visible."
     );
 
     assert.equal(
@@ -487,11 +406,12 @@ async function main() {
           ok: true,
           clonedFrom: source.id,
           cloneId: CLONE_ID,
-          turnMs: turnEndedAt - turnStartedAt,
-          deltaCount,
-          maxTextDuringTurn,
-          entryTextLength: entryMeasure.textLength,
-          entryVisible: entryMeasure.visible,
+          turnMs: Date.now() - turnStartedAt,
+          deltaCount: liveGrowth.deltaCount,
+          lastDeltaItemId: liveGrowth.lastDeltaItemId,
+          entryTextLength: liveGrowth.measure.textLength,
+          entryInViewport: liveGrowth.measure.inViewport,
+          activeTurnIdWhileGrowing: liveGrowth.activeTurnId,
           activeThreadId: finalSession.active_thread_id,
           artifacts: artifacts.dir,
         },
@@ -517,7 +437,106 @@ async function main() {
   }
 }
 
-// --- relay helpers -----------------------------------------------------------
+/// Poll the page and the relay together.  Growth after `active_turn_id`
+/// clears is hydration and must not satisfy the assertion.
+async function waitForLiveGrowth(page, relayPort, { timeoutMs }) {
+  const deadline = Date.now() + timeoutMs;
+  let sawLiveTurn = false;
+  let lastMeasure = { found: false };
+
+  while (Date.now() < deadline) {
+    const session = await sessionData(relayPort);
+    const liveTurn =
+      Boolean(session.active_turn_id) && session.active_thread_id === CLONE_ID;
+    if (liveTurn) {
+      sawLiveTurn = true;
+    }
+
+    const stream = await page.evaluate(() => ({
+      deltaCount: window.__localDeltaCount || 0,
+      lastDeltaItemId: window.__lastDeltaItemId || null,
+      streamConnected: Boolean(window.__streamConnected),
+    }));
+
+    lastMeasure = await page.evaluate(
+      ([marker, deltaItemId]) => {
+        const nodes = [
+          ...document.querySelectorAll('[data-transcript-entry-kind="agent_text"]'),
+          ...document.querySelectorAll('[data-transcript-entry-kind="msg"]'),
+        ];
+        const matches = nodes.filter((node) => (node.textContent || "").includes(marker));
+        let node = deltaItemId
+          ? matches.find((candidate) =>
+            candidate.getAttribute("data-transcript-entry-id") === deltaItemId
+          )
+          : null;
+        if (!node) {
+          node = matches.reduce((best, candidate) => {
+            if (!best) {
+              return candidate;
+            }
+            return (candidate.textContent || "").length > (best.textContent || "").length
+              ? candidate
+              : best;
+          }, null);
+        }
+        if (!node) {
+          return { found: false, itemId: null, textLength: 0, inViewport: false };
+        }
+        const rect = node.getBoundingClientRect();
+        const inViewport =
+          rect.width > 0
+          && rect.height > 0
+          && rect.right > 0
+          && rect.bottom > 0
+          && rect.left < window.innerWidth
+          && rect.top < window.innerHeight;
+        return {
+          found: true,
+          itemId: node.getAttribute("data-transcript-entry-id"),
+          textLength: (node.textContent || "").length,
+          inViewport,
+          top: Math.round(rect.top),
+          height: Math.round(rect.height),
+          width: Math.round(rect.width),
+        };
+      },
+      [REPLY_MARKER, stream.lastDeltaItemId]
+    );
+
+    if (
+      liveTurn
+      && stream.deltaCount > 0
+      && stream.lastDeltaItemId
+      && lastMeasure.itemId === stream.lastDeltaItemId
+      && lastMeasure.textLength > PREVIEW_CAP
+    ) {
+      return {
+        measure: lastMeasure,
+        deltaCount: stream.deltaCount,
+        lastDeltaItemId: stream.lastDeltaItemId,
+        streamConnected: stream.streamConnected,
+        activeTurnId: session.active_turn_id,
+      };
+    }
+
+    // The turn started and then ended without live growth past the cap.
+    // Stop here so a later hydration fetch cannot satisfy the assertion.
+    if (sawLiveTurn && !liveTurn) {
+      break;
+    }
+    await delay(200);
+  }
+
+  throw new Error(
+    `the same assistant node did not grow past PREVIEW_CAP=${PREVIEW_CAP} `
+    + `while the relay reported a live turn. `
+    + `sawLiveTurn=${sawLiveTurn}, `
+    + `last item=${lastMeasure.itemId ?? "none"} `
+    + `len=${lastMeasure.textLength ?? 0}. `
+    + "Post-turn hydration must not count."
+  );
+}
 
 async function sessionData(relayPort) {
   return (await getJson(relayPort, "/api/session")).data || {};
@@ -556,8 +575,6 @@ async function postJson(relayPort, pathname, body) {
   return response.json();
 }
 
-// --- clone helpers -----------------------------------------------------------
-
 function realCursorConfigDir() {
   const explicit = process.env.CURSOR_CONFIG_DIR?.trim();
   if (explicit) {
@@ -595,8 +612,6 @@ async function pathExists(target) {
   );
 }
 
-// --- page helpers ------------------------------------------------------------
-
 async function screenshot(page, artifacts, name) {
   try {
     await fs.mkdir(artifacts.dir, { recursive: true });
@@ -604,7 +619,17 @@ async function screenshot(page, artifacts, name) {
   } catch {}
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+function isDirectRun() {
+  const entry = process.argv[1];
+  if (!entry) {
+    return false;
+  }
+  return import.meta.url === pathToFileURL(path.resolve(entry)).href;
+}
+
+if (isDirectRun()) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}
