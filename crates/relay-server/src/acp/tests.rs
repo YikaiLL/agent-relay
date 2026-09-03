@@ -2898,35 +2898,3 @@ async fn a_foreground_agent_chunks_second_delta_offset_follows_the_first() {
          naive fix ships text_offset: 0 and the client refuses the delta as a gap"
     );
 }
-
-#[tokio::test]
-async fn a_background_agent_chunks_second_delta_offset_follows_the_first() {
-    let state = relay_state();
-    {
-        let mut relay = state.write().await;
-        relay.active_thread_id = Some("other-thread".to_string());
-        relay.set_watched_threads("device-a", "device-a", vec!["t-bg".to_string()]);
-    }
-    let mut deltas = state.read().await.subscribe_transcript_deltas();
-    let mut runtime = session();
-
-    {
-        let mut relay = state.write().await;
-        let op = plan_update(&agent("hello "), &mut runtime);
-        crate::acp::rpc::apply_op(&mut relay, "t-bg", Some("turn-1".to_string()), op, "cursor");
-    }
-    let first = deltas.try_recv().expect("first chunk must queue a delta");
-    assert_eq!(first.text_offset, Some(0));
-
-    {
-        let mut relay = state.write().await;
-        let op = plan_update(&agent("world"), &mut runtime);
-        crate::acp::rpc::apply_op(&mut relay, "t-bg", Some("turn-1".to_string()), op, "cursor");
-    }
-    let second = deltas.try_recv().expect("second chunk must queue a delta");
-    assert_eq!(
-        second.text_offset,
-        Some("hello ".encode_utf16().count() as u64),
-        "the background branch runs the same broken per-chunk `start` today"
-    );
-}

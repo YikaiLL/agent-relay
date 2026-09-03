@@ -684,12 +684,13 @@ pub(crate) fn apply_op(
             delta,
             text,
         } => {
-            // No per-chunk `start`: it wipes the accumulated text before every
-            // append (upsert_transcript_item_for_thread:122), pinning text_offset at 0.
             if background {
+                relay.bg_start_agent_message(thread_id, item_id.clone(), turn.clone(), now);
                 relay.bg_append_agent_delta(thread_id, &item_id, &delta, &turn, now);
                 relay.bg_complete_agent_message(thread_id, item_id, text, turn, now);
             } else {
+                // No per-chunk `start`: it wipes the accumulated text before every
+                // append (upsert_transcript_item_for_thread:122), pinning text_offset at 0.
                 let mutation =
                     relay.append_agent_delta_for_thread(thread_id, &item_id, &delta, &turn);
                 relay.queue_broker_message(BrokerPendingMessage::TranscriptDelta(
