@@ -8,12 +8,16 @@
 // that hides the clip no longer suppresses the authoritative tail fetch.
 //
 // What this proves:
-//   * At least one SSE `transcript_entry_delta` frame was delivered (the event
-//     name, not a JSON `kind` field — the payload carries `delta_kind`).
-//   * The same assistant item that received those deltas grew past PREVIEW_CAP
-//     while the relay still reported a live turn on that thread.  Crossing the
-//     cap after `active_turn_id` clears is post-turn hydration and does not
-//     count.
+//   * `applyLocalTranscriptEntryDelta` accepted at least one non-empty
+//     active-thread frame and reported item id + text length before/after.
+//     SSE arrival alone is not enough: a rejected frame plus hydration can
+//     also grow the item.
+//   * One of those reducer-applied observations itself crosses PREVIEW_CAP
+//     (at-or-below 1,600 → above 1,600) on the tested item.
+//   * The same visible DOM node is independently recorded below and above the
+//     cap while the relay still reports a live turn on that thread, in the
+//     original document.  Crossing after `active_turn_id` clears is post-turn
+//     hydration and does not count.
 //   * That node's BoundingClientRect intersects the viewport, not merely a
 //     nonzero rectangle parked above the fold.
 //   * The document identity did not change across the reply (no navigation /
@@ -102,6 +106,27 @@ export function countTranscriptEntryDeltas(text) {
     }
   }
   return { count, lastItemId };
+}
+
+/// One reducer-applied observation that itself crosses the preview cap.
+///
+/// Cumulative growth across many accepted frames is not enough: the e2e must
+/// see a single accepted delta take the item from at-or-below the cap to above.
+export function findReducerAppliedCrossing(observations, cap = PREVIEW_CAP) {
+  for (const observation of observations || []) {
+    const before = Number(observation?.textLengthBefore);
+    const after = Number(observation?.textLengthAfter);
+    if (
+      observation?.itemId
+      && Number.isFinite(before)
+      && Number.isFinite(after)
+      && before <= cap
+      && after > cap
+    ) {
+      return observation;
+    }
+  }
+  return null;
 }
 
 /// Viewport intersection, not "any nonzero rectangle".
@@ -205,15 +230,62 @@ async function main() {
 
     // Inject observers before the page JS loads.
     //
-    // The local page opens /api/stream via fetch (not EventSource).  We tee
-    // that body and count frames whose SSE event name is
-    // `transcript_entry_delta` — the same name stream.js uses as `type`.
-    await page.addInitScript((parserSource) => {
+    // `__appliedLocalTranscriptDeltas` must exist before stream.js runs: the
+    // reducer only pushes when the sink is already an array.  The local page
+    // opens /api/stream via fetch (not EventSource).  We still tee that body
+    // for diagnostics, but SSE counts cannot satisfy the assertion.
+    await page.addInitScript(({ parserSource, replyMarker }) => {
       const countTranscriptEntryDeltas = (0, eval)(`(${parserSource})`);
       window.__localDeltaCount = 0;
       window.__lastDeltaItemId = null;
       window.__documentUid = Math.random().toString(36).slice(2);
       window.__streamConnected = false;
+      window.__appliedLocalTranscriptDeltas = [];
+      window.__domLiveSamples = [];
+
+      function sampleVisibleAssistantNodes() {
+        const nodes = [
+          ...document.querySelectorAll('[data-transcript-entry-kind="agent_text"]'),
+          ...document.querySelectorAll('[data-transcript-entry-kind="msg"]'),
+        ];
+        for (const node of nodes) {
+          const text = node.textContent || "";
+          if (!text.includes(replyMarker)) {
+            continue;
+          }
+          const itemId = node.getAttribute("data-transcript-entry-id");
+          if (!itemId) {
+            continue;
+          }
+          const rect = node.getBoundingClientRect();
+          const inViewport =
+            rect.width > 0
+            && rect.height > 0
+            && rect.right > 0
+            && rect.bottom > 0
+            && rect.left < window.innerWidth
+            && rect.top < window.innerHeight;
+          const sample = {
+            itemId,
+            textLength: text.length,
+            inViewport,
+            documentUid: window.__documentUid,
+          };
+          const last = window.__domLiveSamples[window.__domLiveSamples.length - 1];
+          if (
+            !last
+            || last.itemId !== sample.itemId
+            || last.textLength !== sample.textLength
+            || last.inViewport !== sample.inViewport
+          ) {
+            if (window.__domLiveSamples.length < 4000) {
+              window.__domLiveSamples.push(sample);
+            }
+          }
+        }
+        requestAnimationFrame(sampleVisibleAssistantNodes);
+      }
+      requestAnimationFrame(sampleVisibleAssistantNodes);
 
       const _fetch = window.fetch;
       window.fetch = function interceptedFetch(input) {
@@ -265,7 +337,10 @@ async function main() {
           }
         });
       };
-    }, countTranscriptEntryDeltas.toString());
+    }, {
+      parserSource: countTranscriptEntryDeltas.toString(),
+      replyMarker: REPLY_MARKER,
+    });
 
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
     await page.waitForFunction(
@@ -345,24 +420,44 @@ async function main() {
       deltaCount: liveGrowth.deltaCount,
       lastDeltaItemId: liveGrowth.lastDeltaItemId,
       streamConnected: liveGrowth.streamConnected,
-      entryMeasure: liveGrowth.measure,
+      appliedDeltaCount: liveGrowth.appliedDeltas.length,
+      reducerCrossing: liveGrowth.crossing,
+      entryMeasureBelow: liveGrowth.domBelow,
+      entryMeasureAbove: liveGrowth.measure,
       activeTurnIdWhileGrowing: liveGrowth.activeTurnId,
       activeThreadId: finalSession.active_thread_id,
       activeTurnId: finalSession.active_turn_id,
     });
 
     assert.ok(
-      liveGrowth.deltaCount > 0,
-      `no SSE transcript_entry_delta frames were parsed. `
-      + `streamConnected=${liveGrowth.streamConnected}. `
-      + "The hook must count the SSE event name, not JSON kind."
+      liveGrowth.crossing,
+      `no reducer-applied delta crossed PREVIEW_CAP=${PREVIEW_CAP}. `
+      + `applied=${liveGrowth.appliedDeltas.length}, `
+      + `sseDeltaCount=${liveGrowth.deltaCount}. `
+      + "SSE arrival or hydration-only growth must not pass."
     );
 
     assert.equal(
-      liveGrowth.lastDeltaItemId,
+      liveGrowth.crossing.itemId,
       liveGrowth.measure.itemId,
-      `foreground deltas applied to ${liveGrowth.lastDeltaItemId}, but the node `
+      `reducer crossing applied to ${liveGrowth.crossing.itemId}, but the node `
       + `that grew past the cap is ${liveGrowth.measure.itemId}`
+    );
+
+    assert.ok(
+      liveGrowth.crossing.textLengthBefore <= PREVIEW_CAP
+      && liveGrowth.crossing.textLengthAfter > PREVIEW_CAP,
+      `reducer crossing is ${liveGrowth.crossing.textLengthBefore}→`
+      + `${liveGrowth.crossing.textLengthAfter}, not a cap crossing`
+    );
+
+    assert.ok(
+      liveGrowth.domBelow
+      && liveGrowth.domBelow.itemId === liveGrowth.crossing.itemId
+      && liveGrowth.domBelow.textLength <= PREVIEW_CAP
+      && liveGrowth.domBelow.inViewport,
+      `the same visible node was not recorded at or below PREVIEW_CAP during the live turn `
+      + `(below=${JSON.stringify(liveGrowth.domBelow)})`
     );
 
     assert.ok(
@@ -382,6 +477,16 @@ async function main() {
       uidBefore,
       "the document identity changed — a reload or navigation replaced the original "
       + "document while the active-thread reply was growing"
+    );
+    assert.equal(
+      liveGrowth.domBelow.documentUid,
+      uidBefore,
+      "the below-cap DOM sample was not taken in the original document"
+    );
+    assert.equal(
+      liveGrowth.measure.documentUid,
+      uidBefore,
+      "the above-cap DOM sample was not taken in the original document"
     );
 
     assert.ok(
@@ -409,6 +514,9 @@ async function main() {
           turnMs: Date.now() - turnStartedAt,
           deltaCount: liveGrowth.deltaCount,
           lastDeltaItemId: liveGrowth.lastDeltaItemId,
+          appliedDeltaCount: liveGrowth.appliedDeltas.length,
+          reducerCrossing: liveGrowth.crossing,
+          entryTextLengthBelow: liveGrowth.domBelow?.textLength ?? null,
           entryTextLength: liveGrowth.measure.textLength,
           entryInViewport: liveGrowth.measure.inViewport,
           activeTurnIdWhileGrowing: liveGrowth.activeTurnId,
@@ -438,11 +546,27 @@ async function main() {
 }
 
 /// Poll the page and the relay together.  Growth after `active_turn_id`
-/// clears is hydration and must not satisfy the assertion.
+/// clears is hydration and must not satisfy the assertion.  SSE arrival
+/// without a reducer-applied cap crossing also must not satisfy it.
 async function waitForLiveGrowth(page, relayPort, { timeoutMs }) {
   const deadline = Date.now() + timeoutMs;
   let sawLiveTurn = false;
   let lastMeasure = { found: false };
+  let appliedDeltas = [];
+  const belowByItem = new Map();
+  const aboveByItem = new Map();
+
+  function noteLiveDomSample(sample) {
+    if (!sample?.itemId || !sample.inViewport) {
+      return;
+    }
+    if (sample.textLength <= PREVIEW_CAP && !belowByItem.has(sample.itemId)) {
+      belowByItem.set(sample.itemId, sample);
+    }
+    if (sample.textLength > PREVIEW_CAP && !aboveByItem.has(sample.itemId)) {
+      aboveByItem.set(sample.itemId, sample);
+    }
+  }
 
   while (Date.now() < deadline) {
     const session = await sessionData(relayPort);
@@ -456,18 +580,25 @@ async function waitForLiveGrowth(page, relayPort, { timeoutMs }) {
       deltaCount: window.__localDeltaCount || 0,
       lastDeltaItemId: window.__lastDeltaItemId || null,
       streamConnected: Boolean(window.__streamConnected),
+      appliedDeltas: Array.isArray(window.__appliedLocalTranscriptDeltas)
+        ? window.__appliedLocalTranscriptDeltas.slice()
+        : [],
+      domSamples: Array.isArray(window.__domLiveSamples)
+        ? window.__domLiveSamples.slice()
+        : [],
     }));
+    appliedDeltas = stream.appliedDeltas;
 
     lastMeasure = await page.evaluate(
-      ([marker, deltaItemId]) => {
+      ([marker, itemId]) => {
         const nodes = [
           ...document.querySelectorAll('[data-transcript-entry-kind="agent_text"]'),
           ...document.querySelectorAll('[data-transcript-entry-kind="msg"]'),
         ];
         const matches = nodes.filter((node) => (node.textContent || "").includes(marker));
-        let node = deltaItemId
+        let node = itemId
           ? matches.find((candidate) =>
-            candidate.getAttribute("data-transcript-entry-id") === deltaItemId
+            candidate.getAttribute("data-transcript-entry-id") === itemId
           )
           : null;
         if (!node) {
@@ -499,20 +630,42 @@ async function waitForLiveGrowth(page, relayPort, { timeoutMs }) {
           top: Math.round(rect.top),
           height: Math.round(rect.height),
           width: Math.round(rect.width),
+          documentUid: window.__documentUid,
         };
       },
-      [REPLY_MARKER, stream.lastDeltaItemId]
+      [REPLY_MARKER, findReducerAppliedCrossing(appliedDeltas)?.itemId || stream.lastDeltaItemId]
     );
 
+    if (liveTurn) {
+      for (const sample of stream.domSamples) {
+        noteLiveDomSample(sample);
+      }
+      if (lastMeasure.found) {
+        noteLiveDomSample(lastMeasure);
+      }
+    }
+
+    const crossing = findReducerAppliedCrossing(appliedDeltas);
+    const domBelow = crossing ? belowByItem.get(crossing.itemId) : null;
+    const domAbove = crossing ? aboveByItem.get(crossing.itemId) : null;
     if (
       liveTurn
-      && stream.deltaCount > 0
-      && stream.lastDeltaItemId
-      && lastMeasure.itemId === stream.lastDeltaItemId
+      && crossing
+      && lastMeasure.itemId === crossing.itemId
       && lastMeasure.textLength > PREVIEW_CAP
+      && lastMeasure.inViewport
+      && domBelow
+      && domBelow.textLength <= PREVIEW_CAP
+      && domBelow.inViewport
+      && domAbove
+      && domAbove.textLength > PREVIEW_CAP
+      && domAbove.inViewport
     ) {
       return {
         measure: lastMeasure,
+        domBelow,
+        crossing,
+        appliedDeltas,
         deltaCount: stream.deltaCount,
         lastDeltaItemId: stream.lastDeltaItemId,
         streamConnected: stream.streamConnected,
@@ -528,13 +681,16 @@ async function waitForLiveGrowth(page, relayPort, { timeoutMs }) {
     await delay(200);
   }
 
+  const crossing = findReducerAppliedCrossing(appliedDeltas);
   throw new Error(
     `the same assistant node did not grow past PREVIEW_CAP=${PREVIEW_CAP} `
-    + `while the relay reported a live turn. `
+    + `via a reducer-applied delta while the relay reported a live turn. `
     + `sawLiveTurn=${sawLiveTurn}, `
+    + `applied=${appliedDeltas.length}, `
+    + `crossing=${crossing ? `${crossing.itemId} ${crossing.textLengthBefore}→${crossing.textLengthAfter}` : "none"}, `
     + `last item=${lastMeasure.itemId ?? "none"} `
     + `len=${lastMeasure.textLength ?? 0}. `
-    + "Post-turn hydration must not count."
+    + "SSE arrival or post-turn hydration must not count."
   );
 }
 

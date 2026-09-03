@@ -262,6 +262,25 @@ export function createStreamController(ctx) {
     return true;
   }
 
+  function observeAppliedActiveThreadDelta(observation) {
+    const sink = globalThis.__appliedLocalTranscriptDeltas;
+    if (!Array.isArray(sink) || !observation?.itemId) {
+      return;
+    }
+    if (
+      !(Number.isSafeInteger(observation.textLengthBefore) && observation.textLengthBefore >= 0)
+      || !(Number.isSafeInteger(observation.textLengthAfter) && observation.textLengthAfter >= 0)
+      || observation.textLengthAfter <= observation.textLengthBefore
+    ) {
+      return;
+    }
+    sink.push({
+      itemId: observation.itemId,
+      textLengthBefore: observation.textLengthBefore,
+      textLengthAfter: observation.textLengthAfter,
+    });
+  }
+
   function applyLocalTranscriptEntryDelta(event) {
     if (!event?.item_id || !Array.isArray(state.session?.transcript)) {
       return;
@@ -308,7 +327,15 @@ export function createStreamController(ctx) {
     // second time — doing both is how a re-delivered chunk rendered as duplicated text
     // even though the stored copy was correct.
     if (transcriptWindowIsLoaded(state, currentThreadId)) {
-      appendTranscriptDelta(state, event);
+      const textLengthBefore = (state.transcriptHydrationEntries.get(event.item_id)?.text ?? "").length;
+      const applied = appendTranscriptDelta(state, event);
+      if (applied) {
+        observeAppliedActiveThreadDelta({
+          itemId: event.item_id,
+          textLengthBefore,
+          textLengthAfter: (state.transcriptHydrationEntries.get(event.item_id)?.text ?? "").length,
+        });
+      }
       queueTranscriptRender({
         ...state.session,
         transcript: renderedTranscriptFromWindow(state, state.session),
@@ -341,6 +368,8 @@ export function createStreamController(ctx) {
       return;
     }
 
+    const textLengthBefore =
+      entryIndex >= 0 ? (state.session.transcript[entryIndex].text ?? "").length : 0;
     const nextTranscript = entryIndex >= 0
       ? state.session.transcript.map((entry, index) =>
           index === entryIndex
@@ -368,6 +397,11 @@ export function createStreamController(ctx) {
             turn_id: event.turn_id || null,
           },
         ];
+    observeAppliedActiveThreadDelta({
+      itemId: event.item_id,
+      textLengthBefore,
+      textLengthAfter: textLengthBefore + appendText.length,
+    });
     queueTranscriptRender({
       ...state.session,
       transcript: nextTranscript,

@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   countTranscriptEntryDeltas,
+  findReducerAppliedCrossing,
+  PREVIEW_CAP,
   rectIntersectsViewport,
 } from "./browser-cursor-active-tail-e2e.mjs";
 
@@ -48,5 +50,24 @@ test("rectIntersectsViewport accepts a rect that overlaps the viewport", () => {
   assert.equal(
     rectIntersectsViewport({ top: 200, left: 40, width: 600, height: 120 }, { width: 1280, height: 900 }),
     true
+  );
+});
+
+test("findReducerAppliedCrossing requires one accepted delta that itself crosses the cap", () => {
+  // SSE-counted growth and hydration-only jumps are not this observation:
+  // only a reducer-applied before/after pair that straddles PREVIEW_CAP counts.
+  assert.equal(
+    findReducerAppliedCrossing([
+      { itemId: "item-1", textLengthBefore: 100, textLengthAfter: 400 },
+      { itemId: "item-1", textLengthBefore: 1700, textLengthAfter: 1900 },
+    ]),
+    null
+  );
+  assert.deepEqual(
+    findReducerAppliedCrossing([
+      { itemId: "item-1", textLengthBefore: 100, textLengthAfter: 400 },
+      { itemId: "item-1", textLengthBefore: 1500, textLengthAfter: PREVIEW_CAP + 80 },
+    ]),
+    { itemId: "item-1", textLengthBefore: 1500, textLengthAfter: PREVIEW_CAP + 80 }
   );
 });

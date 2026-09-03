@@ -233,6 +233,50 @@ test("a newer delta still advances the revision", () => {
   assert.equal(h.renderedText(), "Hello world");
 });
 
+// Proof seam for the Cursor active-tail e2e: SSE arrival is not evidence that
+// the reducer accepted the frame. Only a successful non-empty active-thread
+// apply may report item id and text length before/after.
+function withAppliedDeltaSink(run) {
+  const previous = globalThis.__appliedLocalTranscriptDeltas;
+  const sink = [];
+  globalThis.__appliedLocalTranscriptDeltas = sink;
+  try {
+    return run(sink);
+  } finally {
+    if (previous === undefined) {
+      delete globalThis.__appliedLocalTranscriptDeltas;
+    } else {
+      globalThis.__appliedLocalTranscriptDeltas = previous;
+    }
+  }
+}
+
+test("accepted active-thread deltas emit applied length, refusals do not", () => {
+  withAppliedDeltaSink((sink) => {
+    const h = harness({ text: "Hello" });
+
+    h.deliver({ delta: " world", text_offset: 5 });
+    assert.deepEqual(sink, [
+      { itemId: "item-1", textLengthBefore: 5, textLengthAfter: 11 },
+    ]);
+
+    // Duplicate re-delivery: already covered by the body.
+    h.deliver({ delta: " world", text_offset: 5 });
+    // Gap: starts past the end of what we hold.
+    h.deliver({ delta: "tail", text_offset: 99 });
+    // Rejected: same range, different bytes.
+    h.deliver({ delta: " XXXXX", text_offset: 5 });
+    // Other thread: routed away from the active transcript.
+    h.deliver({ thread_id: "thread-other", delta: " stray", text_offset: 5 });
+
+    assert.deepEqual(
+      sink,
+      [{ itemId: "item-1", textLengthBefore: 5, textLengthAfter: 11 }],
+      "duplicate, gapped, rejected, and other-thread frames must not emit"
+    );
+  });
+});
+
 // ---- the Orchestrator's transcript -----------------------------------------
 
 // The Orchestrator is drawn BESIDE the conversation, so while you are reading a
