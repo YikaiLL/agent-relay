@@ -2142,6 +2142,222 @@ stop was racing to apply right after"
     );
 }
 
+/// Drives a Silent dev turn — so `dev_turns_landed` stays 0, the branch that
+/// still mutates the sub-task below — moves the sub-task on the way the
+/// private driver's action table would, then waits to be released before
+/// attempting the reviewer turn. Gives a test a deterministic window to
+/// settle the run for real before that late reviewer attempt runs.
+struct SettledBeforeReviewDriver {
+    dev_outcome: std::sync::Arc<Mutex<Option<relay_api::team::TeamTurnOutcome>>>,
+    reviewer_outcome: std::sync::Arc<Mutex<Option<relay_api::team::TeamTurnOutcome>>>,
+    dev_landed: std::sync::Arc<tokio::sync::Notify>,
+    proceed_to_reviewer: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for SettledBeforeReviewDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, port: std::sync::Arc<dyn relay_api::TeamPort>, run_id: String) {
+        let dev_thread = port
+            .start_thread(&run_id, relay_api::team::TeamRole::Dev)
+            .await
+            .expect("dev seat thread");
+        let reviewer_thread = port
+            .start_thread(&run_id, relay_api::team::TeamRole::Reviewer)
+            .await
+            .expect("reviewer seat thread");
+        port.update_run(
+            &run_id,
+            Box::new(move |run| {
+                run.sub_tasks.push(crate::state::SubTask {
+                    id: "st-1".to_string(),
+                    dev_thread_id: Some(dev_thread),
+                    reviewer_thread_id: Some(reviewer_thread),
+                    ..Default::default()
+                });
+            }),
+        )
+        .await;
+
+        let dev_outcome = port
+            .turn(
+                &run_id,
+                relay_api::team::TeamThreadSlot::SubTaskDev(0),
+                relay_api::team::TeamRole::Dev,
+                "write the parser",
+            )
+            .await;
+        *self.dev_outcome.lock().await = Some(dev_outcome);
+        // Mirrors the private driver's action table: any non-terminal dev
+        // outcome moves the sub-task on, even a Silent one — the reviewer
+        // gate is what actually catches "nothing landed", not this step.
+        port.update_run(
+            &run_id,
+            Box::new(|run| {
+                if let Some(task) = run.sub_tasks.get_mut(0) {
+                    task.status = relay_api::team::SubTaskStatus::Implementing;
+                }
+            }),
+        )
+        .await;
+        self.dev_landed.notify_one();
+        self.proceed_to_reviewer.notified().await;
+
+        let reviewer_outcome = port
+            .turn(
+                &run_id,
+                relay_api::team::TeamThreadSlot::SubTaskReviewer(0),
+                relay_api::team::TeamRole::Reviewer,
+                "review it",
+            )
+            .await;
+        *self.reviewer_outcome.lock().await = Some(reviewer_outcome);
+    }
+}
+
+/// [Settled-run guard] The reviewer gate decides and commits atomically, but
+/// never checked whether the run had ALREADY settled before deciding
+/// anything. `settle_paused` clears both `stopping` and `pause_requested`, so
+/// a reviewer attempt that only reaches the gate AFTER a real Stop has
+/// already settled the run sees neither flag, falls into the no-landed
+/// branch, and force-resets the sub-task — discarding the progress the Stop
+/// preserved.
+#[tokio::test]
+async fn a_reviewer_turn_after_the_run_already_settled_must_not_touch_it() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    // Silent, so `dev_turns_landed` stays 0 — the no-landed branch is the one
+    // that still mutates even once the run has settled.
+    providers
+        .get("codex")
+        .unwrap()
+        .emit_assistant
+        .store(false, Ordering::Relaxed);
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcome = std::sync::Arc::new(Mutex::new(None));
+    let dev_landed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let proceed_to_reviewer = std::sync::Arc::new(tokio::sync::Notify::new());
+    let app = app.with_team_driver(std::sync::Arc::new(SettledBeforeReviewDriver {
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcome: reviewer_outcome.clone(),
+        dev_landed: dev_landed.clone(),
+        proceed_to_reviewer: proceed_to_reviewer.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    dev_landed.notified().await;
+    assert!(
+        dev_outcome.lock().await.is_some(),
+        "the dev turn must have run before the settle below"
+    );
+
+    // Nothing is in flight yet, so this drains trivially and settles `Paused`
+    // synchronously — BEFORE the reviewer turn below is even attempted.
+    app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect("a quiescent run stops synchronously");
+    let settled = app
+        .relay
+        .read()
+        .await
+        .team_run(&run_id)
+        .cloned()
+        .expect("run recorded");
+    assert_eq!(settled.status, crate::state::TeamRunStatus::Paused);
+    assert_eq!(
+        settled.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Implementing,
+        "sanity: the sub-task's progress just before the late reviewer attempt"
+    );
+
+    proceed_to_reviewer.notify_one();
+    for _ in 0..600 {
+        if reviewer_outcome.lock().await.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        reviewer_outcome.lock().await.is_some(),
+        "the late reviewer attempt should have resolved by now"
+    );
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run(&run_id)
+        .cloned()
+        .expect("run still recorded");
+    assert_eq!(
+        run.status,
+        crate::state::TeamRunStatus::Paused,
+        "a settled run must not be re-decided by a late reviewer attempt"
+    );
+    assert_eq!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Implementing,
+        "the settled run's progress must survive a late reviewer attempt \
+untouched, not be reset to Pending"
+    );
+    assert_eq!(
+        run.pause_kind,
+        Some(relay_api::team::TeamPauseKind::User),
+        "the real stop's own reason must stick, not be silently overwritten \
+by the gate's Boundary kind"
+    );
+    assert_eq!(run.pause_reason.as_deref(), Some("stopped by the user"));
+}
+
+/// `settle_team_run` releases every owned thread's provider seat after
+/// settling `Paused` (`release_seats_when_settled`). The reviewer gate settles
+/// `Paused` too, through its own direct `settle_paused` call rather than
+/// through `settle_team_run` — it must release seats just the same, or a
+/// refused reviewer turn pins the dev's and reviewer's child processes for as
+/// long as the pause lasts.
+#[tokio::test]
+async fn a_refused_reviewer_turn_that_settles_the_run_releases_its_seats() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let codex = providers.get("codex").unwrap().clone();
+    // Silent, so the reviewer gate's own no-landed branch is what settles the
+    // run — not some other path already wired to `release_seats_when_settled`.
+    codex.emit_assistant.store(false, Ordering::Relaxed);
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 1,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
+    let owned = run.owned_thread_ids();
+    assert_eq!(owned.len(), 2, "a dev and a reviewer thread must both be owned");
+
+    for _ in 0..600 {
+        if codex.released_threads().await.len() >= owned.len() {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    let released = codex.released_threads().await;
+    for thread_id in &owned {
+        assert!(
+            released.contains(thread_id),
+            "the reviewer gate's own settle must release every owned seat, \
+same as `settle_team_run` does: {thread_id} missing from {released:?}"
+        );
+    }
+}
+
 /// Regression: the new gate must not weaken the ordinary path. A dev turn that
 /// lands, followed by a reviewer that rejects it twice, must still reach
 /// `Escalated` exactly as it did before this sub-task.

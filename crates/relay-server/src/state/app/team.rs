@@ -1832,6 +1832,17 @@ over on resume"
         let mut relay = self.relay.write().await;
         let run = relay.team_run(run_id)?;
 
+        // Someone else already settled this run. `settle_paused` clears both
+        // `stopping` and `pause_requested`, so without this a late attempt
+        // would fall to the no-landed branch below and reset the sub-task —
+        // discarding progress the settle just preserved (and `block()`'s
+        // terminal-only guard would let it flip a settled `Paused` run to
+        // `Blocked`). `team_turn_preflight` refuses a non-`Running` run on its
+        // own, so `None` here still ends in `Failed`, with nothing written.
+        if run.status.is_terminal() || run.status.is_settled_without_driver() {
+            return None;
+        }
+
         if run.stopping {
             // A draining stop settles this run itself once quiescent; settling
             // here too would race it and can discard the user's own reason.
@@ -1885,6 +1896,7 @@ over on resume"
         }
 
         let mut blocked = None;
+        let mut newly_paused = false;
         relay.update_team_run(run_id, |run| {
             // Only the landed-dev-work branch resets: a user pause must
             // preserve where the work had got to, not send it back to square
@@ -1895,7 +1907,7 @@ over on resume"
                 }
             }
             if working.is_empty() {
-                run.settle_paused(&reason, kind);
+                newly_paused = run.settle_paused(&reason, kind);
             } else {
                 // Mirrors `settle_team_run`'s own guard: a run that cannot
                 // prove quiescence is Blocked instead of a lie the user acts on.
@@ -1914,6 +1926,13 @@ over on resume"
             relay.push_log("warn", format!("Task {run_id} blocked: {message}"));
         }
         relay.notify();
+        drop(relay);
+        if newly_paused {
+            // `settle_team_run` releases seats after settling `Paused`; this is
+            // the other place that settles it, so it must too, or a refused
+            // reviewer turn pins its Claude child for as long as the pause lasts.
+            self.release_seats_when_settled(run_id, TeamRunStatus::Paused);
+        }
         Some(reason)
     }
 
