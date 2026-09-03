@@ -12256,6 +12256,11 @@ mod review_tests {
         // whether a provider round-trip happened at all (e.g. a settled run's
         // turn must never probe the provider it is refusing to drive).
         read_thread_calls: Arc<Mutex<Vec<String>>>,
+        // Held inside `read_thread`, after the call is recorded and before the
+        // provider returns. Lets team tests settle a run while a baseline read is
+        // in flight and prove later bookkeeping re-checks the run status.
+        read_thread_barrier: Arc<Mutex<()>>,
+        read_thread_arrivals: Arc<AtomicU64>,
         // (thread_id, model, effort) recorded at each start_turn, so a test can
         // assert the model/effort a reviewer turn actually ran with (reuse must keep
         // the reviewer's own model, not the parent's).
@@ -12414,6 +12419,8 @@ mod review_tests {
                 fail_delete_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 fail_read_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 read_thread_calls: Arc::new(Mutex::new(Vec::new())),
+                read_thread_barrier: Arc::new(Mutex::new(())),
+                read_thread_arrivals: Arc::new(AtomicU64::new(0)),
                 turn_models: Arc::new(Mutex::new(Vec::new())),
                 list_models_fails: Arc::new(AtomicBool::new(false)),
                 suppress_reviewer_reply: Arc::new(AtomicBool::new(false)),
@@ -12539,6 +12546,14 @@ mod review_tests {
         pub(crate) async fn read_thread_calls(&self) -> Vec<String> {
             self.read_thread_calls.lock().await.clone()
         }
+
+        pub(crate) async fn hold_read_thread_barrier(&self) -> tokio::sync::OwnedMutexGuard<()> {
+            self.read_thread_barrier.clone().lock_owned().await
+        }
+
+        pub(crate) fn read_thread_arrivals(&self) -> u64 {
+            self.read_thread_arrivals.load(Ordering::Relaxed)
+        }
     }
 
     #[async_trait::async_trait]
@@ -12653,6 +12668,8 @@ mod review_tests {
                 .lock()
                 .await
                 .push(thread_id.to_string());
+            self.read_thread_arrivals.fetch_add(1, Ordering::Relaxed);
+            drop(self.read_thread_barrier.lock().await);
             if self.fail_read_thread_ids.lock().await.contains(thread_id) {
                 return Err(format!(
                     "{} provider probe failed for '{thread_id}': PROBE_UNAVAILABLE",

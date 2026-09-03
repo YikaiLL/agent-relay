@@ -678,7 +678,8 @@ over on resume"
         self.team_drive_gate.try_lock().ok()
     }
 
-    /// Hold the driver at the pre-gate latch. Drop the guard to release it.
+    /// Hold the driver after early refusal gates and before pre-turn side effects.
+    /// Drop the guard to release it.
     #[cfg(test)]
     pub(crate) async fn hold_team_turn_barrier(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.team_turn_barrier.clone().lock_owned().await
@@ -690,7 +691,7 @@ over on resume"
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Hold the driver INSIDE the drive gate, after preflight.
+    /// Hold the driver after phase bookkeeping and before the drive gate.
     #[cfg(test)]
     pub(crate) async fn hold_team_gated_barrier(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.team_gated_barrier.clone().lock_owned().await
@@ -1680,6 +1681,17 @@ over on resume"
         self.relay.read().await.team_run(run_id).cloned()
     }
 
+    async fn settled_team_turn_refusal(&self, run_id: &str) -> Option<String> {
+        let status = self.team_run_snapshot(run_id).await?.status;
+        if status.is_terminal() || status.is_settled_without_driver() {
+            return Some(format!(
+                "task run {run_id} settled as {} before this turn started",
+                status.as_str()
+            ));
+        }
+        None
+    }
+
     /// Start a background thread for one seat.
     ///
     /// Mirrors `start_workflow_step_thread`, including the two things that break
@@ -1837,13 +1849,14 @@ over on resume"
         // would fall to the no-landed branch below and reset the sub-task —
         // discarding progress the settle just preserved (and `block()`'s
         // terminal-only guard would let it flip a settled `Paused` run to
-        // `Blocked`). `team_turn`'s own settled check already catches this
-        // before the FIRST call reaches here; this is the GATED call's own
-        // backstop for a settle landing in between — `team_turn_preflight`
-        // runs right after with nothing in between, so `None` here still ends
-        // in `Failed`, with nothing written.
+        // `Blocked`). Hard-refuse here, not in the later preflight: otherwise
+        // the caller can still take preflight-adjacent side effects such as a
+        // provider baseline read or phase stamp before it notices settlement.
         if run.status.is_terminal() || run.status.is_settled_without_driver() {
-            return None;
+            return Some(format!(
+                "task run {run_id} settled as {} before this turn started",
+                run.status.as_str()
+            ));
         }
 
         if run.stopping {
@@ -1959,16 +1972,9 @@ over on resume"
         // Whole-run early-out, for EVERY slot (not just a reviewer's), ahead of
         // the baseline read and the phase stamp below: a settled run must not
         // pay for a provider round-trip or take a write lock for a turn that
-        // will never run. Best-effort only — a stop landing right after this
-        // is still caught, just later (the reviewer-only check next, then the
-        // gated `team_turn_preflight`), because closing that race is THEIR job.
-        if let Some(status) = self.team_run_snapshot(run_id).await.map(|run| run.status) {
-            if status.is_terminal() || status.is_settled_without_driver() {
-                return TeamTurnOutcome::Failed(format!(
-                    "task run {run_id} settled as {} before this turn started",
-                    status.as_str()
-                ));
-            }
+        // will never run.
+        if let Some(reason) = self.settled_team_turn_refusal(run_id).await {
+            return TeamTurnOutcome::Failed(reason);
         }
 
         // Cheap early-out: refuse a reviewer turn before resolving anything at
@@ -1980,21 +1986,58 @@ over on resume"
             return TeamTurnOutcome::Failed(reason);
         }
 
+        // Stop/cancel/mark can settle a run in the awaits above. Re-check before
+        // resolving the seat, reading the provider baseline, or stamping a phase.
+        #[cfg(test)]
+        {
+            // The window a settled stop must not be able to exploit: past the
+            // early checks, before any provider/bookkeeping side effects.
+            self.team_turn_arrivals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            drop(self.team_turn_barrier.lock().await);
+        }
+        if let Some(reason) = self.settled_team_turn_refusal(run_id).await {
+            return TeamTurnOutcome::Failed(reason);
+        }
+
         let Some(mut thread_id) = self.resolve_team_slot(run_id, slot).await else {
             return TeamTurnOutcome::Failed(format!("task run {run_id} has no thread in {slot:?}"));
         };
+        if let Some(reason) = self.settled_team_turn_refusal(run_id).await {
+            return TeamTurnOutcome::Failed(reason);
+        }
         let baseline = self
             .latest_assistant_entry(&thread_id)
             .await
             .map(|(id, _)| id);
 
         // Before driving, not after: with `role` this names the prompt, and the
-        // TL crosses phases inside one session.
+        // TL crosses phases inside one session. Check the run while holding the
+        // write lock that stamps the phase; a stop can settle the run while the
+        // provider baseline read above is in flight.
         {
             let mut relay = self.relay.write().await;
-            if let Some(phase) = relay.team_run(run_id).map(|run| run.phase) {
+            let status_and_phase = relay.team_run(run_id).map(|run| (run.status, run.phase));
+            if let Some((status, _)) = status_and_phase {
+                if status.is_terminal() || status.is_settled_without_driver() {
+                    return TeamTurnOutcome::Failed(format!(
+                        "task run {run_id} settled as {} before this turn started",
+                        status.as_str()
+                    ));
+                }
+            }
+            if let Some((_, phase)) = status_and_phase {
                 relay.note_team_turn_phase(&thread_id, phase);
             }
+        }
+
+        #[cfg(test)]
+        {
+            // The post-bookkeeping window: a stop that lands here must settle
+            // before the later gated preflight refuses this turn.
+            self.team_gated_arrivals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            drop(self.team_gated_barrier.lock().await);
         }
 
         // Everything from the preflight to the provider's `start_turn` runs under
@@ -2003,14 +2046,6 @@ over on resume"
         // stop landing in that window would drain an idle runtime, record the run
         // stopped, and then watch this line start a turn anyway. Under the gate a
         // stop either completes first (and the preflight below sees it) or waits.
-        #[cfg(test)]
-        {
-            // The window a stop must not be able to exploit: past the boundary
-            // check, not yet holding the drive gate.
-            self.team_turn_arrivals
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            drop(self.team_turn_barrier.lock().await);
-        }
         // The id `send_message_to_thread` returns for THIS turn — not `thread_id`,
         // which promotion can change. Matching a later failure against this (not
         // merely its presence) is what stops a stale failure left over from an
@@ -2035,13 +2070,6 @@ over on resume"
             }
             self.set_in_flight_thread(run_id, Some(thread_id.clone()))
                 .await;
-            #[cfg(test)]
-            {
-                self.team_gated_arrivals
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                drop(self.team_gated_barrier.lock().await);
-            }
-
             let (model, effort) = {
                 let relay = self.relay.read().await;
                 match relay.runtime_for_thread(&thread_id) {

@@ -172,20 +172,19 @@ pub struct AppState {
     /// One gate rather than one per run because M1 allows a single run at a time;
     /// key it by run id when that relaxes.
     team_drive_gate: Arc<tokio::sync::Mutex<()>>,
-    /// Test-only latch held across the exact window a stop must not be able to
-    /// exploit: after the driver's boundary check, before it takes the drive gate.
-    /// A test holds it, settles the run, and releases — which is the only way to
-    /// drive that interleaving deterministically rather than hoping for it.
+    /// Test-only latch held after the early refusal gates and before any pre-turn
+    /// provider/bookkeeping side effects. A test holds it, settles the run, and
+    /// releases — which is the only way to drive that interleaving deterministically
+    /// rather than hoping for it.
     #[cfg(test)]
     team_turn_barrier: Arc<tokio::sync::Mutex<()>>,
     /// Counts drivers that have REACHED that latch, so a test can wait for the
-    /// driver to be genuinely past its boundary check instead of sleeping.
+    /// driver to be genuinely past its cheap gates instead of sleeping.
     #[cfg(test)]
     team_turn_arrivals: Arc<std::sync::atomic::AtomicU64>,
-    /// The second window, INSIDE the drive gate: preflight has passed and
-    /// `start_turn` has not been called. A stop reaching the worktree here is the
-    /// failure the gate exists to make impossible, so a test proves it by holding
-    /// this and showing the stop cannot complete.
+    /// The second window: after phase bookkeeping and before the drive gate. The
+    /// phase stamp is allowed only while the run is still live, and a stop landing
+    /// here must settle before the later gated preflight refuses the turn.
     #[cfg(test)]
     team_gated_barrier: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]

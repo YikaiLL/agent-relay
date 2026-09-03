@@ -2377,13 +2377,12 @@ impl relay_api::TeamDriver for RaceWindowDriver {
 }
 
 /// [P1 fix] The early reviewer-gate check (before any thread is resolved) is
-/// NOT sufficient by itself: `team_turn` still has to resolve the thread,
-/// write the phase note, and reach `team_drive_gate` before it can dispatch —
-/// and a stop's `request_stop` sets its flags without ever taking that gate,
-/// so it can land in exactly that window. This pins that the gate is
-/// REPEATED once `team_drive_gate` is held, using the existing pre-gate latch
-/// (`hold_team_turn_barrier`) to land the stop deterministically rather than
-/// racing real wall-clock timing.
+/// NOT sufficient by itself: `team_turn` still has to resolve the thread and
+/// reach `team_drive_gate` before it can dispatch — and a stop's `request_stop`
+/// sets its flags without ever taking that gate, so it can land in exactly that
+/// window. This pins that the gate is REPEATED once `team_drive_gate` is held,
+/// using the pre-side-effect latch (`hold_team_turn_barrier`) to land the stop
+/// deterministically rather than racing real wall-clock timing.
 #[tokio::test]
 async fn a_stop_landing_between_the_reviewer_gates_early_check_and_the_drive_gate_is_still_caught()
 {
@@ -2418,8 +2417,8 @@ async fn a_stop_landing_between_the_reviewer_gates_early_check_and_the_drive_gat
     let latch = app.hold_team_turn_barrier().await;
     // Release the driver NOW, while we hold the latch: its reviewer turn's
     // early check runs and PASSES (dev_turns_landed is 1, nothing pausing
-    // yet), then it parks on the latch we are holding — never reaching
-    // `team_drive_gate` until we say so.
+    // yet), then it parks on the latch we are holding — never resolving the
+    // reviewer thread or reaching `team_drive_gate` until we say so.
     proceed_to_reviewer.notify_one();
 
     for _ in 0..2_000 {
@@ -2434,7 +2433,7 @@ async fn a_stop_landing_between_the_reviewer_gates_early_check_and_the_drive_gat
     );
 
     // The stop lands in exactly the window the early check cannot see: past
-    // its own check (already passed), not yet holding the drive gate.
+    // its own check (already passed), before any later check has run.
     app.relay
         .write()
         .await
@@ -2481,6 +2480,273 @@ early check runs at all: {other:?}"
     assert_ne!(
         run.sub_tasks[0].status,
         crate::state::SubTaskStatus::Escalated
+    );
+}
+
+/// [P2 fix] A run can settle after the reviewer's cheap early gate passes but
+/// before the later preflight under `team_drive_gate`. That late preflight
+/// still refuses the turn, but too late if `team_turn` already paid for the
+/// provider baseline read and stamped bookkeeping. A settled run must become a
+/// no-side-effect refusal before either of those happens.
+#[tokio::test]
+async fn a_stop_settling_after_reviewer_early_check_must_not_probe_or_stamp() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((1_200, None, false));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcome = std::sync::Arc::new(Mutex::new(None));
+    let dev_landed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let proceed_to_reviewer = std::sync::Arc::new(tokio::sync::Notify::new());
+    let app = app.with_team_driver(std::sync::Arc::new(RaceWindowDriver {
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcome: reviewer_outcome.clone(),
+        dev_landed: dev_landed.clone(),
+        proceed_to_reviewer: proceed_to_reviewer.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    dev_landed.notified().await;
+
+    let before = app.team_turn_arrivals();
+    let latch = app.hold_team_turn_barrier().await;
+    proceed_to_reviewer.notify_one();
+
+    for _ in 0..2_000 {
+        if app.team_turn_arrivals() > before {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        app.team_turn_arrivals() > before,
+        "the reviewer turn should have reached the pre-side-effect latch by now"
+    );
+
+    let reviewer_thread_id = app
+        .relay
+        .read()
+        .await
+        .team_run(&run_id)
+        .and_then(|run| run.sub_tasks.first())
+        .and_then(|task| task.reviewer_thread_id.clone())
+        .expect("reviewer thread recorded before the reviewer turn parks");
+
+    let stopped = app
+        .force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect("a quiescent run stops while the reviewer is parked");
+    assert_eq!(stopped, crate::state::TeamRunStatus::Paused);
+    drop(latch);
+
+    for _ in 0..600 {
+        if reviewer_outcome.lock().await.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    match reviewer_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(_)) => {}
+        other => panic!("the settled reviewer turn should fail without running: {other:?}"),
+    }
+    assert!(
+        matches!(
+            dev_outcome.lock().await.clone(),
+            Some(relay_api::team::TeamTurnOutcome::Replied(_))
+        ),
+        "the dev turn itself must land normally"
+    );
+
+    assert!(
+        !providers
+            .get("codex")
+            .unwrap()
+            .read_thread_calls()
+            .await
+            .contains(&reviewer_thread_id),
+        "a reviewer turn that lost the race to a settled stop must not probe the provider"
+    );
+    assert!(
+        !app.relay
+            .read()
+            .await
+            .team_turn_phase_stamped(&reviewer_thread_id),
+        "a reviewer turn that lost the race to a settled stop must not stamp bookkeeping"
+    );
+}
+
+/// [P2 fix] A stop can settle the run while the provider baseline read is in
+/// flight. That read cannot be un-done once started, but the phase stamp happens
+/// under a relay write lock immediately after it, so it must re-check the run
+/// status in that same lock and skip the stamp.
+#[tokio::test]
+async fn a_stop_settling_during_reviewer_baseline_read_must_not_stamp_phase() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let codex = providers.get("codex").unwrap().clone();
+    codex
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((1_200, None, false));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcome = std::sync::Arc::new(Mutex::new(None));
+    let dev_landed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let proceed_to_reviewer = std::sync::Arc::new(tokio::sync::Notify::new());
+    let app = app.with_team_driver(std::sync::Arc::new(RaceWindowDriver {
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcome: reviewer_outcome.clone(),
+        dev_landed: dev_landed.clone(),
+        proceed_to_reviewer: proceed_to_reviewer.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    dev_landed.notified().await;
+
+    let before = codex.read_thread_arrivals();
+    let read_latch = codex.hold_read_thread_barrier().await;
+    proceed_to_reviewer.notify_one();
+    for _ in 0..2_000 {
+        if codex.read_thread_arrivals() > before {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        codex.read_thread_arrivals() > before,
+        "the reviewer turn should be parked inside its provider baseline read"
+    );
+
+    let reviewer_thread_id = app
+        .relay
+        .read()
+        .await
+        .team_run(&run_id)
+        .and_then(|run| run.sub_tasks.first())
+        .and_then(|task| task.reviewer_thread_id.clone())
+        .expect("reviewer thread recorded before baseline read returns");
+
+    let stopped = app
+        .force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect("a quiescent run stops while the provider read is parked");
+    assert_eq!(stopped, crate::state::TeamRunStatus::Paused);
+    drop(read_latch);
+
+    for _ in 0..600 {
+        if reviewer_outcome.lock().await.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    match reviewer_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(_)) => {}
+        other => panic!("the settled reviewer turn should fail without running: {other:?}"),
+    }
+    assert!(
+        codex
+            .read_thread_calls()
+            .await
+            .contains(&reviewer_thread_id),
+        "sanity: this test settles the run during the provider read, not before it"
+    );
+    assert!(
+        !app.relay
+            .read()
+            .await
+            .team_turn_phase_stamped(&reviewer_thread_id),
+        "a run that settled during provider read must not get a later phase stamp"
+    );
+}
+
+/// [P2 coverage] If a stop lands after the phase stamp but before `team_turn`
+/// takes the drive gate, the later gated refusal must still prevent a reviewer
+/// dispatch. This keeps coverage for the old pre-gate window after the earlier
+/// latch moved to the stricter pre-side-effect point.
+#[tokio::test]
+async fn a_stop_settling_after_phase_stamp_before_drive_gate_must_not_dispatch() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let codex = providers.get("codex").unwrap().clone();
+    codex
+        .report_turn_usage
+        .lock()
+        .await
+        .replace((1_200, None, false));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcome = std::sync::Arc::new(Mutex::new(None));
+    let dev_landed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let proceed_to_reviewer = std::sync::Arc::new(tokio::sync::Notify::new());
+    let app = app.with_team_driver(std::sync::Arc::new(RaceWindowDriver {
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcome: reviewer_outcome.clone(),
+        dev_landed: dev_landed.clone(),
+        proceed_to_reviewer: proceed_to_reviewer.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    dev_landed.notified().await;
+
+    let before = app.team_gated_arrivals();
+    let latch = app.hold_team_gated_barrier().await;
+    proceed_to_reviewer.notify_one();
+    for _ in 0..2_000 {
+        if app.team_gated_arrivals() > before {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        app.team_gated_arrivals() > before,
+        "the reviewer turn should have reached the post-phase pre-gate latch"
+    );
+
+    let reviewer_thread_id = app
+        .relay
+        .read()
+        .await
+        .team_run(&run_id)
+        .and_then(|run| run.sub_tasks.first())
+        .and_then(|task| task.reviewer_thread_id.clone())
+        .expect("reviewer thread recorded before the reviewer turn parks");
+    assert!(
+        app.relay
+            .read()
+            .await
+            .team_turn_phase_stamped(&reviewer_thread_id),
+        "sanity: this test settles after the phase stamp already happened"
+    );
+    let turns_before = codex.turns.lock().await.len();
+
+    let stopped = app
+        .force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect("a quiescent run stops before the parked reviewer reaches the drive gate");
+    assert_eq!(stopped, crate::state::TeamRunStatus::Paused);
+    drop(latch);
+
+    for _ in 0..600 {
+        if reviewer_outcome.lock().await.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    match reviewer_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(_)) => {}
+        other => panic!("the settled reviewer turn should fail without running: {other:?}"),
+    }
+    assert_eq!(
+        codex.turns.lock().await.len(),
+        turns_before,
+        "a reviewer turn that loses the pre-gate race must not be dispatched"
     );
 }
 
