@@ -161,7 +161,7 @@ import {
 } from "./shared/thread-groups.js";
 import { findThreadInSearchResults, findVisibleThread } from "./shared/thread-search.js";
 import { createTranscriptInteractionHandler } from "./shared/transcript-interactions.js";
-import { refreshedPinPage } from "./local/pin-page.js";
+import { createViewOnlyRefreshOps } from "./local/view-only-refresh-ops.js";
 
 import {
   createThreadListStore,
@@ -232,16 +232,8 @@ import { threadAttention } from "./shared/thread-attention.js";
 import { isWorkflowInProgressForThread } from "./shared/workflow-state.js";
 import {
   buildViewOnlyPin,
-  mergeOlderViewOnlyPage,
-  viewOnlyEligible,
-  viewOnlyPinNextAction,
-  viewOnlySelfHealThreadId,
 } from "./local/view-only-thread.js";
 import { createWatchedThreadsSync } from "./local/watched-threads.js";
-import {
-  createViewedThreadRefreshLatch,
-  shouldRefreshViewedThread,
-} from "./shared/viewed-thread-refresh.js";
 import { ClientLog } from "./shared/client-log.js";
 import { mapRelayLogEntries, mergeLogEntries } from "./shared/client-log-merge.js";
 import { SessionTabStrip, buildSessionTabItems } from "./shared/session-tab-strip.js";
@@ -1251,190 +1243,17 @@ function viewOnlyReviewSignature(session, threadId) {
 // case is just one flavor (pin.review). For the active thread it clears the
 // projection. A generation guard drops stale responses when the user navigates
 // again mid-fetch.
-async function loadViewOnlyTranscript(threadId) {
-  const session = state.session;
-  if (!viewOnlyEligible(session, threadId)) {
-    if (state.viewOnlyThread) {
-      state.viewOnlyThread = null;
-      if (state.session) renderer.renderSession(state.session);
-    }
-    return;
-  }
-
-  const review = isReviewInProgressForThread(session, threadId);
-  const workflowLocked = isWorkflowInProgressForThread(session, threadId);
-  const generation = (state.viewOnlyGeneration = (state.viewOnlyGeneration || 0) + 1);
-  const reviewSig = review ? viewOnlyReviewSignature(session, threadId) : null;
-  // The viewed thread's own metadata (workspace + provider), so the projection
-  // shows them instead of the live thread's for a cross-workspace saved thread.
-  const summary = findVisible(threadId);
-  const cwd = summary?.cwd ?? null;
-  const provider = summary?.provider ?? null;
-  const prior = state.viewOnlyThread?.threadId === threadId ? state.viewOnlyThread : null;
-  const isWorking = Boolean(
-    (session.thread_activity || []).find((entry) => entry?.thread_id === threadId)
-  );
-  const status = !isWorking && prior?.wasWorking ? "idle" : summary?.status ?? null;
-  state.viewOnlyThread = buildViewOnlyPin({
-    threadId,
-    generation,
-    review,
-    workflowLocked,
-    reviewSig,
-    cwd,
-    threadWorkspaceCwd: prior?.threadWorkspaceCwd ?? null,
-    provider,
-    status,
-    activeTurnId: prior?.activeTurnId || null,
-    currentStatus: prior?.currentStatus || null,
-    currentPhase: prior?.currentPhase || null,
-    currentTool: prior?.currentTool || null,
-    lastProgressAt: prior?.lastProgressAt ?? null,
-    settings: prior?.settings || null,
-    settingsWritable: Boolean(prior?.settingsWritable),
-    availableModels: prior?.availableModels || [],
-    lastRefreshAt: Date.now(),
-    lastRefreshServerTime: prior?.lastRefreshServerTime ?? null,
-    wasWorking: isWorking,
-    priorEntries: prior?.entries || [],
-    priorOlderCursor: prior?.olderCursor ?? null,
-    historyExtended: Boolean(prior?.historyExtended),
-    loading: true,
-  });
-  if (state.session) renderer.renderSession(state.session);
-
-  try {
-    const page = await controller?.fetchTranscriptPage(threadId, {});
-    if (generation !== state.viewOnlyGeneration) return;
-    // Normalize + validate + merge, shared with the Orchestrator pane so the
-    // three reasons those steps exist are written down once (local/pin-page.js).
-    const { page: normalized, ...refreshed } = refreshedPinPage(prior, page, threadId);
-    const exactReview = Boolean(normalized.thread_state?.review_locked ?? review);
-    state.viewOnlyThread = buildViewOnlyPin({
-      threadId,
-      page: {
-        ...normalized,
-        entries: refreshed.entries,
-        prev_cursor: refreshed.olderCursor,
-      },
-      generation,
-      review: exactReview,
-      workflowLocked: Boolean(normalized.thread_state?.workflow_locked ?? workflowLocked),
-      reviewSig: exactReview ? viewOnlyReviewSignature(session, threadId) : reviewSig,
-      cwd: normalized.thread_state?.current_cwd ?? cwd,
-      threadWorkspaceCwd:
-        normalized.thread_state?.thread_workspace_cwd
-        ?? prior?.threadWorkspaceCwd
-        ?? null,
-      provider: normalized.thread_state?.provider ?? provider,
-      status,
-      activeTurnId: normalized.thread_state?.active_turn_id || null,
-      currentStatus: normalized.thread_state?.current_status || null,
-      currentPhase: normalized.thread_state?.current_phase || null,
-      currentTool: normalized.thread_state?.current_tool || null,
-      lastProgressAt: normalized.thread_state?.last_progress_at ?? null,
-      settings: normalized.thread_state
-        ? {
-          approval_policy: normalized.thread_state.approval_policy || "",
-          sandbox: normalized.thread_state.sandbox || "",
-          reasoning_effort: normalized.thread_state.reasoning_effort || "",
-          model: normalized.thread_state.model || "",
-        }
-        : null,
-      settingsWritable: Boolean(normalized.thread_state?.settings_writable),
-      availableModels: normalized.thread_state?.available_models || [],
-      lastRefreshAt: Date.now(),
-      lastRefreshServerTime: normalized.server_time ?? null,
-      wasWorking: isWorking,
-      historyExtended: refreshed.historyExtended,
-    });
-  } catch (error) {
-    if (generation !== state.viewOnlyGeneration) return;
-    state.viewOnlyThread = buildViewOnlyPin({
-      threadId,
-      generation,
-      review,
-      workflowLocked,
-      reviewSig,
-      cwd,
-      threadWorkspaceCwd: prior?.threadWorkspaceCwd ?? null,
-      provider,
-      status,
-      activeTurnId: prior?.activeTurnId || null,
-      currentStatus: prior?.currentStatus || null,
-      currentPhase: prior?.currentPhase || null,
-      currentTool: prior?.currentTool || null,
-      lastProgressAt: prior?.lastProgressAt ?? null,
-      settings: prior?.settings || null,
-      settingsWritable: Boolean(prior?.settingsWritable),
-      availableModels: prior?.availableModels || [],
-      lastRefreshAt: Date.now(),
-      lastRefreshServerTime: prior?.lastRefreshServerTime ?? null,
-      wasWorking: isWorking,
-      priorEntries: prior?.entries || [],
-      priorOlderCursor: prior?.olderCursor ?? null,
-      historyExtended: Boolean(prior?.historyExtended),
-      // Mark the failure so the self-heal (viewOnlySelfHealThreadId) retries this
-      // load after a backoff instead of treating the empty shell as settled.
-      error: true,
-    });
-    logLine(`Couldn't load the read-only session view: ${error.message}`);
-  }
-  if (state.session) renderer.renderSession(state.session);
+let viewOnlyRefreshOps;
+async function loadViewOnlyTranscript(threadId, options) {
+  return viewOnlyRefreshOps.loadViewOnlyTranscript(threadId, options);
 }
 
 // Scroll-up pagination for the read-only pin: fetch the page before the pin's
 // olderCursor (cache-aware via the transcript page cache) and prepend it.
 // Deliberately separate from the active-thread hydration pipeline — that store
 // is keyed to the live thread and must not be re-keyed by a view-only visit.
-let viewOnlyOlderLoading = false;
-const viewOnlyRefreshLatch = createViewedThreadRefreshLatch();
-// Returns the same tri-state the active-thread loader uses so the history
-// loader can keep prefetching read-only pins within one intersection:
-//   true  → a page loaded and more remain
-//   false → reached the pin's oldest page (stop for good)
-//   null  → nothing loaded right now (in-flight / not viewing / error) — retry
 async function loadOlderViewOnlyTranscript() {
-  const pin = state.viewOnlyThread;
-  if (!pin || state.viewThreadId !== pin.threadId) {
-    return null;
-  }
-  if (pin.olderCursor == null) {
-    return false; // no older cursor → this is the oldest page of the pin
-  }
-  if (pin.loading || viewOnlyOlderLoading) {
-    return null; // a load is already in flight; not a definitive stop
-  }
-  const generation = pin.generation;
-  viewOnlyOlderLoading = true;
-  try {
-    const page = await controller?.fetchTranscriptPage(pin.threadId, {
-      before: pin.olderCursor,
-    });
-    const current = state.viewOnlyThread;
-    if (!current || current.generation !== generation || current.threadId !== pin.threadId) {
-      return null; // user navigated / pin replaced while the fetch was in flight
-    }
-    state.viewOnlyThread = mergeOlderViewOnlyPage(current, page);
-    if (state.session) renderer.renderSession(state.session);
-    return state.viewOnlyThread?.olderCursor != null;
-  } catch (error) {
-    logLine(`Couldn't load older messages for the read-only view: ${error.message}`);
-    return null;
-  } finally {
-    viewOnlyOlderLoading = false;
-    const deferredThreadId = viewOnlyRefreshLatch.take();
-    if (
-      deferredThreadId
-      && state.viewThreadId === deferredThreadId
-      && state.viewOnlyThread?.threadId === deferredThreadId
-    ) {
-      // Re-evaluate against the latest session. The viewed thread may have
-      // started working again or the user may have navigated while history was
-      // loading, so the deferred signal alone is not authority to fetch.
-      maybeRefreshViewOnly(state.session);
-    }
-  }
+  return viewOnlyRefreshOps.loadOlderViewOnlyTranscript();
 }
 
 // Called on every render: keep the pin honest against the latest REAL session.
@@ -1476,70 +1295,22 @@ function orchestratorWatchIds() {
   return threadId ? [threadId] : [];
 }
 
+viewOnlyRefreshOps = createViewOnlyRefreshOps({
+  getState: () => state,
+  fetchTranscriptPage: (threadId, options = {}) =>
+    controller?.fetchTranscriptPage(threadId, options),
+  renderSession: (session) => renderer.renderSession(session),
+  logLine,
+  findVisible,
+  reviewSignature: viewOnlyReviewSignature,
+  syncWatchedThreads,
+  getOrchestratorWatchIds: orchestratorWatchIds,
+  isReviewInProgressForThread,
+  isWorkflowInProgressForThread,
+});
+
 function maybeRefreshViewOnly(session) {
-  void syncWatchedThreads(session, state.viewThreadId, orchestratorWatchIds());
-  const pin = state.viewOnlyThread;
-  if (pin && session) {
-    const action = viewOnlyPinNextAction(session, pin, {
-      viewThreadId: state.viewThreadId,
-      reviewSignature: viewOnlyReviewSignature,
-    });
-    if (action.kind === "release") {
-      state.viewOnlyThread = null;
-    } else if (action.kind === "refresh") {
-      // Review/workflow lifecycle transitions are authoritative and may be the
-      // final signal we receive, so do not defer them behind history loading.
-      void loadViewOnlyTranscript(pin.threadId);
-    } else {
-      const working = Boolean(
-        (session.thread_activity || []).find((entry) => entry?.thread_id === pin.threadId)
-      );
-      if (shouldRefreshViewedThread({
-        elapsedMs: Date.now() - (pin.lastRefreshAt || 0),
-        historyLoading: viewOnlyOlderLoading,
-        loading: pin.loading,
-        // Set by the delta reducer when it refused a chunk. `buildViewOnlyPin`
-        // does not carry it, so the refetch that answers it clears it.
-        needsRepair: Boolean(pin.tailGap),
-        wasWorking: pin.wasWorking,
-        working,
-      })) {
-        if (viewOnlyOlderLoading) {
-          // Only the working→idle case passes shouldRefreshViewedThread while
-          // history is loading. Let that page land, then re-check the terminal
-          // state from the loader's finally block.
-          viewOnlyRefreshLatch.defer(pin.threadId);
-        } else {
-          void loadViewOnlyTranscript(pin.threadId);
-        }
-      }
-    }
-  }
-
-  // The viewed thread's cwd/provider come from its thread summary, which on a
-  // deep link loads AFTER the session — so a deep-linked pin can be built with
-  // them null. Backfill once the summary appears (otherwise the projection shows
-  // blank metadata until then).
-  const metaPin = state.viewOnlyThread;
-  if (metaPin && (metaPin.cwd == null || metaPin.provider == null)) {
-    const summary = findVisible(metaPin.threadId);
-    if (summary && (summary.cwd != null || summary.provider != null)) {
-      state.viewOnlyThread = {
-        ...metaPin,
-        cwd: metaPin.cwd ?? summary.cwd ?? null,
-        provider: metaPin.provider ?? summary.provider ?? null,
-      };
-    }
-  }
-
-  const selfHeal = viewOnlySelfHealThreadId(session, {
-    viewThreadId: state.viewThreadId,
-    viewOnlyThread: state.viewOnlyThread,
-    now: Date.now(),
-  });
-  if (selfHeal) {
-    void loadViewOnlyTranscript(selfHeal);
-  }
+  return viewOnlyRefreshOps.maybeRefreshViewOnly(session);
 }
 
 controller = createSessionController({

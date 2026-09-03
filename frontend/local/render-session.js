@@ -168,7 +168,6 @@ import {
   workflowRunsForThread,
 } from "../shared/workflow-state.js";
 import {
-  mergeOlderViewOnlyPage,
   projectViewOnlySession,
   VIEW_ONLY_LOAD_RETRY_BACKOFF_MS,
 } from "./view-only-thread.js";
@@ -185,9 +184,19 @@ import {
 } from "./react-session-panels.js";
 import { ThreadGroupList } from "../shared/thread-list-react.js";
 import { buildThreadActivityMap, threadActivityFor } from "../shared/thread-activity.js";
-import { shouldRefreshViewedThread } from "../shared/viewed-thread-refresh.js";
+import {
+  applyOlderOrchestratorPage,
+  applyOrchestratorLoadFinally,
+  applyRefreshedOrchestratorPage,
+  beginOrchestratorLoad,
+  nextOrchestratorRefreshObservations,
+  nextOrchestratorWasWorking,
+  orchestratorRefreshPin,
+  orchestratorTranscriptRefreshDecision,
+  takeDeferredOrchestratorRefresh,
+} from "./orchestrator-transcript-refresh.js";
+import { createViewedThreadRefreshLatch } from "../shared/viewed-thread-refresh.js";
 import { copyTextToClipboard } from "../shared/clipboard.js";
-import { refreshedPinPage } from "./pin-page.js";
 import { attachTranscriptHistoryLoader } from "../shared/transcript-history-loader.js";
 import { createTranscriptInteractionHandler } from "../shared/transcript-interactions.js";
 import { describeStatusChips } from "../shared/session-status.js";
@@ -2175,6 +2184,7 @@ export function createSessionRenderer({
   // advancing costs exactly one.
   let orchestratorHistoryLoader = null;
   let orchestratorHistoryScroller = null;
+  const orchestratorRefreshLatch = createViewedThreadRefreshLatch();
 
   function renderTaskTeam(session) {
     if (!taskTeamMount) {
@@ -2228,21 +2238,17 @@ export function createSessionRenderer({
       state.orchestratorEntriesThreadId = null;
     }
     state.orchestratorWasActiveThread = orchIsActive;
-    const orchWorking = Boolean(orchActivity.phase);
-    const orchNeedsRefresh =
-      Boolean(orchId)
-      && !orchIsActive
-      && shouldRefreshViewedThread({
-        elapsedMs: Date.now() - (state.orchestratorLastRefreshAt || 0),
-        loading: Boolean(state.orchestratorEntriesLoading),
-        needsRepair: Boolean(state.orchestratorTailGap),
-        wasWorking: Boolean(state.orchestratorWasWorking),
-        working: orchWorking,
-      });
-    state.orchestratorWasWorking = orchWorking;
-    if (orchNeedsRefresh) {
+    const orchRefresh = orchestratorTranscriptRefreshDecision(state, session, orchId);
+    state.orchestratorWasWorking = nextOrchestratorWasWorking(state, orchRefresh.orchWorking);
+    Object.assign(state, nextOrchestratorRefreshObservations(state, orchRefresh.orchWorking));
+    if (orchRefresh.defer) {
+      orchestratorRefreshLatch.defer(orchId);
+    } else if (orchRefresh.refresh) {
       state.orchestratorLastRefreshAt = Date.now();
-      void loadOrchestratorTranscript(orchId).then(() => {
+      void loadOrchestratorTranscript(orchId, {
+        terminal: orchRefresh.terminal,
+        repair: orchRefresh.repair,
+      }).then(() => {
         if (state.session) {
           renderTaskTeam(state.session);
         }
@@ -2444,6 +2450,7 @@ export function createSessionRenderer({
       // The old thread's entries are not this thread's — keep them and the new
       // conversation would open showing someone else's history.
       state.orchestratorEntries = null;
+      state.orchestratorHistoryExtended = false;
       if (state.session) {
         state.session = { ...state.session, orchestrator_thread_id: threadId };
       }
@@ -2524,29 +2531,30 @@ export function createSessionRenderer({
     return state.orchestratorEnsurePromise;
   }
 
-  async function loadOrchestratorTranscript(threadId) {
-    if (!threadId || typeof fetchTranscriptPage !== "function") {
-      state.orchestratorEntries = [];
-      state.orchestratorEntriesThreadId = threadId || null;
-      return;
-    }
-    if (state.session?.active_thread_id === threadId) {
-      state.orchestratorEntries = state.session.transcript || [];
-      state.orchestratorEntriesThreadId = threadId;
-      return;
-    }
-    state.orchestratorEntriesLoading = true;
-    // A counter, not just a thread-id compare: two loads for the SAME thread
-    // both pass an id check, and then the one that happens to resolve last wins
-    // even when it is the older request. `restartOrchestrator` plus the 300ms
-    // tail refresh make that overlap ordinary.
-    const generation = (state.orchestratorLoadGeneration =
-      (state.orchestratorLoadGeneration || 0) + 1);
-    const prior =
-      state.orchestratorEntriesThreadId === threadId
-        ? { threadId, entries: state.orchestratorEntries || [], olderCursor: state.orchestratorOlderCursor ?? null }
-        : null;
+  async function loadOrchestratorTranscript(threadId, { terminal = false, repair = false } = {}) {
+    // Taken here and released in the `finally`, with every answer inside the
+    // `try` — including the two that need no fetch. A load that returned before
+    // the `finally` settled nothing, and since a tail gap is retried on the very
+    // next render with no throttle, an unsettled one is repaired forever.
+    const generation = beginOrchestratorLoad(state, { repair });
     try {
+      if (!threadId || typeof fetchTranscriptPage !== "function") {
+        state.orchestratorEntries = [];
+        state.orchestratorEntriesThreadId = threadId || null;
+        state.orchestratorHistoryExtended = false;
+        return;
+      }
+      if (state.session?.active_thread_id === threadId) {
+        // The Orchestrator is the live thread, so its own transcript is the
+        // authoritative answer and the gap is closed by reading it.
+        state.orchestratorEntries = state.session.transcript || [];
+        state.orchestratorEntriesThreadId = threadId;
+        // These entries replace what was paged in, so no prefix is being held
+        // open any more — a stale flag would keep a later refresh from trimming.
+        state.orchestratorHistoryExtended = false;
+        return;
+      }
+      const prior = orchestratorRefreshPin(state, threadId);
       const page = await fetchTranscriptPage(threadId, {});
       if (generation !== state.orchestratorLoadGeneration) {
         return;
@@ -2555,14 +2563,11 @@ export function createSessionRenderer({
       // view-only pin takes and for the same reasons (local/pin-page.js). This
       // used to assign `page.entries` wholesale, discarding every delta that
       // arrived while the fetch was in flight.
-      const refreshed = refreshedPinPage(prior, page, threadId);
-      state.orchestratorEntries = refreshed.entries;
-      state.orchestratorOlderCursor = refreshed.olderCursor;
-      state.orchestratorEntriesThreadId = threadId;
+      applyRefreshedOrchestratorPage(state, prior, page, threadId);
       state.orchestratorEntriesError = null;
       state.orchestratorEntriesErrorAt = 0;
-      // Answered: this page is authoritative for the window it covers.
-      state.orchestratorTailGap = false;
+      // The tail gap is NOT answered here: this page was built before a delta
+      // refused mid-flight, so only the `finally` may settle it.
     } catch (error) {
       // A failed load must NOT claim the thread as loaded. It used to set
       // `orchestratorEntriesThreadId = threadId` and `entries = []`, and the
@@ -2579,7 +2584,7 @@ export function createSessionRenderer({
       state.orchestratorEntriesErrorAt = Date.now();
       logLine(`Orchestrator transcript load failed: ${error?.message || error}`);
     } finally {
-      state.orchestratorEntriesLoading = false;
+      applyOrchestratorLoadFinally(state, generation, threadId, state.session, { terminal });
     }
   }
 
@@ -2650,16 +2655,7 @@ export function createSessionRenderer({
       ) {
         return null;
       }
-      const merged = mergeOlderViewOnlyPage(
-        {
-          threadId,
-          entries: state.orchestratorEntries || [],
-          olderCursor: state.orchestratorOlderCursor,
-        },
-        page
-      );
-      state.orchestratorEntries = merged.entries;
-      state.orchestratorOlderCursor = merged.olderCursor;
+      applyOlderOrchestratorPage(state, threadId, page);
       if (state.session) {
         renderTaskTeam(state.session);
       }
@@ -2669,6 +2665,11 @@ export function createSessionRenderer({
       return null;
     } finally {
       state.orchestratorOlderLoading = false;
+      // Hand back the refresh this request made wait. Re-render rather than
+      // calling the loader: the decision has to be retaken, not replayed.
+      if (takeDeferredOrchestratorRefresh(state, orchestratorRefreshLatch) && state.session) {
+        renderTaskTeam(state.session);
+      }
     }
   }
 

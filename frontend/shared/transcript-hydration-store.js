@@ -416,6 +416,12 @@ export function createTranscriptHydrationPromisePatch(promise) {
   };
 }
 
+export function createClearedTranscriptHydrationFetchedRevisionPatch() {
+  return {
+    transcriptHydrationFetchedRevision: null,
+  };
+}
+
 export function createClearedTranscriptHydrationPromisePatch(state, promise) {
   // Clear the in-flight promise by IDENTITY, not by signature. A new entry joining
   // the tail mid-fetch re-keys the signature (createMergedSnapshotTailPatch), so a

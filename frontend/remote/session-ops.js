@@ -67,6 +67,11 @@ import { threadAttention } from "../shared/thread-attention.js";
 import { forkFieldsToPayload } from "../shared/fork-fields.js";
 import { isDocumentForeground, notifyThreadEvents } from "../shared/thread-notify.js";
 import { shouldRefreshViewedThread } from "../shared/viewed-thread-refresh.js";
+import {
+  resolveViewOnlyPinWasWorking,
+  resolveViewOnlyPinWasWorkingAfterFetch,
+  viewOnlyThreadIsWorking,
+} from "../local/view-only-thread.js";
 import { sessionViewedWorkspaceKey } from "../shared/viewed-workspace-key.js";
 import { isWorkingThreadStatus } from "../shared/thread-status.js";
 import { createFrameRenderQueue } from "./frame-render-queue.js";
@@ -94,9 +99,45 @@ let viewOnlyNavigationGeneration = 0;
 let viewOnlyRefreshInFlight = false;
 let viewOnlyLastRefreshAt = 0;
 let viewOnlyWasWorking = false;
+let viewOnlyDeltaDuringTerminalRefresh = false;
 // Last thread-watch set declared to the relay, so a snapshot that changes nothing about
 // what is on screen does not become an outbound frame.
 let lastDeclaredWatchKey = null;
+
+function remoteViewedThreadIsWorking(threadId, session = state.realSession) {
+  return viewOnlyThreadIsWorking(session, threadId);
+}
+
+function seedViewOnlyWasWorking(threadId, session = state.realSession) {
+  viewOnlyWasWorking = remoteViewedThreadIsWorking(threadId, session);
+}
+
+function preserveViewOnlyWasWorkingAfterTerminalFetch(threadId, session = state.realSession) {
+  const latchedDuringFetch = viewOnlyDeltaDuringTerminalRefresh;
+  viewOnlyDeltaDuringTerminalRefresh = false;
+  viewOnlyWasWorking = latchedDuringFetch
+    ? resolveViewOnlyPinWasWorking({
+        prior: { wasWorking: viewOnlyWasWorking },
+        isWorking: remoteViewedThreadIsWorking(threadId, session),
+      })
+    : resolveViewOnlyPinWasWorkingAfterFetch({
+        prior: { wasWorking: viewOnlyWasWorking },
+        isWorking: remoteViewedThreadIsWorking(threadId, session),
+        terminal: true,
+      });
+}
+
+function latchViewOnlyWasWorkingFromDelta(threadId) {
+  if (viewOnlyThreadId && threadId === viewOnlyThreadId) {
+    viewOnlyWasWorking = resolveViewOnlyPinWasWorking({
+      prior: { wasWorking: viewOnlyWasWorking },
+      isWorking: true,
+    });
+    if (viewOnlyRefreshInFlight) {
+      viewOnlyDeltaDuringTerminalRefresh = true;
+    }
+  }
+}
 const transcriptFrameRenderQueue = createFrameRenderQueue({
   render() {
     if (state.session) {
@@ -115,6 +156,7 @@ function invalidateViewOnlyNavigation() {
   viewOnlyRefreshInFlight = false;
   viewOnlyLastRefreshAt = 0;
   viewOnlyWasWorking = false;
+  viewOnlyDeltaDuringTerminalRefresh = false;
   // The relay drops watch sets when the broker connection goes, so the phone must
   // forget what it declared or it would never re-declare after reconnecting.
   lastDeclaredWatchKey = null;
@@ -318,6 +360,7 @@ export function applyTranscriptDelta({
       entry_seq,
       deltaRevision,
       server_time,
+      viewedThreadId: commit === commitViewedSession ? (currentThreadId || thread_id) : null,
     });
     return;
   }
@@ -349,6 +392,7 @@ export function applyTranscriptDelta({
     entry_seq,
     deltaRevision,
     server_time,
+    viewedThreadId: commit === commitViewedSession ? (currentThreadId || thread_id) : null,
   });
 }
 
@@ -364,6 +408,7 @@ function commitTranscriptDeltaAppend({
   entry_seq,
   deltaRevision,
   server_time,
+  viewedThreadId = null,
 }) {
   const nextTranscript = entryIndex >= 0
     ? transcript.map((entry, index) => {
@@ -408,6 +453,9 @@ function commitTranscriptDeltaAppend({
     nextSession.server_time = server_time;
   }
   commit(nextSession);
+  if (viewedThreadId) {
+    latchViewOnlyWasWorkingFromDelta(viewedThreadId);
+  }
 }
 
 // Highest target revision we still owe a repair for, per thread. A Map (not a
@@ -681,7 +729,7 @@ export function applySessionSnapshot(snapshot) {
       viewOnlyNavigationGeneration += 1;
       viewOnlyThreadId = inboundPromotion.to;
       viewOnlyLastRefreshAt = Date.now();
-      viewOnlyWasWorking = Boolean(snapshot?.active_turn_id);
+      seedViewOnlyWasWorking(inboundPromotion.to, snapshot);
       clearTranscriptHydration(state);
     }
   }
@@ -1669,7 +1717,7 @@ export async function viewRemoteThread(threadId) {
   if (state.realSession?.active_thread_id === threadId) {
     viewOnlyThreadId = threadId;
     viewOnlyLastRefreshAt = Date.now();
-    viewOnlyWasWorking = Boolean(state.realSession.active_turn_id);
+    seedViewOnlyWasWorking(threadId);
     applyRenderedSession(state.realSession);
     return true;
   }
@@ -1698,12 +1746,10 @@ export async function viewRemoteThread(threadId) {
     // leaving the user's local view in place.
     viewOnlyThreadId = threadId;
     viewOnlyLastRefreshAt = Date.now();
-    if (!viewOnlyRefreshInFlight) {
-      viewOnlyWasWorking = Boolean(
-        (state.realSession?.thread_activity || []).find(
-          (entry) => entry?.thread_id === threadId
-        )
-      );
+    if (viewOnlyRefreshInFlight) {
+      preserveViewOnlyWasWorkingAfterTerminalFetch(threadId);
+    } else {
+      seedViewOnlyWasWorking(threadId);
     }
     applyRenderedSession(
       projectRemoteViewedSession(
@@ -1733,22 +1779,23 @@ function maybeRefreshRemoteViewedThread(realSession) {
   if (!viewOnlyThreadId || viewOnlyRefreshInFlight) {
     return;
   }
-  const working = Boolean(
-    (realSession?.thread_activity || []).find(
-      (entry) => entry?.thread_id === viewOnlyThreadId
-    )
-  );
+  const working = remoteViewedThreadIsWorking(viewOnlyThreadId, realSession);
   const shouldRefresh = shouldRefreshViewedThread({
     elapsedMs: Date.now() - viewOnlyLastRefreshAt,
     wasWorking: viewOnlyWasWorking,
     working,
   });
-  viewOnlyWasWorking = working;
   if (!shouldRefresh) {
+    viewOnlyWasWorking = resolveViewOnlyPinWasWorking({
+      prior: { wasWorking: viewOnlyWasWorking },
+      isWorking: working,
+    });
     return;
   }
   const threadId = viewOnlyThreadId;
+  viewOnlyWasWorking = working;
   viewOnlyRefreshInFlight = true;
+  viewOnlyDeltaDuringTerminalRefresh = false;
   viewOnlyLastRefreshAt = Date.now();
   void viewRemoteThread(threadId).finally(() => {
     viewOnlyRefreshInFlight = false;
@@ -1806,7 +1853,7 @@ export async function sendMessage(messageDraft, effort, model = "") {
       viewOnlyNavigationGeneration += 1;
       viewOnlyThreadId = promotedThreadId;
       viewOnlyLastRefreshAt = Date.now();
-      viewOnlyWasWorking = Boolean(state.realSession?.active_turn_id);
+      seedViewOnlyWasWorking(promotedThreadId);
       // One-shot alias for the transcript pane: it keeps per-thread scroll
       // bookkeeping keyed by thread id, and must rekey it (same logical
       // thread, new public id) instead of treating the promotion as a thread

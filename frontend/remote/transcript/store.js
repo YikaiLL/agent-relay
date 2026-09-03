@@ -1,6 +1,7 @@
 import {
   buildHydratedTranscriptProgress,
   createClearedTranscriptHydrationPatch,
+  createClearedTranscriptHydrationFetchedRevisionPatch,
   createClearedTranscriptHydrationPromisePatch,
   createMergedTranscriptHydrationPagePatch,
   prepareTranscriptHydrationState,
@@ -63,6 +64,10 @@ export function clearTranscriptHydrationPromise(state, promise) {
 
 export function setTranscriptHydrationIdle() {
   applyRemoteSurfacePatch(createTranscriptHydrationStatusPatch("idle"));
+}
+
+export function clearTranscriptHydrationFetchedRevision() {
+  applyRemoteSurfacePatch(createClearedTranscriptHydrationFetchedRevisionPatch());
 }
 
 export function recordTranscriptHydrationRevision(state, fetchedRevision) {

@@ -2,6 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createStreamController } from "./stream.js";
+import { createViewedThreadRefreshLatch } from "../../shared/viewed-thread-refresh.js";
+import {
+  applyOrchestratorLoadFinally,
+  beginOrchestratorLoad,
+  nextOrchestratorRefreshObservations,
+  nextOrchestratorWasWorking,
+  orchestratorTranscriptRefreshDecision,
+  takeDeferredOrchestratorRefresh,
+} from "../orchestrator-transcript-refresh.js";
 
 // Both review rounds found bugs my earlier tests missed because they only exercised the
 // hydration STORE. The defect lived in the reducer that sits on top of it: it reconciled
@@ -340,6 +349,7 @@ test("a streamed delta marks the Orchestrator as mid-turn", () => {
   h.deliver({ thread_id: "orch-1", delta: "ing", text_offset: 4 });
 
   assert.equal(h.state.orchestratorWasWorking, true, "text is arriving, so it is working");
+  assert.equal(h.state.orchestratorDeltaRaisedWorking, true);
 });
 
 test("a delta for another thread does not mark the Orchestrator working", () => {
@@ -348,4 +358,422 @@ test("a delta for another thread does not mark the Orchestrator working", () => 
   h.deliver({ thread_id: "someone-else", delta: "x", text_offset: 4 });
 
   assert.notEqual(h.state.orchestratorWasWorking, true);
+});
+
+const ORCH_THREAD = "orch-1";
+const LIVE_THREAD = "thread-1";
+
+function orchSession({ threadActivity = [] } = {}) {
+  return {
+    active_thread_id: LIVE_THREAD,
+    orchestrator_thread_id: ORCH_THREAD,
+    thread_activity: threadActivity,
+  };
+}
+
+// Drive the same refresh decision renderTaskTeam uses. Deltas land through the
+// stream controller; the Tasks pane applies the policy on the next render.
+function maybeRefreshOrchestrator(state, session, loads, latch = null) {
+  const orchId = state.orchestratorEntriesThreadId;
+  const decision = orchestratorTranscriptRefreshDecision(state, session, orchId);
+  state.orchestratorWasWorking = nextOrchestratorWasWorking(state, decision.orchWorking);
+  Object.assign(state, nextOrchestratorRefreshObservations(state, decision.orchWorking));
+  if (decision.defer) {
+    latch?.defer(orchId);
+  } else if (decision.refresh) {
+    loads.push({ threadId: orchId, terminal: decision.terminal, repair: decision.repair });
+  }
+}
+
+// The other half of that call site: render-session.js:2524-2545. Both answers
+// that need no fetch are modelled, because both used to leave the loader without
+// reaching the settle. There the two share one `finally`; here the fetch is only
+// started rather than awaited, so the settle is written out on each.
+function loadOrchestratorTranscript(
+  state,
+  threadId,
+  { terminal = false, repair = false, canFetch = true } = {}
+) {
+  const generation = beginOrchestratorLoad(state, { repair });
+  if (!threadId || !canFetch) {
+    state.orchestratorEntries = [];
+    state.orchestratorEntriesThreadId = threadId || null;
+    applyOrchestratorLoadFinally(state, generation, threadId, state.session, { terminal });
+    return null;
+  }
+  if (state.session?.active_thread_id === threadId) {
+    state.orchestratorEntries = state.session.transcript || [];
+    state.orchestratorEntriesThreadId = threadId;
+    applyOrchestratorLoadFinally(state, generation, threadId, state.session, { terminal });
+    return null;
+  }
+  return generation;
+}
+
+// render-session.js:2238-2250 again, this time including the tail of it: the
+// load's promise re-renders the pane when it settles, so a decision the load
+// does not answer is simply retaken on the next frame. Bounded, so a policy
+// that never converges fails with a count instead of hanging the run.
+function renderUntilQuiet(state, session, { canFetch = true, maxRenders = 6 } = {}) {
+  const loads = [];
+  for (let render = 0; render < maxRenders; render += 1) {
+    const before = loads.length;
+    maybeRefreshOrchestrator(state, session, loads);
+    if (loads.length === before) {
+      break;
+    }
+    const scheduled = loads[loads.length - 1];
+    loadOrchestratorTranscript(state, scheduled.threadId, {
+      terminal: scheduled.terminal,
+      repair: scheduled.repair,
+      canFetch,
+    });
+  }
+  return loads;
+}
+
+test("orchestrator idle refresh fires when thread_activity clears after a delta", () => {
+  const h = orchHarness();
+
+  h.deliver({ thread_id: ORCH_THREAD, delta: "ing", text_offset: 4 });
+  assert.equal(h.state.orchestratorWasWorking, true);
+
+  const loads = [];
+  const workingSession = orchSession({
+    threadActivity: [{ thread_id: ORCH_THREAD, phase: "tool", tool: "Bash" }],
+  });
+  maybeRefreshOrchestrator(h.state, workingSession, loads);
+  assert.equal(loads.length, 0, "no refresh while the orchestrator is still working");
+  assert.equal(h.state.orchestratorWasWorking, true);
+
+  const idleSession = orchSession();
+  maybeRefreshOrchestrator(h.state, idleSession, loads);
+  assert.equal(loads.length, 1, "phase clearing must trigger an authoritative refetch");
+  assert.equal(loads[0].threadId, ORCH_THREAD);
+  assert.equal(loads[0].terminal, true);
+});
+
+test("a fresh orchestrator delta is not mistaken for an observed idle edge", () => {
+  const h = orchHarness();
+
+  h.deliver({ thread_id: ORCH_THREAD, delta: "ing", text_offset: 4 });
+  assert.equal(h.state.orchestratorWasWorking, true);
+  assert.equal(h.state.orchestratorDeltaRaisedWorking, true);
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+
+  assert.equal(loads.length, 0, "thread_activity omission must not arm a terminal fetch mid-turn");
+  assert.equal(h.state.orchestratorWasWorking, true);
+  assert.equal(h.state.orchestratorDeltaRaisedWorking, false, "the suppression latch is consumed on render");
+
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+  assert.equal(loads.length, 1, "a later idle render must still refetch");
+  assert.equal(loads[0].terminal, true);
+});
+
+test("orchestrator idle refresh survives thread_activity omitting the orchestrator during work", () => {
+  const h = orchHarness();
+  h.state.orchestratorEntriesLoading = true;
+
+  h.deliver({ thread_id: ORCH_THREAD, delta: "ing", text_offset: 4 });
+  assert.equal(h.state.orchestratorWasWorking, true);
+
+  const loads = [];
+  const workingSession = orchSession();
+  maybeRefreshOrchestrator(h.state, workingSession, loads);
+
+  assert.equal(loads.length, 0, "an in-flight page load must not swallow the idle edge");
+  assert.equal(
+    h.state.orchestratorWasWorking,
+    true,
+    "thread_activity must not clobber a delta-raised working latch"
+  );
+
+  h.state.orchestratorEntriesLoading = false;
+  maybeRefreshOrchestrator(h.state, workingSession, loads);
+  assert.equal(loads.length, 1, "the settled working→idle edge must refetch");
+  assert.equal(loads[0].threadId, ORCH_THREAD);
+  assert.equal(loads[0].terminal, true);
+});
+
+test("orchestrator tailGap triggers refresh even while entries are loading", () => {
+  const h = orchHarness();
+  h.state.orchestratorEntriesLoading = true;
+
+  h.deliver({ thread_id: ORCH_THREAD, delta: "tail", text_offset: 99 });
+  assert.equal(h.state.orchestratorTailGap, true);
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+
+  assert.equal(loads.length, 1, "a refused delta must not wait behind orchestratorEntriesLoading");
+  assert.equal(loads[0].threadId, ORCH_THREAD);
+  assert.equal(loads[0].repair, true);
+});
+
+test("orchestrator tailGap repair does not start a second fetch while one is in flight", () => {
+  const h = orchHarness();
+  h.state.orchestratorTailGap = true;
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+  assert.equal(loads.length, 1);
+  loadOrchestratorTranscript(h.state, ORCH_THREAD, { repair: true });
+  assert.equal(h.state.orchestratorTailGapRepairing, true, "the fetch that began holds the latch");
+
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+  assert.equal(loads.length, 1, "tail-gap repair must be single-flight while the gap remains");
+});
+
+// The latch has exactly one release, `applyOrchestratorLoadFinally`, and it runs
+// in the loader's `finally`. So a load that returns before the `try` must not
+// have taken the latch -- it would stay set for the life of the page, and
+// `needsTailGapRepair = tailGap && !tailGapRepairing` would be false forever.
+// This early return is reachable: the decision reads the session argument
+// renderTaskTeam was called with, the loader reads `state.session`, and the two
+// disagree while a thread switch is settling.
+test("a repair that answered without fetching must not disable repair forever", () => {
+  const h = orchHarness();
+  h.state.orchestratorTailGap = true;
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+  assert.equal(loads[0].repair, true, "the gap asked for a repair");
+
+  // `state.session` says the Orchestrator is the active thread, so the loader
+  // answers from the live transcript and never fetches.
+  h.state.session = {
+    ...h.state.session,
+    active_thread_id: ORCH_THREAD,
+    transcript: h.state.orchestratorEntries,
+  };
+  const generation = loadOrchestratorTranscript(h.state, ORCH_THREAD, { repair: true });
+  assert.equal(generation, null, "no fetch began, so there is no settle coming");
+
+  // It goes back to the background and the next delta is refused: a fresh hole,
+  // which must be repairable no matter how the previous one was answered.
+  h.state.session = { ...h.state.session, active_thread_id: LIVE_THREAD };
+  h.deliver({ thread_id: ORCH_THREAD, delta: "tail", text_offset: 99 });
+  assert.equal(h.state.orchestratorTailGap, true);
+
+  const later = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), later);
+
+  assert.equal(later.length, 1, "the new gap must still be repairable");
+  assert.equal(later[0].repair, true);
+});
+
+// Nothing throttles tail-gap repair -- `shouldRefreshViewedThread` returns true
+// on `needsRepair` before it looks at anything else, and the poll that used to
+// pace this was deliberately removed. So "settled" is the only thing that ends a
+// repair, and a load that answers without fetching has to settle too. Left
+// unsettled, the load's promise re-renders, the gap is still there, and the pane
+// schedules another repair on every frame for the life of the page.
+test("a repair with no fetcher settles instead of re-arming on every render", () => {
+  const h = orchHarness();
+  h.state.orchestratorTailGap = true;
+
+  const loads = renderUntilQuiet(h.state, orchSession(), { canFetch: false });
+
+  assert.equal(loads.length, 1, "one attempt, then quiet");
+  assert.equal(h.state.orchestratorTailGap, false, "a gap nothing can fetch must not stay armed");
+});
+
+test("a repair the live transcript answers settles instead of re-arming", () => {
+  const h = orchHarness();
+  h.state.orchestratorTailGap = true;
+  // The disagreement that makes this reachable: the decision reads the session
+  // renderTaskTeam was handed, which still has the Orchestrator in the
+  // background, while the loader reads `state.session`, where it is already the
+  // active thread.
+  h.state.session = {
+    ...h.state.session,
+    active_thread_id: ORCH_THREAD,
+    transcript: h.state.orchestratorEntries,
+  };
+
+  const loads = renderUntilQuiet(h.state, orchSession());
+
+  assert.equal(loads.length, 1, "one attempt, then quiet");
+  assert.equal(h.state.orchestratorTailGap, false, "the live transcript is the answer");
+});
+
+test("a superseded orchestrator load must not clear tail-gap repair flags", () => {
+  const state = {
+    orchestratorLoadGeneration: 2,
+    orchestratorEntriesLoading: true,
+    orchestratorTailGapRepairing: true,
+    orchestratorTailGap: true,
+    orchestratorEntriesThreadId: ORCH_THREAD,
+    orchestratorWasWorking: false,
+    orchestratorDeltaDuringFetch: false,
+    session: orchSession(),
+  };
+
+  const settled = applyOrchestratorLoadFinally(state, 1, ORCH_THREAD, state.session, {
+    terminal: false,
+  });
+
+  assert.equal(settled, false, "stale generation must not mutate loading/repair state");
+  assert.equal(state.orchestratorEntriesLoading, true);
+  assert.equal(state.orchestratorTailGapRepairing, true);
+});
+
+// The settle is the ONE place that answers "does the hole still exist?", for the
+// same reason the view-only pin decides it in one place
+// (view-only-refresh-ops.js:139-142): the page the server built cannot describe
+// a delta that was refused after it was built. The loader's success branch used
+// to answer it too, unconditionally, and its answer landed first -- so a delta
+// refused mid-fetch had its gap wiped and the hole was never repaired.
+function settleOrchestratorLoad(state, generation, { terminal = false } = {}) {
+  return applyOrchestratorLoadFinally(state, generation, ORCH_THREAD, state.session, {
+    terminal,
+  });
+}
+
+test("a gap raised while an orchestrator fetch is in flight survives the settle", () => {
+  const h = orchHarness();
+  h.state.session = { ...h.state.session, ...orchSession() };
+  h.state.orchestratorLoadGeneration = 1;
+  h.state.orchestratorEntriesLoading = true;
+
+  // Refused after the server built the page, before the promise resolved.
+  h.deliver({ thread_id: ORCH_THREAD, delta: "tail", text_offset: 99 });
+  assert.equal(h.state.orchestratorTailGap, true);
+  assert.equal(h.state.orchestratorDeltaDuringFetch, true);
+
+  settleOrchestratorLoad(h.state, 1, { terminal: true });
+
+  assert.equal(h.state.orchestratorTailGap, true, "the page never covered this delta");
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+  assert.equal(loads.length, 1, "the surviving gap must schedule the repair");
+  assert.equal(loads[0].repair, true);
+});
+
+test("a settled orchestrator load clears a gap no delta re-raised", () => {
+  const state = {
+    orchestratorLoadGeneration: 1,
+    orchestratorEntriesLoading: true,
+    orchestratorTailGapRepairing: true,
+    orchestratorTailGap: true,
+    orchestratorEntriesThreadId: ORCH_THREAD,
+    orchestratorWasWorking: false,
+    orchestratorDeltaDuringFetch: false,
+    session: orchSession(),
+  };
+
+  settleOrchestratorLoad(state, 1, { terminal: true });
+
+  assert.equal(state.orchestratorTailGap, false, "this fetch answered the gap it was sent to repair");
+
+  const loads = [];
+  maybeRefreshOrchestrator(state, orchSession(), loads);
+  assert.equal(loads.length, 0, "an uncleared gap re-fetches on every frame -- there is no throttle");
+});
+
+// `orchestratorDeltaDuringFetch` decides both answers, so the settle has to read
+// it before it clears it. It used to clear first and then call
+// `orchestratorWasWorkingAfterFetch`, which reads that same field -- always false.
+test("the settle reads deltaDuringFetch before clearing it", () => {
+  const state = {
+    orchestratorLoadGeneration: 1,
+    orchestratorEntriesLoading: true,
+    orchestratorTailGapRepairing: false,
+    orchestratorTailGap: false,
+    orchestratorEntriesThreadId: ORCH_THREAD,
+    orchestratorWasWorking: true,
+    orchestratorDeltaDuringFetch: true,
+    session: orchSession(),
+  };
+
+  settleOrchestratorLoad(state, 1, { terminal: true });
+
+  assert.equal(
+    state.orchestratorWasWorking,
+    true,
+    "a delta landed mid-fetch, so this terminal refresh did not observe the idle edge"
+  );
+  assert.equal(state.orchestratorDeltaDuringFetch, false, "and the flag is consumed");
+});
+
+// Scrolling up starts an older-history fetch that validates itself against
+// `orchestratorLoadGeneration`. Any refresh landing mid-flight bumps that
+// counter, so the history page is thrown away on arrival — and nothing asks
+// again, because the sentinel that requested it has already backed off. The user
+// scrolls up and the page simply never comes.
+//
+// The view-only pane solves this by deferring the refresh instead of firing it
+// (`maybeRefreshViewOnly` + the `finally` of `loadOlderViewOnlyTranscript`), and
+// re-running the decision once history settles. Same latch, same policy here.
+test("a repair refresh defers rather than superseding an older-history fetch", () => {
+  const h = orchHarness();
+  const latch = createViewedThreadRefreshLatch();
+  h.state.orchestratorLoadGeneration = 7;
+  h.state.orchestratorOlderLoading = true;
+  h.state.orchestratorTailGap = true;
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads, latch);
+
+  assert.equal(loads.length, 0, "a repair must not fire on top of an in-flight history page");
+  assert.equal(
+    h.state.orchestratorLoadGeneration,
+    7,
+    "and so the generation that page validates against still holds"
+  );
+
+  // The history request settles and hands the deferred decision back.
+  h.state.orchestratorOlderLoading = false;
+  assert.equal(latch.take(), ORCH_THREAD, "the deferred refresh must be remembered");
+
+  maybeRefreshOrchestrator(h.state, orchSession(), loads, latch);
+  assert.equal(loads.length, 1, "and then actually run");
+  assert.equal(loads[0].repair, true);
+});
+
+// A repair never reaches `shouldRefreshViewedThread`'s `wasWorking` test, and a
+// terminal refresh never reaches its `needsRepair` test, so neither covers the
+// other -- both have to defer.
+test("a terminal refresh defers rather than superseding an older-history fetch", () => {
+  const h = orchHarness();
+  const latch = createViewedThreadRefreshLatch();
+  h.state.orchestratorOlderLoading = true;
+
+  h.deliver({ thread_id: ORCH_THREAD, delta: "ing", text_offset: 4 });
+  assert.equal(h.state.orchestratorWasWorking, true);
+  // Consume the delta-raised suppression so the next render sees a real edge.
+  maybeRefreshOrchestrator(h.state, orchSession(), [], latch);
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads, latch);
+  assert.equal(loads.length, 0, "the idle edge must wait for history, not race it");
+  assert.equal(h.state.orchestratorWasWorking, true, "the edge is not spent by deferring");
+
+  h.state.orchestratorOlderLoading = false;
+  assert.equal(latch.take(), ORCH_THREAD);
+
+  maybeRefreshOrchestrator(h.state, orchSession(), loads, latch);
+  assert.equal(loads.length, 1, "the deferred terminal refresh runs once history settles");
+  assert.equal(loads[0].terminal, true);
+});
+
+test("a deferred refresh for a thread the pane no longer shows is dropped", () => {
+  const h = orchHarness();
+  const latch = createViewedThreadRefreshLatch();
+  h.state.orchestratorOlderLoading = true;
+  h.state.orchestratorTailGap = true;
+
+  maybeRefreshOrchestrator(h.state, orchSession(), [], latch);
+
+  // The pane moved to another Orchestrator thread while history was in flight.
+  h.state.orchestratorEntriesThreadId = "orch-2";
+  assert.equal(
+    takeDeferredOrchestratorRefresh(h.state, latch),
+    null,
+    "the deferred decision belonged to the thread that is gone"
+  );
+  assert.equal(latch.take(), null, "and it is consumed either way");
 });

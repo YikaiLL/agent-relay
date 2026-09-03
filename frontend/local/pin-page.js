@@ -45,7 +45,7 @@ export function normalizeTranscriptPage(page, threadId) {
  * @param {object|null} prior the pin being refreshed, or null for a first load
  * @param {object|object[]|null} page raw response
  * @param {string} threadId
- * @returns {{ page: object, entries: object[], olderCursor: string|null }}
+ * @returns {{ page: object, entries: object[], olderCursor: string|null, historyExtended: boolean }}
  */
 export function refreshedPinPage(prior, page, threadId) {
   const normalized = normalizeTranscriptPage(page, threadId);
@@ -54,5 +54,8 @@ export function refreshedPinPage(prior, page, threadId) {
     page: { ...normalized, entries: merged.entries, prev_cursor: merged.olderCursor },
     entries: merged.entries,
     olderCursor: merged.olderCursor,
+    // The caller stores this and hands it back as the next refresh's `prior`.
+    // Computed here and dropped, it survived exactly one refresh.
+    historyExtended: merged.historyExtended,
   };
 }

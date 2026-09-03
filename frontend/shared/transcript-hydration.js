@@ -61,11 +61,13 @@ export async function hydrateTranscript(
       // the page is stale: release the loading gate and discard it so a fresh fetch,
       // re-armed at the new revision, rebuilds the tail. (The older-page loop below
       // prepends, which never resets the order, so its post-merge checks are safe.)
-      if (
-        store.getTranscriptHydrationThreadId(state) !== snapshot.active_thread_id ||
-        store.getTranscriptHydrationSignature(state) !== signature
-      ) {
+      if (store.getTranscriptHydrationThreadId(state) !== snapshot.active_thread_id) {
         store.setTranscriptHydrationIdle(state);
+        return;
+      }
+      if (store.getTranscriptHydrationSignature(state) !== signature) {
+        store.setTranscriptHydrationIdle(state);
+        store.clearTranscriptHydrationFetchedRevision(state);
         return;
       }
 
@@ -93,6 +95,7 @@ export async function hydrateTranscript(
           return;
         }
         if (store.getTranscriptHydrationSignature(state) !== signature) {
+          store.clearTranscriptHydrationFetchedRevision(state);
           return;
         }
       }

@@ -29,6 +29,34 @@ export function viewOnlyEligible(session, threadId) {
   );
 }
 
+export function viewOnlyThreadIsWorking(session, threadId) {
+  return Boolean(
+    (session?.thread_activity || []).find((entry) => entry?.thread_id === threadId)
+  );
+}
+
+// `thread_activity` can omit a background thread that is still receiving deltas
+// (Cursor is the usual case). The pin reducer sets `wasWorking` when text
+// arrives; clobbering that with `thread_activity` alone at fetch start drops
+// the working→idle edge `maybeRefreshViewOnly` keys on.
+export function resolveViewOnlyPinWasWorking({ prior, isWorking }) {
+  return Boolean(isWorking || prior?.wasWorking);
+}
+
+// After a non-terminal fetch completes, keep the edge alive until a terminal
+// refresh lands. A fetch started from `shouldRefreshViewedThread` has seen the
+// edge already and may clear the latch on completion.
+export function resolveViewOnlyPinWasWorkingAfterFetch({
+  prior,
+  isWorking,
+  terminal = false,
+}) {
+  if (terminal && !prior?.deltaDuringFetch) {
+    return Boolean(isWorking);
+  }
+  return resolveViewOnlyPinWasWorking({ prior, isWorking });
+}
+
 /// How much of a delta is genuinely new for a pinned entry, given `text_offset`.
 /// Mirrors `resolveDeltaAppend` in shared/transcript-hydration-store.js — same wire
 /// contract, same reconciliation. Returns null to refuse, "" for a pure duplicate.
@@ -117,15 +145,17 @@ export function applyDeltaToViewOnlyPin(pin, event) {
     // downgrade the body so it is not treated as authoritative, and raise a
     // flag the refresh decision can act on in this frame rather than at the end
     // of the turn.
+    const duringFetch = pin.loading ? { deltaDuringFetch: true } : {};
     if (index < 0) {
       // We hold nothing for this item and the chunk does not start at 0, so its
       // opening text never arrived. Nothing to downgrade; the pin still needs a
       // page before it can render this entry at all.
-      return { ...pin, tailGap: true };
+      return { ...pin, tailGap: true, ...duringFetch };
     }
     return {
       ...pin,
       tailGap: true,
+      ...duringFetch,
       entries: pin.entries.map((entry, position) =>
         position === index ? { ...entry, content_state: "preview" } : entry
       ),
@@ -169,6 +199,7 @@ export function applyDeltaToViewOnlyPin(pin, event) {
     // what made a watched background thread look finished when it wasn't.
     activeTurnId: pin.activeTurnId || event.turn_id || null,
     wasWorking: true,
+    ...(pin.loading ? { deltaDuringFetch: true } : {}),
   };
 }
 

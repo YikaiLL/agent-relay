@@ -79,6 +79,8 @@
     "test:cursor:provider": "node scripts/cursor-provider-e2e.mjs",
     "test:cursor:delete": "node scripts/cursor-session-delete-e2e.mjs",
     "test:browser:cursor-delete": "npm run build && node scripts/browser-cursor-delete-e2e.mjs",
+    "test:browser:cursor-view-only-history": "npm run build && node scripts/browser-cursor-view-only-history-e2e.mjs",
+    "test:browser:cursor-view-only-tail-gap": "npm run build && node scripts/browser-cursor-view-only-tail-gap-e2e.mjs",
     "test:claude:browser": "node scripts/e2e/run-browser-suite.mjs --suite real-provider",
     "test:claude": "npm run test:claude:provider && npm run test:claude:browser",
     "test:browser:install": "playwright install chromium",
