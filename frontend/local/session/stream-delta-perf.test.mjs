@@ -137,6 +137,43 @@ test("a flush with nothing pending does not rebuild", () => {
   );
 });
 
+// P1: applyLocalTranscriptEntryPatch used to settle the pending window
+// projection before checking whether the patch even applies to the active
+// thread. Background threads are watched, so an off-thread patch arriving
+// between an active-thread delta and its flush is routine, not exceptional —
+// paying for an O(n) settle just to discard the patch defeats the point of
+// deferring the projection to the flush.
+test("an off-thread patch arriving before the flush does not force the deferred projection early", () => {
+  __resetTranscriptFullRebuildCount();
+  const { controller, state } = buildHarness(20000);
+
+  streamToken(controller, 0);
+  assert.equal(
+    __readTranscriptFullRebuildCount(),
+    0,
+    "the active-thread delta itself must not rebuild anything"
+  );
+
+  controller.applyLocalTranscriptEntryPatch(
+    { item_id: "item-5", thread_id: "some-other-thread", status: "completed", text: "done" },
+    { defaultStatus: "completed" }
+  );
+
+  assert.equal(
+    __readTranscriptFullRebuildCount(),
+    0,
+    "an off-thread patch is dropped before ever touching state.session.transcript — it must not settle the pending projection early"
+  );
+
+  flush(controller, state);
+
+  assert.equal(
+    __readTranscriptFullRebuildCount(),
+    1,
+    "the flush itself must still settle exactly once"
+  );
+});
+
 // REVIEW P2: the window projection is not the only full-array rebuild site —
 // the pre-hydration fallback (no hydration window loaded yet) copies the
 // whole state.session.transcript synchronously per delta. It stays

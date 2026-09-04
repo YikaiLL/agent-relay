@@ -442,14 +442,12 @@ export function createStreamController(ctx) {
   }
 
   function applyLocalTranscriptEntryPatch(event, { defaultStatus = null } = {}) {
-    // This function is about to read state.session.transcript and rebuild it
-    // (below) — settle any pending window append into it FIRST, or this
-    // rebuild would carry the pre-append text forward into its own new array
-    // reference, silently dropping the pending delta (see
-    // settleTranscriptProjection's doc). Once settled here, the render
-    // chokepoint's own settle is a no-op — this rebuild's array already
-    // carries both the delta and this patch.
-    settleTranscriptProjection(state);
+    // Validate BEFORE settling: background threads are watched, so an
+    // off-thread patch here is routine, not exceptional, and the early
+    // returns below drop it without ever touching state.session.transcript.
+    // Settling is an O(n) window projection — paying for it on a patch we
+    // are about to discard defeats the whole point of deferring it to the
+    // flush.
     const currentThreadId = state.session?.active_thread_id || null;
     const eventThreadId = event.thread_id || event.active_thread_id || event.entry?.thread_id || null;
     if (eventThreadId && currentThreadId && eventThreadId !== currentThreadId) {
@@ -467,6 +465,14 @@ export function createStreamController(ctx) {
     if (!entry?.item_id || !Array.isArray(state.session?.transcript)) {
       return;
     }
+    // Only now is this function committed to reading state.session.transcript
+    // and rebuilding it (below) — settle any pending window append into it
+    // FIRST, or that rebuild would carry the pre-append text forward into its
+    // own new array reference, silently dropping the pending delta (see
+    // settleTranscriptProjection's doc). Once settled here, the render
+    // chokepoint's own settle is a no-op — this rebuild's array already
+    // carries both the delta and this patch.
+    settleTranscriptProjection(state);
     const patchedEntry = {
       ...entry,
       kind: entry.kind || event.entry_kind || null,
