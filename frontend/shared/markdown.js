@@ -155,5 +155,136 @@ export function __getMarkdownCacheSizeForTests() {
   return markdownCache.size;
 }
 
+// -- Streaming split ---------------------------------------------------------
+//
+// A running agent message hands its whole (growing) text to renderMarkdown on
+// every token, which is a cache miss — and a full re-parse — every time. This
+// is a SEPARATE entry point rather than a change to renderMarkdown itself:
+// renderMarkdown's same-text -> same-element-reference contract is asserted
+// directly by markdown.test.mjs and relied on by React.memo, so it and its
+// cache stay untouched.
+//
+// renderStreamingMarkdown finds the LAST point in the text where the markdown
+// block structure is unambiguous (a blank line that is not inside a fenced
+// code block, list, or blockquote continuation), renders everything up to
+// there as the "prefix" and everything after as the "tail" — each through the
+// ordinary cached renderMarkdown, just called on a substring instead of the
+// whole text. The prefix stops changing once a boundary is behind it, so it
+// becomes a cache hit on every later flush; only the short, still-growing
+// tail is a fresh parse. When no safe boundary exists yet, the whole text is
+// the tail — identical cost to calling renderMarkdown directly, so this is
+// never worse than today, only sometimes better.
+
+const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const LIST_MARKER_RE = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)/;
+const BLOCKQUOTE_RE = /^ {0,3}>/;
+// 2 spaces is the narrowest real CommonMark list-continuation width ("- ");
+// ordered markers need 3+. We don't track which marker opened the list, so
+// treat ANY 2+ indent as a possible continuation — errs toward refusing a
+// split, never toward splitting a real continuation out of its list.
+const INDENTED_CONTINUATION_RE = /^ {2,}\S/;
+
+function isListOrBlockquoteContinuation(line) {
+  return (
+    LIST_MARKER_RE.test(line)
+    || BLOCKQUOTE_RE.test(line)
+    || INDENTED_CONTINUATION_RE.test(line)
+  );
+}
+
+// Tracks fence open/close by PARITY of fence-marker lines seen, not by
+// matching the exact fence character — agent output is overwhelmingly
+// backtick fences, and refusing a split slightly more often near a tilde
+// fence is safe (the rule's job is to refuse rather than split wrongly).
+function toggleFence(openMarker, line) {
+  const fenceMatch = FENCE_LINE_RE.exec(line);
+  if (!fenceMatch) {
+    return openMarker;
+  }
+  const marker = fenceMatch[1];
+  const rest = fenceMatch[2];
+  if (openMarker == null) {
+    return marker;
+  }
+  // CommonMark: a closing fence is the marker run plus optional trailing
+  // whitespace ONLY — anything else after it (an info string, stray text) is
+  // just code content, not a closer, e.g. "```not-a-closer" inside an open
+  // ```-fence stays inside it.
+  const isCloser = marker[0] === openMarker[0] && marker.length >= openMarker.length && rest.trim() === "";
+  if (isCloser) {
+    return null;
+  }
+  // A fence-shaped line that doesn't validly close (wrong character, too
+  // short, or trailing content) is just code content — state is unchanged.
+  return openMarker;
+}
+
+// Returns the character offset of the last safe prefix/tail boundary in
+// `text`, or null if none exists yet (the caller then treats the whole text
+// as tail).
+function findStreamingSplitOffset(text) {
+  const lines = text.split("\n");
+  let openFence = null;
+  let safeOffset = null;
+  let offset = 0;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const wasFenceLine = FENCE_LINE_RE.test(line);
+    openFence = toggleFence(openFence, line);
+    if (
+      !wasFenceLine
+      && openFence == null
+      && line.trim() === ""
+      && i + 1 < lines.length
+      && !isListOrBlockquoteContinuation(lines[i + 1])
+    ) {
+      // Safe: everything through this line's trailing newline is a complete,
+      // unambiguous prefix.
+      safeOffset = offset + line.length + 1;
+    }
+    offset += line.length + 1;
+  }
+
+  return safeOffset;
+}
+
+// The prefix, by construction, always ends with fences balanced (an open
+// fence blocks every candidate boundary inside it). So only the tail can
+// itself end mid-fence — close it synthetically so it parses as a complete,
+// well-formed code block on its own rather than relying on end-of-input to
+// implicitly close it.
+function unterminatedFenceMarker(text) {
+  let openFence = null;
+  for (const line of text.split("\n")) {
+    openFence = toggleFence(openFence, line);
+  }
+  return openFence;
+}
+
+function closeUnterminatedFence(text) {
+  const marker = unterminatedFenceMarker(text);
+  return marker ? `${text}\n${marker}` : text;
+}
+
+export function renderStreamingMarkdown(text) {
+  if (typeof text !== "string" || text.length === 0) {
+    return text == null ? "" : text;
+  }
+  const splitOffset = findStreamingSplitOffset(text);
+  const hasSplit = splitOffset != null && splitOffset < text.length;
+  const prefix = hasSplit ? text.slice(0, splitOffset) : "";
+  const tail = hasSplit ? text.slice(splitOffset) : text;
+  const renderedTail = renderMarkdown(closeUnterminatedFence(tail));
+  if (!hasSplit) {
+    return renderedTail;
+  }
+  return h(React.Fragment, null, renderMarkdown(prefix), renderedTail);
+}
+
 // Exported for tests.
-export const __test__ = { safeUrl };
+export const __test__ = {
+  safeUrl,
+  findStreamingSplitOffset,
+  unterminatedFenceMarker,
+};

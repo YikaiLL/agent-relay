@@ -23,7 +23,7 @@ import {
   getFileChanges,
   parseUnifiedDiffRows,
 } from "./file-change-diff.js";
-import { renderMarkdown } from "./markdown.js";
+import { renderMarkdown, renderStreamingMarkdown } from "./markdown.js";
 import { didPrependOlderTranscript } from "./transcript-scroll.js";
 
 const h = React.createElement;
@@ -161,9 +161,12 @@ function ExpandableBlock({
   );
 }
 
-function renderMessageBody(text) {
+// `isStreaming` is only ever true while status is "running" — mergeTranscriptEntry
+// (shared/transcript-hydration-store.js) guarantees a completing entry's text
+// is still the full body, so completed always gets the ordinary full parse.
+function renderMessageBody(text, isStreaming = false) {
   if (!text) return "(empty)";
-  return renderMarkdown(text);
+  return isStreaming ? renderStreamingMarkdown(text) : renderMarkdown(text);
 }
 
 // Per-message action row for agent messages.
@@ -280,7 +283,11 @@ function AgentEntryImpl({ entry, isJustPrepended = false, isForkable = false, pr
     h(
       "div",
       { className: "message-card" },
-      h("div", { className: "message-body" }, renderMessageBody(entry.text)),
+      h(
+        "div",
+        { className: "message-body" },
+        renderMessageBody(entry.text, entry.status === "running")
+      ),
       renderMessageActions(entry, isForkable)
     )
   );

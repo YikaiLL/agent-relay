@@ -64,6 +64,15 @@ test("virtual transcript scrolls the .chat-thread element on every surface", () 
 import { TranscriptPane } from "./shared/transcript-pane.js";
 import { collectFileChangeDetailItemIds } from "./shared/transcript-entry-details-state.js";
 import { parseUnifiedDiffRows } from "./shared/file-change-diff.js";
+import {
+  renderMarkdown,
+  __clearMarkdownCacheForTests,
+  __getMarkdownCacheSizeForTests,
+} from "./shared/markdown.js";
+import {
+  createClearedTranscriptHydrationPatch,
+  prepareTranscriptHydrationState,
+} from "./shared/transcript-hydration-store.js";
 
 const h = React.createElement;
 
@@ -140,6 +149,110 @@ test("renderEntryMarkup renders typed session items safely", () => {
   assert.match(toolMarkup, /tool-log-name">Read</);
   assert.match(toolMarkup, /message-card-tool/);
   assert.match(toolMarkup, /tool-log-primary">frontend\/remote\/main\.js</);
+});
+
+// A running agent entry renders through renderStreamingMarkdown (a stable
+// cached prefix + a short freshly-parsed tail); a completed one renders
+// through renderMarkdown on the whole text, same as before this sub-task.
+// Proven via the markdown cache rather than a spy: renderStreamingMarkdown
+// splits into two separate renderMarkdown() calls (prefix, tail), so the
+// FULL text is never itself a cache key while running — only once the
+// status is no longer "running" does the whole text become one cache entry.
+test("a running agent entry streams the split path; the same entry once completed renders renderMarkdown(fullText) directly", () => {
+  const text = "Finished paragraph, done streaming.\n\nSecond paragraph, still typ";
+
+  __clearMarkdownCacheForTests();
+  renderEntryMarkup({ item_id: "a1", kind: "agent_text", status: "running", text });
+  const sizeAfterRunning = __getMarkdownCacheSizeForTests();
+  renderMarkdown(text);
+  assert.equal(
+    __getMarkdownCacheSizeForTests(),
+    sizeAfterRunning + 1,
+    "the full text must be a FRESH cache miss after a running render — it was split into prefix+tail, never parsed whole"
+  );
+
+  __clearMarkdownCacheForTests();
+  renderEntryMarkup({ item_id: "a1", kind: "agent_text", status: "completed", text });
+  const sizeAfterCompleted = __getMarkdownCacheSizeForTests();
+  renderMarkdown(text);
+  assert.equal(
+    __getMarkdownCacheSizeForTests(),
+    sizeAfterCompleted,
+    "the full text must already be cached after a completed render — it renders through renderMarkdown(fullText) directly"
+  );
+});
+
+// Regression for the completing-snapshot race this sub-task's split relies
+// on staying correct: a snapshot can carry a 1600-char truncated preview
+// (the relay's max_transcript_chars) for an entry that already streamed past
+// that length locally. mergeTranscriptEntry keeps the longer local body
+// (selectTranscriptText) while the incoming status wins through the spread —
+// so the renderer must see status flip out of "running" and still render the
+// full, untruncated text through the full markdown path, not the truncated
+// preview and not the streaming split frozen mid-flight.
+test("a completing snapshot carrying a 1600-char truncated preview flips the entry out of running and renders the full text", () => {
+  const paragraph1 = "First paragraph, already settled before the truncation point.";
+  const longSecondParagraph = `**bold marker** then ${"word ".repeat(400)}`.trim();
+  const fullText = `${paragraph1}\n\n${longSecondParagraph}`;
+  assert.ok(fullText.length > 1600, `fixture must exceed the 1600-char truncation length, got ${fullText.length}`);
+  const truncatedPreview = fullText.slice(0, 1600);
+
+  const state = {
+    ...createClearedTranscriptHydrationPatch(),
+    transcriptHydrationThreadId: "thread-1",
+    transcriptHydrationEntries: new Map([
+      [
+        "a1",
+        {
+          item_id: "a1",
+          kind: "agent_text",
+          status: "running",
+          text: fullText,
+          turn_id: "turn-1",
+          tool: null,
+          content_state: "full",
+        },
+      ],
+    ]),
+    transcriptHydrationOrder: ["a1"],
+    transcriptHydrationTailReady: true,
+    transcriptHydrationStatus: "idle",
+  };
+
+  const snapshot = {
+    active_thread_id: "thread-1",
+    transcript_truncated: true,
+    transcript_revision: 2,
+    transcript: [
+      {
+        item_id: "a1",
+        kind: "agent_text",
+        status: "completed",
+        text: truncatedPreview,
+        turn_id: "turn-1",
+        content_state: "preview",
+      },
+    ],
+  };
+
+  const { patch } = prepareTranscriptHydrationState(state, snapshot);
+  const mergedEntry = patch.transcriptHydrationEntries.get("a1");
+
+  assert.notEqual(mergedEntry.status, "running", "the completing snapshot's status must flip the entry out of running");
+  assert.equal(mergedEntry.text, fullText, "the longer locally-streamed body must survive the truncated preview");
+
+  __clearMarkdownCacheForTests();
+  const markup = renderEntryMarkup(mergedEntry);
+  assert.match(markup, /<strong>bold marker<\/strong>/, "the full text must render through markdown, not as a raw/truncated string");
+  assert.doesNotMatch(markup, /\.\.\.\s*<\/div>|…\s*<\/div>/, "no truncation ellipsis leaks into the completed render");
+
+  const sizeAfter = __getMarkdownCacheSizeForTests();
+  renderMarkdown(fullText);
+  assert.equal(
+    __getMarkdownCacheSizeForTests(),
+    sizeAfter,
+    "the completed entry must have rendered renderMarkdown(fullText) directly, not the streaming split"
+  );
 });
 
 test("shouldAutoLoadFileChangeDiffs waits for an explicit file expansion", () => {
