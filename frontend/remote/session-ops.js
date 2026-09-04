@@ -74,7 +74,7 @@ import {
 } from "../local/view-only-thread.js";
 import { sessionViewedWorkspaceKey } from "../shared/viewed-workspace-key.js";
 import { isWorkingThreadStatus } from "../shared/thread-status.js";
-import { createFrameRenderQueue } from "./frame-render-queue.js";
+import { createTranscriptFlushScheduler } from "../shared/transcript-flush-scheduler.js";
 
 const fetchTranscriptPageOverBroker = createTranscriptPageFetcher(dispatchOrRecover);
 const fetchRawTranscriptPage = fetchTranscriptPageOverBroker;
@@ -138,7 +138,7 @@ function latchViewOnlyWasWorkingFromDelta(threadId) {
     }
   }
 }
-const transcriptFrameRenderQueue = createFrameRenderQueue({
+const transcriptFlushScheduler = createTranscriptFlushScheduler({
   render() {
     if (state.session) {
       renderSession(state.session);
@@ -147,7 +147,7 @@ const transcriptFrameRenderQueue = createFrameRenderQueue({
 });
 
 export function flushRemoteTranscriptRenderForTest() {
-  transcriptFrameRenderQueue.flush();
+  transcriptFlushScheduler.flushNow("test");
 }
 
 function invalidateViewOnlyNavigation() {
@@ -452,7 +452,7 @@ function commitTranscriptDeltaAppend({
   if (Number.isSafeInteger(server_time)) {
     nextSession.server_time = server_time;
   }
-  commit(nextSession);
+  commit(nextSession, { chars: appendText.length, reason: "transcript_entry_delta" });
   if (viewedThreadId) {
     latchViewOnlyWasWorkingFromDelta(viewedThreadId);
   }
@@ -628,6 +628,22 @@ export function applyTranscriptEvent(event) {
     return;
   }
 
+  if (eventKind === "transcript_stream_lagged") {
+    // Mirrors local's handling (frontend/local/session/stream.js): we may have
+    // missed delta frames, so the cached text can no longer be trusted — pull
+    // the authoritative tail rather than trust it. Whatever text is already
+    // pending must not sit out the coalescing window behind a signal that
+    // says the current view may already be stale.
+    const laggedThreadId = event.thread_id || currentLiveSession()?.active_thread_id || null;
+    scheduleTranscriptGapRepair(
+      laggedThreadId,
+      "transcript_stream_lagged",
+      numericRevision(event.revision ?? event.transcript_revision)
+    );
+    transcriptFlushScheduler.flushNow("transcript_stream_lagged");
+    return;
+  }
+
   if (
     eventKind === "transcript_entry_started"
     || eventKind === "transcript_entry_completed"
@@ -640,6 +656,7 @@ export function applyTranscriptEvent(event) {
           : eventKind === "transcript_entry_started"
             ? "running"
             : null,
+      reason: eventKind,
     });
     return;
   }
@@ -652,7 +669,7 @@ export function applyTranscriptEvent(event) {
     const liveSession = currentLiveSession();
     applySessionMetadataPatch({
       pending_approvals: upsertApproval(liveSession?.pending_approvals || [], approval),
-    });
+    }, "approval_added");
     return;
   }
 
@@ -665,12 +682,12 @@ export function applyTranscriptEvent(event) {
     applySessionMetadataPatch({
       pending_approvals: (liveSession?.pending_approvals || [])
         .filter((approval) => approval?.request_id !== requestId),
-    });
+    }, "approval_resolved");
     return;
   }
 
   if (eventKind === "session_meta_updated") {
-    applySessionMetadataPatch(event.session || event.patch || event);
+    applySessionMetadataPatch(event.session || event.patch || event, "session_meta_updated");
   }
 }
 
@@ -747,7 +764,8 @@ export function applySessionSnapshot(snapshot) {
   const effectiveSnapshot = viewOnlyThreadId && !viewingLiveThread
     ? projectedSnapshot
     : restoreHydratedTranscript(state, projectedSnapshot);
-  transcriptFrameRenderQueue.cancel();
+  // applyRenderedSession cancels the scheduler itself before rendering, so
+  // every synchronous render — this one included — clears the pending slot.
   applyRenderedSession(effectiveSnapshot, {
     hydrationSnapshot: displaySnapshot,
     hydrateTranscript: !viewOnlyThreadId || viewingLiveThread,
@@ -1024,7 +1042,7 @@ function settledThreadStatus(status) {
     : status || "idle";
 }
 
-function applyTranscriptEntryPatch(event, { defaultStatus = null } = {}) {
+function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null } = {}) {
   const currentSession = currentLiveSession();
   if (!currentSession) {
     return;
@@ -1107,10 +1125,17 @@ function applyTranscriptEntryPatch(event, { defaultStatus = null } = {}) {
   if (Number.isSafeInteger(event.server_time)) {
     nextSession.server_time = event.server_time;
   }
-  commitLiveSession(nextSession);
+  // A patch that leaves the entry "running" is a routine update on an
+  // in-flight stream and coalesces with the delta path; anything else
+  // (completed, failed, cancelled, …) is terminal completion and must paint
+  // at once — it is the only signal remote gets for a turn going idle.
+  commitLiveSession(nextSession, {
+    immediate: entryPatch.status !== "running",
+    reason: reason || "transcript_entry_patch",
+  });
 }
 
-function applySessionMetadataPatch(patch) {
+function applySessionMetadataPatch(patch, reason = "session_meta_updated") {
   const currentSession = currentLiveSession();
   if (!currentSession || !patch) {
     return;
@@ -1132,7 +1157,9 @@ function applySessionMetadataPatch(patch) {
     nextSession.thread_activity_server_time =
       serverTimeSeconds(metadata.server_time) || currentSession.thread_activity_server_time || null;
   }
-  commitLiveSession(nextSession);
+  // Approvals, ask-user state, and turn/error status all ride this patch, and
+  // remote has no separate live event for any of them — always paint at once.
+  commitLiveSession(nextSession, { immediate: true, reason });
 }
 
 function shouldAcceptTranscriptRevision(event) {
@@ -1209,12 +1236,12 @@ export function declareWatchedThreads() {
 /// Deliberately does not touch `state.realSession`: the live session still belongs to
 /// whatever thread the relay has active, and folding a watched background thread's
 /// text into it would corrupt the transcript the user sees on switching back.
-function commitViewedSession(nextViewedSession) {
+function commitViewedSession(nextViewedSession, { immediate = false, chars = 0, reason } = {}) {
   state.session = nextViewedSession;
-  transcriptFrameRenderQueue.queue();
+  scheduleTranscriptFlush({ immediate, chars, reason });
 }
 
-function commitLiveSession(nextLiveSession) {
+function commitLiveSession(nextLiveSession, { immediate = false, chars = 0, reason } = {}) {
   state.realSession = nextLiveSession;
   let nextRenderedSession = nextLiveSession;
   if (viewOnlyThreadId && viewOnlyThreadId !== nextLiveSession.active_thread_id) {
@@ -1226,9 +1253,23 @@ function commitLiveSession(nextLiveSession) {
   }
   // Advance reducer state synchronously so every delta in this frame appends to
   // the latest text. Subscriber notification and React reconciliation are the
-  // expensive part, so those are coalesced to one animation-frame render.
+  // expensive part, so those are coalesced by the shared flush scheduler.
   state.session = nextRenderedSession;
-  transcriptFrameRenderQueue.queue();
+  scheduleTranscriptFlush({ immediate, chars, reason });
+}
+
+// Single chokepoint from a session commit to the scheduler, so every commit
+// site picks "coalesce" vs "paint now" the same way instead of each caller
+// juggling queue()/note()/flushNow() itself.
+function scheduleTranscriptFlush({ immediate = false, chars = 0, reason } = {}) {
+  if (immediate) {
+    transcriptFlushScheduler.flushNow(reason);
+    return;
+  }
+  transcriptFlushScheduler.queue(reason);
+  if (chars > 0) {
+    transcriptFlushScheduler.note(chars);
+  }
 }
 
 function normalizeTranscriptEventEntryKind(kind) {
@@ -2281,6 +2322,12 @@ function applyRenderedSession(
   { hydrateTranscript = true, hydrationSnapshot = session } = {}
 ) {
   const previousThreadId = state.session?.active_thread_id || "-";
+  // Every call here is a direct, synchronous render — the same "render now,
+  // nothing pending after" invariant the scheduler exists to keep. Without
+  // this, a delta timer left over from before a thread switch, a hydration
+  // progress step, a promotion, or a settings update fires later and renders
+  // a second time on top of what this call already painted.
+  transcriptFlushScheduler.cancel();
   renderSession(session);
   const message = `[session-state] renderSession prev=${previousThreadId} next=${session?.active_thread_id || "-"} state=${state.session?.active_thread_id || "-"} entries=${session?.transcript?.length || 0} hydrate=${hydrateTranscript ? "1" : "0"} hydration_input=${hydrationSnapshot?.active_thread_id || "-"}`;
   renderLog(message);

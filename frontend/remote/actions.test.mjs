@@ -680,6 +680,27 @@ test("handleRemoteBrokerPayload routes typed transcript events", async () => {
   assert.equal(received[0].item_id, "item-1");
 });
 
+test("handleRemoteBrokerPayload routes transcript_stream_lagged as a typed transcript event", async () => {
+  installBrowserStubs();
+
+  const { configureRemoteActions, handleRemoteBrokerPayload } = await import("./actions.js");
+
+  const received = [];
+  configureRemoteActions({
+    onApplyTranscriptEvent: (event) => received.push(event),
+  });
+
+  await handleRemoteBrokerPayload({
+    kind: "transcript_stream_lagged",
+    thread_id: "thread-1",
+    dropped: 3,
+  });
+
+  assert.equal(received.length, 1);
+  assert.equal(received[0].kind, "transcript_stream_lagged");
+  assert.equal(received[0].dropped, 3);
+});
+
 test("handleRemoteBrokerPayload decrypts encrypted typed transcript events", async () => {
   installBrowserStubs();
 

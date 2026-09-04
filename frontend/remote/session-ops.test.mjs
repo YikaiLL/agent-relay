@@ -2796,6 +2796,78 @@ test("an authoritative snapshot cancels a queued remote delta render", async () 
   unsubscribe();
 });
 
+test("a queued delta render is cancelled by an immediate thread switch", async () => {
+  const browser = installBrowserStubs();
+  const { state, subscribeRemoteState } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
+    viewRemoteThread,
+  } = await import("./session-ops.js");
+  flushRemoteTranscriptRenderForTest();
+  // A prior test's view-only pin (viewOnlyThreadId) is module-private state
+  // this test does not otherwise touch — reset it so neither this test's
+  // start nor its own pin below leaks into whatever runs next.
+  clearSessionRuntime();
+
+  state.realSession = {
+    active_thread_id: "thread-live",
+    transcript_revision: 0,
+    transcript: [{
+      item_id: "item-live",
+      kind: "agent_text",
+      status: "running",
+      text: "",
+      turn_id: "turn-live",
+      tool: null,
+    }],
+  };
+  state.session = state.realSession;
+
+  const notifications = [];
+  const unsubscribe = subscribeRemoteState((_nextState, patch) => {
+    if (patch.session) {
+      notifications.push(patch.session);
+    }
+  });
+
+  applyTranscriptDelta({
+    thread_id: "thread-live",
+    revision: 1,
+    item_id: "item-live",
+    turn_id: "turn-live",
+    delta: "partial",
+    delta_kind: "agent_text",
+  });
+  assert.equal(notifications.length, 0, "the delta must still be coalescing, not yet painted");
+
+  // viewRemoteThread's same-thread branch renders synchronously via
+  // applyRenderedSession — the same path a real thread switch, hydration
+  // progress step, promotion, or settings update takes.
+  const switched = await viewRemoteThread("thread-live");
+  assert.equal(switched, true);
+
+  assert.equal(notifications.length, 1, "the switch must render exactly once, immediately");
+  assert.equal(
+    notifications[0].transcript[0].text,
+    "partial",
+    "the switch's render must include the pending delta text, not stale text"
+  );
+
+  browser.runNextTimer();
+  assert.equal(
+    notifications.length,
+    1,
+    "the delta timer left over from before the switch must not render a second time"
+  );
+
+  unsubscribe();
+  // This test's own pin (viewOnlyThreadId = "thread-live") is module-private
+  // state that would otherwise leak into whatever test runs next.
+  clearSessionRuntime();
+});
+
 test("applyTranscriptDelta does not mutate the previous session snapshot", async () => {
   activeBrowser || installBrowserStubs();
 
@@ -4041,6 +4113,78 @@ test("applyTranscriptEvent updates approvals as metadata only", async () => {
 
   assert.deepEqual(state.session.pending_approvals, []);
   assert.equal(state.session.transcript[0].text, "visible history");
+});
+
+test("applyTranscriptEvent flushes immediately and schedules repair on transcript_stream_lagged", async () => {
+  const browser = activeBrowser || installBrowserStubs();
+
+  const { state, subscribeRemoteState } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    applyTranscriptEvent,
+    flushRemoteTranscriptRenderForTest,
+  } = await import("./session-ops.js");
+  flushRemoteTranscriptRenderForTest();
+
+  window.__transcriptGapRepairCount = 0;
+  // No responding socket: this test only asserts the gap-repair scheduling and
+  // the immediate flush, not the fetch -> converge path (that has its own
+  // coverage elsewhere).
+  state.socket = null;
+  state.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 1,
+    transcript: [{
+      item_id: "item-1",
+      kind: "agent_text",
+      status: "running",
+      text: "",
+      turn_id: "turn-1",
+      tool: null,
+    }],
+  };
+  state.realSession = state.session;
+
+  const notifications = [];
+  const unsubscribe = subscribeRemoteState((_nextState, patch) => {
+    if (patch.session) {
+      notifications.push(patch.session);
+    }
+  });
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    revision: 2,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "partial",
+    delta_kind: "agent_text",
+  });
+  assert.equal(notifications.length, 0, "the ordinary delta must still coalesce");
+
+  applyTranscriptEvent({
+    kind: "transcript_stream_lagged",
+    thread_id: "thread-1",
+    dropped: 2,
+  });
+
+  assert.equal(
+    window.__transcriptGapRepairCount,
+    1,
+    "a lagged stream must schedule an authoritative tail repair"
+  );
+  assert.equal(notifications.length, 1, "the lagged signal must flush immediately");
+  assert.equal(notifications[0].transcript[0].text, "partial");
+
+  browser.runNextTimer();
+  assert.equal(
+    notifications.length,
+    1,
+    "the stale coalesced timer must not render a second time"
+  );
+
+  unsubscribe();
+  delete window.__transcriptGapRepairCount;
 });
 
 test("approval events merge against the live session while another thread is viewed", async () => {

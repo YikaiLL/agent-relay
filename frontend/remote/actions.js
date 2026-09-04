@@ -449,7 +449,8 @@ function isTranscriptEventKind(kind) {
     || kind === "transcript_entry_completed"
     || kind === "transcript_entry_patched"
     || kind === "approval_added"
-    || kind === "approval_resolved";
+    || kind === "approval_resolved"
+    || kind === "transcript_stream_lagged";
 }
 
 function isVerboseBrokerLoggingEnabled() {
