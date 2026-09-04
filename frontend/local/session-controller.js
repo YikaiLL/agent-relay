@@ -149,10 +149,14 @@ export function createSessionController({
   // This is what makes the many direct renderSession(...) call sites in
   // lifecycle.js / transcript.js / app.js safe to leave alone — any of them
   // can paint at any time and the pending flush is satisfied rather than
-  // duplicated.
+  // duplicated. Also why the window projection (stream.js's
+  // projectTranscriptWindowIfPending) runs HERE rather than only inside the
+  // scheduler's own flush: a direct call builds its own session object by
+  // spreading state.session, so projecting elsewhere would miss it and paint
+  // the stale array with the just-armed token invisible.
   function renderSessionAndClearPendingFlush(session) {
     transcriptFlushScheduler.cancel();
-    return renderSession(session);
+    return renderSession(ctx.projectTranscriptWindowIfPending?.(session) ?? session);
   }
 
   const ctx = {

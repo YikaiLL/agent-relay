@@ -59,7 +59,21 @@ function harness({ threadId = "thread-1", itemId = "item-1", text = "Hello world
   const rendered = [];
   const hydrationCalls = [];
   const renderSession = (session) => rendered.push(session);
-  const controller = createStreamController({
+  // Late-bound: the scheduler is constructed before the controller it flushes
+  // through exists (same seam as session-controller.js's real render callback).
+  let controller;
+  const transcriptFlushScheduler = createSyncTranscriptFlushScheduler(() => {
+    // The window-loaded delta path only bumps transcript_revision; this is
+    // what derives the rendered array from the window (once per flush,
+    // synchronous here so assertions can read state right after delivering).
+    // Mirrors session-controller.js's ctx.renderSession wrapper, which
+    // reassigns state.session to the projected result before rendering.
+    if (state.session) {
+      state.session = controller.projectTranscriptWindowIfPending(state.session);
+      renderSession(state.session);
+    }
+  });
+  controller = createStreamController({
     state,
     ensureConversationTranscript: (session) => {
       hydrationCalls.push(session);
@@ -74,11 +88,7 @@ function harness({ threadId = "thread-1", itemId = "item-1", text = "Hello world
     scheduleSessionPoll: () => {},
     scheduleStreamReconnect: () => {},
     // Render synchronously so assertions do not race the scheduler's window.
-    transcriptFlushScheduler: createSyncTranscriptFlushScheduler(() => {
-      if (state.session) {
-        renderSession(state.session);
-      }
-    }),
+    transcriptFlushScheduler,
   });
   const deliver = (event) =>
     controller.applySessionStreamEvent("transcript_entry_delta", {

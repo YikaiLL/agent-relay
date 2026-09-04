@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createStreamController } from "./session/stream.js";
+import {
+  createStreamController,
+  __readTranscriptFullRebuildCount,
+  __resetTranscriptFullRebuildCount,
+} from "./session/stream.js";
 import {
   createTranscriptFlushScheduler,
   TRANSCRIPT_FLUSH_CHAR_THRESHOLD,
@@ -64,15 +68,27 @@ function makeController() {
       transcript_revision: 0,
     },
   };
-  function renderSession(session) {
+  function baseRenderSession(session) {
     renders.push(session);
   }
-  // Mirrors production: session-controller.js owns the scheduler and passes
-  // ctx.renderSession(state.session) as its render callback.
+  // Late-bound: the scheduler and the wrapper below are constructed before
+  // the controller they flush through exists (same seam as
+  // session-controller.js's real wiring).
+  let controller;
+  // Mirrors session-controller.js's ctx.renderSession: the ONE choke point
+  // every render — the scheduler's own flush AND stream.js's own direct
+  // render calls (session_meta_updated, approvals, the stream-disconnect
+  // notice) alike — goes through, which is what makes
+  // projectTranscriptWindowIfPending() reliable no matter which path
+  // triggered the render.
+  function renderSessionAndClearPendingFlush(session) {
+    transcriptFlushScheduler.cancel();
+    return baseRenderSession(controller.projectTranscriptWindowIfPending(session));
+  }
   const transcriptFlushScheduler = createTranscriptFlushScheduler({
     render: () => {
       if (state.session) {
-        renderSession(state.session);
+        renderSessionAndClearPendingFlush(state.session);
       }
     },
     now: clock.now,
@@ -80,13 +96,13 @@ function makeController() {
     clearTimer: clock.clearTimer,
     isHidden: () => false,
   });
-  const controller = createStreamController({
+  controller = createStreamController({
     applySessionSnapshot() {},
     cancelSessionPoll() {},
     cancelStreamReconnect() {},
     handleUnauthorized() {},
     logLine() {},
-    renderSession,
+    renderSession: renderSessionAndClearPendingFlush,
     scheduleSessionPoll() {},
     scheduleStreamReconnect() {},
     seedDefaults() {},
@@ -201,4 +217,83 @@ test("transcript_stream_lagged brings a pending render forward instead of leavin
 
   clock.tick(TRANSCRIPT_FLUSH_MAX_WINDOW_MS);
   assert.equal(renders.length, 1, "the absorbed window timer must not render a second time");
+});
+
+test("with a loaded hydration window, deltas within one window rebuild the transcript only once, at the flush", () => {
+  __resetTranscriptFullRebuildCount();
+  const { clock, controller, renders, state } = makeController();
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([
+    ["agent-1", { ...state.session.transcript[0] }],
+  ]);
+  state.transcriptHydrationOrder = ["agent-1"];
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "one",
+    item_id: "agent-1",
+    revision: 1,
+    thread_id: "thread-1",
+  });
+  controller.applyLocalTranscriptEntryDelta({
+    delta: " two",
+    item_id: "agent-1",
+    revision: 2,
+    thread_id: "thread-1",
+  });
+
+  assert.equal(
+    __readTranscriptFullRebuildCount(),
+    0,
+    "the window-loaded deltas must not rebuild the rendered array before the flush"
+  );
+  assert.equal(renders.length, 0);
+
+  clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+
+  assert.equal(
+    __readTranscriptFullRebuildCount(),
+    1,
+    "the flush must derive the rendered array from the window exactly once"
+  );
+  assert.equal(renders.length, 1);
+  assert.equal(renders[0].transcript[0].text, "one two");
+});
+
+// REVIEW P1: renderSessionAndClearPendingFlush's own scheduler flush is not
+// the only render path. A direct render call — session_meta_updated here,
+// but any of the ~30 elsewhere in the app is the same shape — builds its own
+// session object by spreading state.session and renders it immediately,
+// cancelling the pending scheduled flush along the way. If the projection
+// only ran inside the scheduler's own flush, that cancel would throw away
+// the ONLY chance to derive the fresh array, and the direct render would
+// paint the stale one with the just-streamed token missing.
+test("a delta immediately followed by a direct render (session_meta_updated) still paints the fresh window text, not the stale array", () => {
+  const { controller, renders, state } = makeController();
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([
+    ["agent-1", { ...state.session.transcript[0] }],
+  ]);
+  state.transcriptHydrationOrder = ["agent-1"];
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "one",
+    item_id: "agent-1",
+    revision: 1,
+    thread_id: "thread-1",
+  });
+  assert.equal(renders.length, 0, "the delta must still be coalescing");
+
+  // No scheduled flush ever fires — the direct render below is the only
+  // paint this test drives.
+  controller.applySessionStreamEvent("session_meta_updated", {
+    session: { current_status: "idle" },
+  });
+
+  assert.equal(renders.length, 1, "the direct render must paint immediately");
+  assert.equal(
+    renders[0].transcript[0].text,
+    "one",
+    "the direct render must include the token the cancelled flush would have shown"
+  );
+  assert.equal(renders[0].current_status, "idle", "and still carry the metadata it was sent to apply");
 });
