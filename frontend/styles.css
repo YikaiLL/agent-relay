@@ -2150,11 +2150,16 @@ input:focus, textarea:focus, select:focus {
   gap: 8px;
   margin-top: 12px;
 }
+/* Capped and self-scrolling: the pane is a fixed-height column inside an
+   `overflow: hidden` cell, so an uncapped band of cards took its height off the
+   bottom and clipped the composer away with nothing left to scroll. */
 .task-orch-proposals {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 12px 16px 0;
+  max-height: 50%;
+  overflow-y: auto;
 }
 .task-orch-chip:not(.is-disabled) {
   cursor: pointer;
