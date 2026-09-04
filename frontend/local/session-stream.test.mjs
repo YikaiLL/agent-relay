@@ -6,6 +6,7 @@ import {
   __readTranscriptFullRebuildCount,
   __resetTranscriptFullRebuildCount,
 } from "./session/stream.js";
+import { settleTranscriptProjection } from "./transcript/store.js";
 import {
   createTranscriptFlushScheduler,
   TRANSCRIPT_FLUSH_CHAR_THRESHOLD,
@@ -79,11 +80,27 @@ function makeController() {
   // every render — the scheduler's own flush AND stream.js's own direct
   // render calls (session_meta_updated, approvals, the stream-disconnect
   // notice) alike — goes through, which is what makes
-  // projectTranscriptWindowIfPending() reliable no matter which path
-  // triggered the render.
+  // settleTranscriptProjection() reliable no matter which path triggered the
+  // render.
   function renderSessionAndClearPendingFlush(session) {
     transcriptFlushScheduler.cancel();
-    return baseRenderSession(controller.projectTranscriptWindowIfPending(session));
+    const settled = settleTranscriptProjection(state);
+    if (!settled) {
+      return baseRenderSession(session);
+    }
+    // settleTranscriptProjection materialises into state.session, not
+    // necessarily into THIS `session` — a direct call (session_meta_updated
+    // below) builds its own `{...state.session, override}` copy captured
+    // before the settle above ran. Recognise "the same live thread" by id,
+    // not array identity, and adopt the freshly-settled transcript into it.
+    const isLiveThreadSession =
+      session
+      && state.session
+      && session.active_thread_id
+      && session.active_thread_id === state.session.active_thread_id;
+    return baseRenderSession(
+      isLiveThreadSession ? { ...session, transcript: state.session.transcript } : session
+    );
   }
   const transcriptFlushScheduler = createTranscriptFlushScheduler({
     render: () => {
@@ -110,7 +127,18 @@ function makeController() {
     transcriptFlushScheduler,
   });
 
-  return { clock, controller, renders, state, transcriptFlushScheduler };
+  // Mirrors session-controller.js's exposed cancelPendingTranscriptFlush —
+  // app.js's `renderer.renderSession` wrap (frontend/app.js:1192) calls this
+  // BEFORE painting `state.session` directly, bypassing
+  // renderSessionAndClearPendingFlush/ctx.renderSession entirely. Must
+  // settle as well as cancel, or that direct paint sees the stale
+  // pre-projection array.
+  function cancelPendingTranscriptFlush() {
+    transcriptFlushScheduler.cancel();
+    settleTranscriptProjection(state);
+  }
+
+  return { clock, controller, renders, state, transcriptFlushScheduler, cancelPendingTranscriptFlush };
 }
 
 test("live transcript deltas update state immediately but render once per window", () => {
@@ -296,4 +324,114 @@ test("a delta immediately followed by a direct render (session_meta_updated) sti
     "the direct render must include the token the cancelled flush would have shown"
   );
   assert.equal(renders[0].current_status, "idle", "and still carry the metadata it was sent to apply");
+});
+
+// P1: frontend/app.js:1192 (`renderer.renderSession`'s wrap) calls
+// cancelPendingTranscriptFlush() and then paints `state.session` DIRECTLY —
+// it never goes through renderSessionAndClearPendingFlush/ctx.renderSession
+// at all, so it never called projectTranscriptWindowIfPending either. A BARE
+// cancel (the old cancelPendingTranscriptFlush) would destroy the only
+// scheduled catch-up while leaving state.session.transcript on its stale
+// pre-projection array — so this direct paint would show that stale array
+// with the just-streamed token invisible, permanently (nothing else was
+// ever going to render it). cancelPendingTranscriptFlush must settle too.
+test("cancelPendingTranscriptFlush settles the pending projection, so a direct render right after paints the fresh text, not the stale array", () => {
+  const { controller, state, transcriptFlushScheduler, cancelPendingTranscriptFlush } = makeController();
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([
+    ["agent-1", { ...state.session.transcript[0] }],
+  ]);
+  state.transcriptHydrationOrder = ["agent-1"];
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "one",
+    item_id: "agent-1",
+    revision: 1,
+    thread_id: "thread-1",
+  });
+
+  // Sanity: before settling, the array itself has not been rebuilt — only
+  // the window Map has the token (this is what "deferred" means).
+  assert.equal(state.session.transcript[0].text, "");
+  assert.equal(transcriptFlushScheduler.stats().pending, true);
+
+  // Mirrors app.js's wrappedRenderSession: cancel the pending flush, THEN
+  // paint state.session directly — no ctx.renderSession involved.
+  cancelPendingTranscriptFlush();
+  const directlyRenderedSession = state.session;
+
+  assert.equal(
+    transcriptFlushScheduler.stats().pending,
+    false,
+    "the scheduled catch-up must be cancelled — the direct render below satisfies it"
+  );
+  assert.equal(
+    directlyRenderedSession.transcript[0].text,
+    "one",
+    "a bare cancel would leave this stale — cancelPendingTranscriptFlush must also settle the window projection"
+  );
+});
+
+// P1: applyLocalTranscriptEntryPatch reads state.session.transcript and
+// rebuilds it (for a DIFFERENT item than any pending delta targets) without
+// ever touching the hydration window. Two ways that used to go wrong, both
+// guarded here:
+//   - The old render-time projection matched a pending append by ARRAY
+//     IDENTITY. This patch's rebuild produces a new array reference, so the
+//     match missed and agent-1's still-pending delta was silently dropped
+//     from the eventual render (never lost from the window itself, just
+//     never painted).
+//   - Settling always re-derives the WHOLE array from the window
+//     (settleTranscriptProjection), which does not know about this patch —
+//     so if the patch does not settle FIRST, before its own read/rebuild,
+//     the render chokepoint's later settle overwrites the patch's own
+//     array-only change to agent-2 with the window's (unpatched) copy of it.
+test("an entry patch for one item, landing between a delta for another item and the flush, does not drop the delta OR the patch", () => {
+  const { clock, controller, renders, state } = makeController();
+  state.session.transcript.push({
+    item_id: "agent-2",
+    kind: "agent_text",
+    status: "running",
+    text: "",
+    tool: null,
+    turn_id: "turn-2",
+  });
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([
+    ["agent-1", { ...state.session.transcript[0] }],
+    ["agent-2", { ...state.session.transcript[1] }],
+  ]);
+  state.transcriptHydrationOrder = ["agent-1", "agent-2"];
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "one",
+    item_id: "agent-1",
+    revision: 1,
+    thread_id: "thread-1",
+  });
+  assert.equal(renders.length, 0, "the delta must still be coalescing");
+
+  // The interleaved write: a patch for agent-2 lands BEFORE the delta's
+  // flush fires. It reads+rewrites state.session.transcript directly,
+  // producing a new array reference — exactly the write the old
+  // identity-matching projection could not see past.
+  controller.applyLocalTranscriptEntryPatch(
+    { item_id: "agent-2", status: "completed", text: "done", thread_id: "thread-1" },
+    { defaultStatus: "completed" }
+  );
+
+  clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+
+  assert.equal(renders.length, 1);
+  const rendered = renders[0].transcript;
+  assert.equal(
+    rendered.find((entry) => entry.item_id === "agent-1").text,
+    "one",
+    "the delta for agent-1 must survive the interleaved patch for agent-2, not be dropped by it"
+  );
+  assert.equal(
+    rendered.find((entry) => entry.item_id === "agent-2").text,
+    "done",
+    "and the patch itself must still land"
+  );
 });

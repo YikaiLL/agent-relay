@@ -3,29 +3,23 @@ import { applyDeltaToViewOnlyPin } from "../view-only-thread.js";
 import {
   appendTranscriptDelta,
   invalidateTranscriptWindowForRepair,
+  markTranscriptWindowProjectionPending,
   resolveDeltaAppend,
+  settleTranscriptProjection,
   transcriptWindowIsLoaded,
+  __recordTranscriptFullRebuild,
+  __readTranscriptFullRebuildCount,
+  __resetTranscriptFullRebuildCount,
 } from "../transcript/store.js";
 
-// Test/perf instrumentation: counts every time the delta path rebuilds the
-// WHOLE rendered transcript array, at either of its two full-rebuild sites —
-// deriving it from the hydration window (renderedTranscriptFromWindow's
-// order.map(...).filter(Boolean), deferred to once per flush by
-// projectTranscriptWindowIfPending) or, before hydration is loaded, the
-// pre-hydration fallback's map()/spread over state.session.transcript
-// (synchronous per delta, but bounded by the relay's max_transcript_entries:
-// 8, so never the O(n) concern the window path is). Mirrors
+// Re-exported so existing test imports (`from "./stream.js"`) keep working —
+// the counter itself now lives in transcript/store.js, since that is where
+// the deferred window-projection rebuild site (settleTranscriptProjection)
+// lives. This file's own pre-hydration-fallback rebuild site (below) records
+// to the SAME counter via __recordTranscriptFullRebuild, matching
 // transcriptFullWindowCopyCount's one-counter-many-sites shape
 // (frontend/shared/transcript-hydration-store.js:115).
-let transcriptFullRebuildCount = 0;
-
-export function __readTranscriptFullRebuildCount() {
-  return transcriptFullRebuildCount;
-}
-
-export function __resetTranscriptFullRebuildCount() {
-  transcriptFullRebuildCount = 0;
-}
+export { __readTranscriptFullRebuildCount, __resetTranscriptFullRebuildCount };
 
 export function createStreamController(ctx) {
   const {
@@ -44,13 +38,6 @@ export function createStreamController(ctx) {
   const scheduleSessionPoll = (...args) => ctx.scheduleSessionPoll(...args);
   const scheduleStreamReconnect = (...args) => ctx.scheduleStreamReconnect(...args);
   const transcriptFlushScheduler = ctx.transcriptFlushScheduler;
-  // The (stale, pre-projection) transcript array reference queued by the
-  // window-loaded branch below. Tracked by ARRAY identity rather than
-  // session identity: a direct render call site (session_meta_updated,
-  // approvals, …) builds its own session object by spreading state.session,
-  // which carries this same array through unless overridden — see
-  // projectTranscriptWindowIfPending.
-  let pendingWindowProjectionTranscript = null;
 
   function queueTranscriptRender(nextSession, chars = 0) {
     // State advances synchronously so another delta arriving in this same frame
@@ -348,7 +335,7 @@ export function createStreamController(ctx) {
     // owns the text_offset bookkeeping that makes re-delivery idempotent — and it is
     // already O(1) per delta (a Map write). Projecting it back to the rendered array
     // (order.map(...).filter(Boolean)) is O(n) in the loaded window, so that step is
-    // deferred to projectTranscriptWindowIfPending() and runs once per render instead
+    // deferred to settleTranscriptProjection() and runs once per render instead
     // of once per token — this call only bumps transcript_revision.
     // state.session.transcript trails the window by up to one render until then;
     // every reader that needs the newest text reads the window directly.
@@ -369,7 +356,7 @@ export function createStreamController(ctx) {
         ...state.session,
         transcript_revision: nextRevision,
       };
-      pendingWindowProjectionTranscript = nextSession.transcript;
+      markTranscriptWindowProjectionPending(state);
       queueTranscriptRender(nextSession, Math.max(0, textLengthAfter - textLengthBefore));
       return;
     }
@@ -427,10 +414,11 @@ export function createStreamController(ctx) {
             turn_id: event.turn_id || null,
           },
         ];
-    // Same full-rebuild shape as the window projection below, just bounded
-    // (max_transcript_entries: 8) rather than deferred — counted for the same
-    // reason: visibility into every site that copies the whole array.
-    transcriptFullRebuildCount += 1;
+    // Same full-rebuild shape as the deferred window projection
+    // (settleTranscriptProjection), just bounded (max_transcript_entries: 8)
+    // rather than deferred — counted for the same reason: visibility into
+    // every site that copies the whole array.
+    __recordTranscriptFullRebuild();
     observeAppliedActiveThreadDelta({
       itemId: event.item_id,
       threadId: currentThreadId,
@@ -448,63 +436,19 @@ export function createStreamController(ctx) {
     );
   }
 
-  /// Project the hydration window onto the rendered transcript.
-  ///
-  /// Falls back to the session's own transcript when the window is not loaded for this
-  /// thread (a delta can arrive before the first hydration), so the live tail still
-  /// shows rather than blanking.
-  function renderedTranscriptFromWindow(state, session) {
-    const entries = state.transcriptHydrationEntries;
-    const order = state.transcriptHydrationOrder;
-    if (
-      state.transcriptHydrationThreadId !== session?.active_thread_id
-      || !(entries instanceof Map)
-      || !Array.isArray(order)
-      || !order.length
-    ) {
-      return session?.transcript || [];
-    }
-    return order.map((itemId) => entries.get(itemId)).filter(Boolean);
-  }
-
-  /// Runs the deferred projection if `session` still carries the stale
-  /// pre-projection array — matched by ARRAY identity, not session identity,
-  /// because a direct render (session_meta_updated, an approval, ...) builds
-  /// its own session by spreading state.session, carrying the same stale
-  /// array through unless it overrides `transcript`. Called from the one
-  /// render/cancel choke point every render goes through
-  /// (session-controller.js), not just the scheduler's own flush — otherwise
-  /// a direct render paints the stale array with the just-armed token
-  /// missing.
-  ///
-  /// Clears the pending mark on a miss too: a different array means a
-  /// snapshot's own fresh rebuild (which already reads the window directly)
-  /// already superseded it.
-  function projectTranscriptWindowIfPending(session) {
-    if (!pendingWindowProjectionTranscript) {
-      return session;
-    }
-    const isPending = session?.transcript === pendingWindowProjectionTranscript;
-    pendingWindowProjectionTranscript = null;
-    if (!isPending) {
-      return session;
-    }
-    const threadId = session.active_thread_id || null;
-    if (!transcriptWindowIsLoaded(state, threadId)) {
-      return session;
-    }
-    transcriptFullRebuildCount += 1;
-    return {
-      ...session,
-      transcript: renderedTranscriptFromWindow(state, session),
-    };
-  }
-
   function normalizeLocalDeltaKind(kind) {
     return kind === "command_output" ? "command" : kind || "agent_text";
   }
 
   function applyLocalTranscriptEntryPatch(event, { defaultStatus = null } = {}) {
+    // This function is about to read state.session.transcript and rebuild it
+    // (below) — settle any pending window append into it FIRST, or this
+    // rebuild would carry the pre-append text forward into its own new array
+    // reference, silently dropping the pending delta (see
+    // settleTranscriptProjection's doc). Once settled here, the render
+    // chokepoint's own settle is a no-op — this rebuild's array already
+    // carries both the delta and this patch.
+    settleTranscriptProjection(state);
     const currentThreadId = state.session?.active_thread_id || null;
     const eventThreadId = event.thread_id || event.active_thread_id || event.entry?.thread_id || null;
     if (eventThreadId && currentThreadId && eventThreadId !== currentThreadId) {
@@ -568,6 +512,5 @@ export function createStreamController(ctx) {
     applyLocalTranscriptEntryDelta,
     normalizeLocalDeltaKind,
     applyLocalTranscriptEntryPatch,
-    projectTranscriptWindowIfPending,
   };
 }

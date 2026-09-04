@@ -44,12 +44,15 @@ export function createTranscriptFlushScheduler({
   let renderCount = 0;
   let lastRenderDurationMs = 0;
   let lastFlushReason = null;
-  // Sticky until a render actually proves itself fast enough under the
-  // window it was given. NOT re-derived by comparing lastRenderDurationMs
-  // against the live `windowMs` — that value is reassigned at the end of
-  // every render, so a second comparison against it (e.g. the next queue())
-  // would measure the last render against the WRONG window and decay
-  // one flush early even though nothing has actually gotten faster.
+  // Sticky until a render actually proves itself fast enough to decay.
+  // Compared against the FIXED TRANSCRIPT_FLUSH_MIN_WINDOW_MS in runFlush(),
+  // never against `windowMs` itself (live OR a value captured earlier in the
+  // same flush) — `windowMs` is ITSELF derived from this flag one line later
+  // (computeWindowMs()), so comparing against it measures each render
+  // against a target that flip-flops with the flag it is trying to set: a
+  // steady render duration would alternate stretch/decay forever instead of
+  // settling. Only the fixed floor gives a stable answer to "did this render
+  // genuinely get fast enough."
   let renderOutlastedWindow = false;
 
   function isPending() {
@@ -79,13 +82,12 @@ export function createTranscriptFlushScheduler({
     generation += 1;
     pendingChars = 0;
     lastFlushReason = reason || lastFlushReason;
-    // The window THIS render is being measured against — captured before
-    // computeWindowMs() below reassigns `windowMs` for the NEXT flush.
-    const windowBeforeRender = windowMs;
     const startedAt = now();
     render();
     lastRenderDurationMs = Math.max(0, now() - startedAt);
-    renderOutlastedWindow = lastRenderDurationMs > windowBeforeRender;
+    // Against the fixed floor, not `windowMs` — see renderOutlastedWindow's
+    // own doc above for why.
+    renderOutlastedWindow = lastRenderDurationMs > TRANSCRIPT_FLUSH_MIN_WINDOW_MS;
     renderCount += 1;
     windowMs = computeWindowMs();
   }

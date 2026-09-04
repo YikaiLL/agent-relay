@@ -1189,7 +1189,18 @@ renderer.renderSession = function wrappedRenderSession(session) {
   // renderer.renderSession(...) calls elsewhere in this file — must satisfy
   // the flush scheduler's pending slot, or a coalesced delta timer left over
   // from before this render fires later and paints a second time.
+  //
+  // cancelPendingTranscriptFlush also settles any pending window projection
+  // into state.session — a bare cancel would destroy the only scheduled
+  // catch-up while leaving the stale pre-projection array in place, which is
+  // what this render would then paint. Every direct call here passes
+  // state.session itself, so re-read it afterward to pick up whatever just
+  // got materialised.
+  const wasLiveSession = session === state.session;
   controller?.cancelPendingTranscriptFlush?.();
+  if (wasLiveSession) {
+    session = state.session;
+  }
   if (devicesCache.hasData()) {
     session = { ...session, ...devicesCache.current() };
   }

@@ -178,11 +178,14 @@ export function __getMarkdownCacheSizeForTests() {
 const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const LIST_MARKER_RE = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)/;
 const BLOCKQUOTE_RE = /^ {0,3}>/;
-// 2 spaces is the narrowest real CommonMark list-continuation width ("- ");
-// ordered markers need 3+. We don't track which marker opened the list, so
-// treat ANY 2+ indent as a possible continuation — errs toward refusing a
-// split, never toward splitting a real continuation out of its list.
-const INDENTED_CONTINUATION_RE = /^ {2,}\S/;
+// Coarser than tracking CommonMark's exact continuation width — which varies
+// by list marker AND counts a leading tab as 4 columns, so a naive
+// space-counting regex missed a tab-indented continuation entirely.
+// Reimplementing that column arithmetic in a regex is what produced that
+// bug; instead, refuse to split whenever the next line starts with ANY
+// space or tab. Over-refusing is free here (worst case the whole message is
+// tail, same cost as today); under-refusing corrupts the render.
+const INDENTED_CONTINUATION_RE = /^[ \t]/;
 
 function isListOrBlockquoteContinuation(line) {
   return (

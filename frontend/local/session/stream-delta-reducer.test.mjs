@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createStreamController } from "./stream.js";
+import { settleTranscriptProjection } from "../transcript/store.js";
 import { createViewedThreadRefreshLatch } from "../../shared/viewed-thread-refresh.js";
 import {
   applyOrchestratorLoadFinally,
@@ -67,9 +68,9 @@ function harness({ threadId = "thread-1", itemId = "item-1", text = "Hello world
     // what derives the rendered array from the window (once per flush,
     // synchronous here so assertions can read state right after delivering).
     // Mirrors session-controller.js's ctx.renderSession wrapper, which
-    // reassigns state.session to the projected result before rendering.
+    // settles state.session in place before rendering.
     if (state.session) {
-      state.session = controller.projectTranscriptWindowIfPending(state.session);
+      settleTranscriptProjection(state);
       renderSession(state.session);
     }
   });

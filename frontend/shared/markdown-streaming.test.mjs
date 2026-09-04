@@ -190,6 +190,42 @@ test("a bullet list's continuation paragraph is not split out of its list", () =
   assert.equal(viaStreaming, viaPlain);
 });
 
+// CommonMark counts a leading TAB as 4 columns — wide enough to continue any
+// list marker — but the space-only threshold above does not recognize a tab
+// as an indent at all, so `- item\n\n\tcontinued` split into a finished list
+// plus a stray indented code block instead of staying one list item. Fixed
+// by refusing on ANY leading space or tab rather than counting columns.
+const CONTINUATION_INDENT_CASES = [
+  ["tab", "\t"],
+  ["mixed tab/space", " \t"],
+  ["1-space", " "],
+];
+
+for (const [label, indent] of CONTINUATION_INDENT_CASES) {
+  test(`no split before a ${label}-indented unordered-list continuation`, () => {
+    const text = `- item one\n\n${indent}continued paragraph, still typ`;
+    assert.equal(findStreamingSplitOffset(text), null);
+  });
+
+  test(`no split before a ${label}-indented ordered-list continuation`, () => {
+    const text = `1. item one\n\n${indent}continued paragraph, still typ`;
+    assert.equal(findStreamingSplitOffset(text), null);
+  });
+}
+
+test("a tab-indented continuation paragraph is not split out of its list (regression)", () => {
+  const text = "- item one\n\n\tcontinued paragraph in item one, still typ";
+  assert.equal(
+    findStreamingSplitOffset(text),
+    null,
+    "must refuse — the tab-indented line continues the list item"
+  );
+  const viaStreaming = renderStreaming(text);
+  __clearMarkdownCacheForTests();
+  const viaPlain = renderToStaticMarkup(h(React.Fragment, null, renderMarkdown(text)));
+  assert.equal(viaStreaming, viaPlain);
+});
+
 // -- Refuse-rather-than-split-wrongly -----------------------------------------
 
 test("no safe boundary anywhere falls back to the whole text as tail — same cost as today, never worse", () => {

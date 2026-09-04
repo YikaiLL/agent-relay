@@ -132,3 +132,90 @@ export function mergeTranscriptHydrationPage(state, page, { prepend = false } = 
 }
 
 export { buildHydratedTranscriptProgress };
+
+// -- Deferred window→array projection ----------------------------------------
+//
+// Appending a delta to the loaded window (appendTranscriptDelta, above) is
+// O(1) — a Map write. Projecting it back onto the rendered array
+// (order.map(...).filter(Boolean)) is O(n) in the loaded window, so that step
+// is deferred: a delta only raises a pending flag, and settleTranscriptProjection
+// does the actual rebuild, once, whenever it is next called. See
+// .sealwire/PLAN.md, "The one lesson that keeps costing us".
+
+// Test/perf instrumentation, mirroring transcriptFullWindowCopyCount's
+// one-counter-many-sites shape (transcript-hydration-store.js:115): every
+// site that copies the WHOLE transcript array increments this, whether that
+// is this module's deferred window projection or session/stream.js's
+// synchronous pre-hydration fallback.
+let transcriptFullRebuildCount = 0;
+
+export function __readTranscriptFullRebuildCount() {
+  return transcriptFullRebuildCount;
+}
+
+export function __resetTranscriptFullRebuildCount() {
+  transcriptFullRebuildCount = 0;
+}
+
+export function __recordTranscriptFullRebuild() {
+  transcriptFullRebuildCount += 1;
+}
+
+/// Project the hydration window onto a rendered transcript array. Falls back
+/// to the session's own transcript when the window is not loaded for this
+/// thread (a delta can arrive before the first hydration), so the live tail
+/// still shows rather than blanking.
+export function renderedTranscriptFromWindow(state, session) {
+  const entries = state.transcriptHydrationEntries;
+  const order = state.transcriptHydrationOrder;
+  if (
+    state.transcriptHydrationThreadId !== session?.active_thread_id
+    || !(entries instanceof Map)
+    || !Array.isArray(order)
+    || !order.length
+  ) {
+    return session?.transcript || [];
+  }
+  return order.map((itemId) => entries.get(itemId)).filter(Boolean);
+}
+
+/// Marks that a live delta appended to the loaded window without yet being
+/// reflected in state.session.transcript. The O(n) rebuild that would reflect
+/// it is deferred until settleTranscriptProjection actually runs, so a burst
+/// of deltas costs one rebuild instead of one per delta.
+export function markTranscriptWindowProjectionPending(state) {
+  state.transcriptWindowProjectionPending = true;
+}
+
+/// Idempotently materialise any pending window projection into
+/// state.session.transcript. Cheap when nothing is pending; safe to call
+/// re-entrantly or from many call sites (flush start, the renderSession
+/// chokepoint, or any path about to read/rewrite the transcript array) since
+/// it always re-derives from the CURRENT window rather than trusting a
+/// remembered array reference. That matters because array-identity
+/// detection (the bug this replaces) has a blind spot: a write that rebuilds
+/// the array — e.g. a transcript_entry_patch reducer — produces a new
+/// reference every time, so identity comparison misses on exactly the case
+/// it needs to catch. Settling before every read closes that gap: by the
+/// time a patch reads the array to rebuild it, the pending delta is already
+/// baked in and rides along in the patch's own rebuild.
+///
+/// Returns whether it materialised anything, so a caller holding a
+/// session-shaped copy (spread from state.session before this ran) knows
+/// whether it needs to fold the freshly-settled transcript back in.
+export function settleTranscriptProjection(state) {
+  if (!state?.transcriptWindowProjectionPending || !state.session) {
+    return false;
+  }
+  state.transcriptWindowProjectionPending = false;
+  const threadId = state.session.active_thread_id || null;
+  if (!transcriptWindowIsLoaded(state, threadId)) {
+    return false;
+  }
+  __recordTranscriptFullRebuild();
+  state.session = {
+    ...state.session,
+    transcript: renderedTranscriptFromWindow(state, state.session),
+  };
+  return true;
+}

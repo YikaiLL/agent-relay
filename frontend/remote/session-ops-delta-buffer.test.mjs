@@ -686,6 +686,7 @@ test("local and remote surfaces produce the same transcript text for the same de
   activeBrowser || installBrowserStubs();
 
   const { createStreamController } = await import("../local/session/stream.js");
+  const { settleTranscriptProjection } = await import("../local/transcript/store.js");
   const { createTranscriptFlushScheduler } = await import("../shared/transcript-flush-scheduler.js");
   const { state: remoteState } = await import("./state.js");
   const {
@@ -705,9 +706,10 @@ test("local and remote surfaces produce the same transcript text for the same de
     },
   };
   let localController;
-  function renderSessionAndClearPendingFlush(session) {
+  function renderSessionAndClearPendingFlush(_session) {
     localScheduler.cancel();
-    return localController.projectTranscriptWindowIfPending(session);
+    settleTranscriptProjection(localState);
+    return localState.session;
   }
   const localScheduler = createTranscriptFlushScheduler({
     render: () => {

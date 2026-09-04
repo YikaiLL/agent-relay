@@ -1,7 +1,7 @@
 // Perf regression, shaped like transcript-hydration-perf.test.mjs: the delta
 // path used to derive the rendered transcript array from the hydration
 // window (order.map(...).filter(Boolean), O(n) in the loaded window) once
-// PER TOKEN. That projection is now deferred to projectTranscriptWindowIfPending,
+// PER TOKEN. That projection is now deferred to settleTranscriptProjection,
 // so it runs once per flush regardless of how many tokens streamed in between
 // or how large the loaded window is. Counters, not wall time.
 
@@ -13,6 +13,7 @@ import {
   __readTranscriptFullRebuildCount,
   __resetTranscriptFullRebuildCount,
 } from "./stream.js";
+import { settleTranscriptProjection } from "../transcript/store.js";
 
 const THREAD = "thread-1";
 const BODY = "x".repeat(120);
@@ -83,9 +84,9 @@ function streamToken(controller, tick) {
 }
 
 // Mirrors session-controller.js's ctx.renderSession wrapper: a "flush" here
-// is calling the projection with the CURRENT session and keeping the result.
-function flush(controller, state) {
-  state.session = controller.projectTranscriptWindowIfPending(state.session);
+// is settling any pending window projection directly into state.session.
+function flush(_controller, state) {
+  settleTranscriptProjection(state);
 }
 
 test("the delta path never rebuilds before a flush, and rebuilds exactly once per flush, independent of window size", () => {

@@ -124,6 +124,43 @@ test("flushNow brings a queued render forward and renders exactly once — no du
   assert.deepEqual(renders, ["delta", "authoritative snapshot"]);
 });
 
+// The settle primitive this scheduler is paired with (session-controller.js's
+// renderSessionAndClearPendingFlush / cancelPendingTranscriptFlush) calls
+// scheduler.cancel() itself, from INSIDE the render() callback the
+// scheduler's own flush invokes — runFlush already cleared the timer and
+// bumped generation before calling render(), so this is a real re-entrant
+// call, not a hypothetical one. It must be inert (isPending() is already
+// false), and must not leave the generation counter or pending slot in a
+// state where the NEXT schedule silently fails to fire.
+test("a nested cancel() from inside the render callback does not corrupt the pending slot or generation counter for the next schedule", () => {
+  const clock = createManualClock();
+  let renderCount = 0;
+  const scheduler = createTranscriptFlushScheduler({
+    render: () => {
+      renderCount += 1;
+      scheduler.cancel();
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    isHidden: () => false,
+  });
+
+  scheduler.queue("transcript_entry_delta");
+  clock.tick(scheduler.stats().windowMs);
+
+  assert.equal(renderCount, 1, "the flush must have rendered exactly once");
+  assert.equal(scheduler.stats().pending, false, "the re-entrant cancel must not leave anything scheduled");
+
+  // A fresh schedule after the re-entrant cancel must still fire normally —
+  // proving the generation counter was not double-bumped into mismatching
+  // the timer callback's captured `scheduledGeneration`.
+  scheduler.queue("transcript_entry_delta");
+  assert.equal(scheduler.stats().pending, true, "a new schedule after the re-entrant cancel must still arm a timer");
+  clock.tick(scheduler.stats().windowMs);
+  assert.equal(renderCount, 2, "the second flush must actually fire");
+});
+
 test("cancelling a queued render invalidates it, even if the host fails to clear the real timer", () => {
   const scheduledCallbacks = [];
   let renderCount = 0;
@@ -240,6 +277,58 @@ test("a stretched window survives the very next queue() instead of immediately r
     scheduler.stats().windowMs,
     TRANSCRIPT_FLUSH_MAX_WINDOW_MS,
     "the next queue() must not decay before a render proves itself fast enough at 300ms"
+  );
+});
+
+// P1 regression: `renderOutlastedWindow` used to be re-derived by comparing
+// `lastRenderDurationMs` against `windowMs` captured at the START of the very
+// flush being measured — which is itself last flush's OUTPUT, not a fixed
+// reference point. A steady 150ms render then oscillates: flush 1 measures
+// against the 100ms floor (150 > 100, stretches to 300); flush 2 measures the
+// SAME 150ms render against the 300ms it just got handed (150 > 300 is
+// false, decays back to 100); flush 3 is back to measuring against 100
+// again. Asserting only `stats().windowMs` after a single flush (the
+// existing tests above) cannot catch this — it takes three consecutive
+// schedules, and inspecting the actual delay handed to `setTimer` rather
+// than a value read back out of the scheduler, to see the flip-flop.
+test("a persistently slow render stays stretched across three consecutive schedules — the delay handed to setTimer never decays back to 100", () => {
+  const requestedDelays = [];
+  let pendingCallback = null;
+  let elapsed = 0;
+  const scheduler = createTranscriptFlushScheduler({
+    // A STEADY 150ms render, every single flush — never gets any faster.
+    render: () => {
+      elapsed += 150;
+    },
+    now: () => elapsed,
+    setTimer: (callback, delayMs) => {
+      requestedDelays.push(delayMs);
+      pendingCallback = callback;
+      return requestedDelays.length;
+    },
+    clearTimer: () => {
+      pendingCallback = null;
+    },
+    isHidden: () => false,
+  });
+
+  function fireNextTimer() {
+    const callback = pendingCallback;
+    pendingCallback = null;
+    callback();
+  }
+
+  scheduler.queue("transcript_entry_delta");
+  fireNextTimer(); // flush 1: renders inside the initial 100ms window
+  scheduler.queue("transcript_entry_delta");
+  fireNextTimer(); // flush 2: still 150ms — must have stretched to 300
+  scheduler.queue("transcript_entry_delta");
+  fireNextTimer(); // flush 3: still 150ms — must NOT have decayed back to 100
+
+  assert.deepEqual(
+    requestedDelays,
+    [100, 300, 300],
+    "a render that never gets faster than 150ms must stay stretched at 300 once it has stretched once"
   );
 });
 
