@@ -407,10 +407,16 @@ export function applyTranscriptDelta({
   // The rule: write the window only when it is loaded for THIS delta's own
   // thread — never assume the pin's thread and the window's thread agree
   // (projectRemoteViewedSession resets `transcript` on exactly that
-  // mismatch). Otherwise take the array fallback, synchronously — like local
-  // does when unhydrated, and bounded for the same reason
-  // (max_transcript_entries caps what an unloaded transcript can hold; see
-  // .sealwire/PLAN.md, "Why the window is loaded when it matters").
+  // mismatch). Otherwise take the array fallback below — an O(n) find/scan
+  // over `transcript`, same as local's own unhydrated fallback. This is NOT
+  // the per-token hot path this sub-task removes: the window loads (flipping
+  // this to the O(1) branch) the moment the relay marks the thread
+  // `transcript_truncated`, which it does as soon as the thread's own stored
+  // transcript exceeds `max_transcript_entries` (6 remote — see
+  // crates/relay-server/src/protocol.rs:467, :846-849) — a bound that, once
+  // crossed, never un-crosses, since a thread's history only grows. So this
+  // branch's `n` is capped at 6 by construction; see .sealwire/PLAN.md, "Why
+  // the window is loaded when it matters".
   const windowLoaded = transcriptWindowIsLoaded(state, currentThreadId);
   const viewedThreadId = commit === commitViewedSession ? (currentThreadId || thread_id) : null;
 
@@ -572,6 +578,8 @@ function commitTranscriptDeltaAppend({
 
 // The no-window fallback: rebuild the array for just this one entry,
 // synchronously — the array-path twin of appendTranscriptDeltaToWindow.
+// O(n) in transcript length, but n is capped at 6 while this branch can run
+// at all — see the windowLoaded comment in applyTranscriptDelta above.
 function applyArrayTranscriptDeltaAppend(session, { item_id, turn_id, entry_seq, resolvedKind, appendText }) {
   const transcript = session.transcript;
   const entryIndex = transcript.findIndex((entry) => entry?.item_id === item_id);
@@ -1275,6 +1283,13 @@ function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null 
   // track this item — see applyTranscriptPatchOverlay.
   applyEntryPatchToWindow(state, currentThreadId, entryPatch);
   const entryIndex = currentSession.transcript.findIndex((entry) => entry.item_id === itemId);
+  // applyEntryPatchToWindow just no-op'd when true: the window is loaded but
+  // has never tracked this item, so the array append below would otherwise be
+  // the ONLY place it exists — not durable, since a later delta for some
+  // OTHER item re-arms the pending projection, and settling it rebuilds the
+  // whole array from the window (settleTranscriptProjection), which never
+  // heard of this one. Resolved below, once nextSession exists.
+  const patchIntroducesUntrackedItem = entryIndex < 0 && transcriptWindowIsLoaded(state, currentThreadId);
   const nextTranscript = entryIndex >= 0
     ? currentSession.transcript.map((entry, index) => {
         if (index !== entryIndex) {
@@ -1309,6 +1324,22 @@ function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null 
   }
   if (Number.isSafeInteger(event.server_time)) {
     nextSession.server_time = event.server_time;
+  }
+  if (patchIntroducesUntrackedItem) {
+    // Sync the window from nextSession — NOT currentSession: hydration's own
+    // tail merge (createMergedSnapshotTailPatch, run unconditionally by
+    // prepareTranscriptHydrationState whenever this thread's window has
+    // visible entries) folds a snapshot's own transcript array into the
+    // window, adding any id not yet in `order`. Passing the stale array would
+    // merge nothing new and — because "more authoritative wins" — would also
+    // promote every existing entry straight back to `full`, undoing an
+    // invalidation for nothing. Passing nextSession lets that same merge pick
+    // up this item directly, which is the general "hydration/snapshot merges
+    // may write the window" case the plan already sanctions (.sealwire/PLAN.md,
+    // "Invalidate; do not write"), rather than a bespoke append. Mirrors
+    // local's applyLocalTranscriptEntryPatch (local/session/stream.js), which
+    // reaches the same place by calling ensureConversationTranscript.
+    void hydrateActiveTranscript(nextSession);
   }
   // A patch that leaves the entry "running" is a routine update on an
   // in-flight stream and coalesces with the delta path; anything else

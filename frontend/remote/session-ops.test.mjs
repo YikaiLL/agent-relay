@@ -5603,6 +5603,77 @@ test("applyTranscriptEntryPatch writes the window, not just the array — the pa
   assert.equal(state.session.transcript.find((entry) => entry.item_id === "item-2")?.status, "completed");
 });
 
+// P1: a completion patch introducing an item the loaded window has never
+// tracked used to write ONLY the array. The very next delta for a DIFFERENT,
+// already window-tracked item re-arms the deferred projection, and settling
+// it rebuilds the array purely from the window (settleTranscriptProjection)
+// — which never heard of the patched item, so it silently vanished.
+test("a completion patch for an item a LOADED window has never seen is absorbed into the window, so a later delta's settle does not drop it", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await import("./state.js");
+  const { applyTranscriptDelta, applyTranscriptEvent, clearSessionRuntime, flushRemoteTranscriptRenderForTest } =
+    await import("./session-ops.js");
+
+  clearSessionRuntime();
+  state.realSession = state.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 1,
+    // The window is only ever loaded because an earlier snapshot already
+    // said this thread was truncated — true in practice for as long as the
+    // window stays loaded, since the relay's own truncation flag never
+    // clears once a thread's real history exceeds the budget.
+    transcript_truncated: true,
+    transcript: [
+      { item_id: "item-1", kind: "agent_text", status: "completed", text: "Hello", turn_id: "turn-1", tool: null },
+    ],
+  };
+  state.socket = null;
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([
+    ["item-1", { ...state.session.transcript[0], content_state: "full" }],
+  ]);
+  state.transcriptHydrationOrder = ["item-1"];
+
+  // A completion patch introduces item-2, which the window has never tracked.
+  applyTranscriptEvent({
+    kind: "transcript_entry_completed",
+    thread_id: "thread-1",
+    item_id: "item-2",
+    entry_kind: "agent_text",
+    text: "brand new",
+    turn_id: "turn-2",
+    revision: 2,
+  });
+
+  assert.ok(
+    state.session.transcript.some((entry) => entry.item_id === "item-2"),
+    "the new entry must still be visible right away"
+  );
+  assert.ok(
+    state.transcriptHydrationOrder.includes("item-2"),
+    "the window must pick up the new item directly, not just the array"
+  );
+
+  // A delta for item-1 (already window-tracked) re-arms the deferred
+  // projection; flushing settles it by rebuilding the array purely from the
+  // window. Before the fix, item-2 was never in the window, so this step
+  // silently dropped it.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "!",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  flushRemoteTranscriptRenderForTest();
+
+  assert.ok(
+    state.session.transcript.some((entry) => entry.item_id === "item-2"),
+    "the patch-introduced item must survive a later delta's settle, not just the first render"
+  );
+});
+
 // P1: applyTranscriptEntryPatch merged patchedEntry into the window with
 // content_state forced to "full" unconditionally — including for a
 // status-only completion (no text field at all). For an item whose real body
