@@ -168,6 +168,49 @@ test("embedded detail uses the vertical role flow, not the three-up seats", () =
   assert.doesNotMatch(html, /All tasks/);
 });
 
+test("role flow does not paint placeholder em-dashes when there is no token estimate", () => {
+  // Observed: every seat showed a lone "—" on the far right of the embedded
+  // pane — a missing estimate rendered as punctuation, not as absence. Only a
+  // real number belongs in that slot.
+  const html = renderToStaticMarkup(
+    h(TaskDetail, {
+      run: run({ sub_tasks: [subTask()] }),
+      embedded: true,
+    })
+  );
+  assert.doesNotMatch(html, /team-role-estimate/);
+  assert.doesNotMatch(
+    html,
+    /team-role-head[\s\S]*?—/,
+    "no em-dash placeholder beside the role name"
+  );
+});
+
+test("the Orchestrator header carries a sidebar expand control for the tasks view", () => {
+  // Sessions put the expand-back control in the chat header when the sidebar is
+  // collapsed. The tasks view hides that header entirely (`chat-shell[data-view=
+  // "tasks"] > * { display:none }`), so without a twin here a collapsed sidebar
+  // on Tasks has no way to reopen — only the icon rail remains.
+  const html = renderToStaticMarkup(
+    h(TaskTeamScreen, {
+      runs: [run()],
+      selectedRunId: null,
+      orchestrator: { entries: [], onSend: () => {} },
+    })
+  );
+  assert.match(html, /id="tasks-sidebar-toggle"/);
+  assert.match(html, /Hide navigation panel|Show navigation panel|navigation panel/);
+});
+
+test("a locked Tasks screen still carries the sidebar expand control", () => {
+  // Public / non-beta builds return TaskLockedPreview before OrchestratorPane.
+  // The reopen control has to live on that preview too, or collapsing the
+  // sidebar on locked Tasks leaves no on-screen way back.
+  const html = renderToStaticMarkup(h(TaskTeamScreen, { locked: true }));
+  assert.match(html, /id="tasks-sidebar-toggle"/);
+  assert.match(html, /Tasks is in development/);
+});
+
 test("the diagram renders exactly three seats, in team order", () => {
   const html = renderToStaticMarkup(
     h(TeamDiagram, { run: run({ sub_tasks: [subTask()] }) })
@@ -268,7 +311,7 @@ test("a task still loading is not reported as gone", () => {
   assert.doesNotMatch(html, /That task is gone/);
 });
 
-test("the workspace keeps Orchestrator centre and detail on the right", () => {
+test("the workspace puts task detail in the middle and Orchestrator on the right", () => {
   const html = renderToStaticMarkup(
     h(TaskTeamScreen, {
       runs: [
@@ -282,12 +325,18 @@ test("the workspace keeps Orchestrator centre and detail on the right", () => {
       waitingCount: 1,
     })
   );
-  assert.match(html, /task-workspace-center/);
-  assert.match(html, /task-workspace-right/);
+  assert.match(html, /task-workspace-detail/);
+  assert.match(html, /task-workspace-orch/);
+  assert.match(html, /id="task-workspace-resize"/);
   assert.match(html, /Orchestrator/);
   assert.match(html, /1 waiting on you/);
   assert.match(html, /Paused for a decision/);
   assert.match(html, /Add a parser/);
+  // Detail precedes Orchestrator in DOM — middle then right.
+  assert.ok(
+    html.indexOf("task-workspace-detail") < html.indexOf("task-workspace-orch"),
+    "task detail must sit before the Orchestrator column"
+  );
   // List is in the app sidebar — embedded detail has no "All tasks" back control.
   assert.doesNotMatch(html, /All tasks/);
 });
@@ -429,10 +478,18 @@ test("the Orchestrator composer is live when a send handler is wired", () => {
   assert.match(html, />Send</);
 });
 
-test("with nothing selected the right pane stays empty and the centre welcomes", () => {
+test("with nothing selected the detail pane stays empty and the Orchestrator welcomes", () => {
   const html = renderToStaticMarkup(h(TaskTeamScreen, { runs: [run()], selectedRunId: null }));
   assert.match(html, /Ask the Orchestrator/);
   assert.match(html, /No task selected/);
+});
+
+test("Orchestrator idle copy points at task detail on the left after the column swap", () => {
+  const html = renderToStaticMarkup(
+    h(TaskTeamScreen, { runs: [run()], selectedRunId: "team-1" })
+  );
+  assert.match(html, /seats and branch are on the left/);
+  assert.doesNotMatch(html, /seats and branch are on the right/);
 });
 
 test("sub-task rounds and summaries surface, but never the brief", () => {

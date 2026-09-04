@@ -307,6 +307,256 @@ test("mobile environment suppresses drag (isMobile guard)", async () => {
   }
 });
 
+test("collapsible:false never snaps to 0 on drag-release below CLOSE_THRESHOLD", async () => {
+  setupEnv();
+  try {
+    const createPanelControl = await importControl();
+    const control = createPanelControl({
+      cssVarName: "--task-orch-panel-width",
+      widthStorageKey: STORAGE_WIDTH,
+      openWidthStorageKey: STORAGE_OPEN,
+      minOpenWidth: 320,
+      maxOpenWidth: 720,
+      defaultOpenWidth: 440,
+      side: "right",
+      collapsible: false,
+    });
+    const handle = makeFakeHandle();
+    control.attachResizeHandle(handle);
+    handle.dispatch("pointerdown", { pointerId: 1, clientX: 800 });
+    // Drag toward collapse (right panel: increase clientX shrinks width).
+    handle.dispatch("pointermove", { clientX: 1200 });
+    handle.dispatch("pointerup", {});
+    assert.equal(
+      control.getWidth(),
+      320,
+      "non-collapsible panels must floor at minOpenWidth, not 0"
+    );
+    assert.equal(control.isOpen(), true);
+  } finally {
+    teardown();
+  }
+});
+
+test("collapsible:false Enter/Space resets to default instead of collapsing", async () => {
+  setupEnv({ savedWidth: 500, savedOpen: 500 });
+  try {
+    const createPanelControl = await importControl();
+    const control = createPanelControl({
+      cssVarName: "--task-orch-panel-width",
+      widthStorageKey: STORAGE_WIDTH,
+      openWidthStorageKey: STORAGE_OPEN,
+      minOpenWidth: 320,
+      maxOpenWidth: 720,
+      defaultOpenWidth: 440,
+      side: "right",
+      collapsible: false,
+    });
+    const handle = makeFakeHandle();
+    control.attachResizeHandle(handle);
+    handle.dispatch("keydown", { key: "Enter" });
+    assert.equal(control.getWidth(), 440);
+    handle.dispatch("keydown", { key: " " });
+    assert.equal(control.getWidth(), 440);
+    assert.equal(control.isOpen(), true);
+  } finally {
+    teardown();
+  }
+});
+
+test("collapsible:false boots past a persisted zero width", async () => {
+  setupEnv({ savedWidth: 0, savedOpen: 500 });
+  try {
+    const createPanelControl = await importControl();
+    const control = createPanelControl({
+      cssVarName: "--task-orch-panel-width",
+      widthStorageKey: STORAGE_WIDTH,
+      openWidthStorageKey: STORAGE_OPEN,
+      minOpenWidth: 320,
+      maxOpenWidth: 720,
+      defaultOpenWidth: 440,
+      side: "right",
+      collapsible: false,
+    });
+    assert.equal(
+      control.getWidth(),
+      500,
+      "a stored 0 must restore the last open width when collapse is disallowed"
+    );
+  } finally {
+    teardown();
+  }
+});
+
+test("resolveMaxOpenWidth caps setWidth and drag so CSS and controller stay aligned", async () => {
+  setupEnv({ savedWidth: 440, savedOpen: 440 });
+  try {
+    const createPanelControl = await importControl();
+    let containerHalf = 350;
+    const control = createPanelControl({
+      cssVarName: "--task-orch-panel-width",
+      widthStorageKey: STORAGE_WIDTH,
+      openWidthStorageKey: STORAGE_OPEN,
+      minOpenWidth: 320,
+      maxOpenWidth: 720,
+      defaultOpenWidth: 440,
+      side: "right",
+      collapsible: false,
+      resolveMaxOpenWidth: () => containerHalf,
+    });
+    control.reclampToContainer();
+    assert.equal(control.getWidth(), 350, "must clamp displayed width down to container half");
+    assert.equal(control.getPreferredWidth(), 440, "preferred width stays at the saved value");
+
+    // Widen: preferred returns. Drag starts from 440 (not a stale uncapped /
+    // capped mismatch), so the first pixel of motion moves the divider.
+    containerHalf = 500;
+    control.reclampToContainer();
+    assert.equal(control.getWidth(), 440);
+
+    const handle = makeFakeHandle();
+    control.attachResizeHandle(handle);
+    handle.dispatch("pointerdown", { pointerId: 1, clientX: 1000 });
+    handle.dispatch("pointermove", { clientX: 960 });
+    handle.dispatch("pointerup", {});
+    assert.equal(control.getWidth(), 480);
+  } finally {
+    teardown();
+  }
+});
+
+test("reclampToContainer is temporary and restores the preferred width when space returns", async () => {
+  const { store } = setupEnv({ savedWidth: 600, savedOpen: 600 });
+  try {
+    const createPanelControl = await importControl();
+    let containerHalf = 320;
+    const control = createPanelControl({
+      cssVarName: "--task-orch-panel-width",
+      widthStorageKey: STORAGE_WIDTH,
+      openWidthStorageKey: STORAGE_OPEN,
+      minOpenWidth: 320,
+      maxOpenWidth: 720,
+      defaultOpenWidth: 440,
+      side: "right",
+      collapsible: false,
+      resolveMaxOpenWidth: () => containerHalf,
+    });
+    control.reclampToContainer();
+    assert.equal(control.getWidth(), 320);
+    assert.equal(store.get(STORAGE_WIDTH), "600", "narrow clamp must not rewrite width storage");
+    assert.equal(store.get(STORAGE_OPEN), "600", "narrow clamp must not rewrite open-width storage");
+
+    containerHalf = 700;
+    control.reclampToContainer();
+    assert.equal(
+      control.getWidth(),
+      600,
+      "widening must restore the preferred width, not the temporary clamp"
+    );
+    assert.equal(store.get(STORAGE_WIDTH), "600");
+  } finally {
+    teardown();
+  }
+});
+
+test("no-op pointerdown/up under a container cap keeps the preferred width", async () => {
+  const { store } = setupEnv({ savedWidth: 600, savedOpen: 600 });
+  try {
+    const createPanelControl = await importControl();
+    const control = createPanelControl({
+      cssVarName: "--task-orch-panel-width",
+      widthStorageKey: STORAGE_WIDTH,
+      openWidthStorageKey: STORAGE_OPEN,
+      minOpenWidth: 320,
+      maxOpenWidth: 720,
+      defaultOpenWidth: 440,
+      side: "right",
+      collapsible: false,
+      resolveMaxOpenWidth: () => 350,
+    });
+    const handle = makeFakeHandle();
+    control.attachResizeHandle(handle);
+    handle.dispatch("pointerdown", { pointerId: 1, clientX: 1000 });
+    handle.dispatch("pointerup", {});
+    assert.equal(control.getWidth(), 350);
+    assert.equal(control.getPreferredWidth(), 600);
+    assert.equal(store.get(STORAGE_WIDTH), "600");
+    assert.equal(store.get(STORAGE_OPEN), "600");
+  } finally {
+    teardown();
+  }
+});
+
+test("drag toward a capped maximum does not shrink the preferred width", async () => {
+  const { store } = setupEnv({ savedWidth: 600, savedOpen: 600 });
+  try {
+    const createPanelControl = await importControl();
+    const control = createPanelControl({
+      cssVarName: "--task-orch-panel-width",
+      widthStorageKey: STORAGE_WIDTH,
+      openWidthStorageKey: STORAGE_OPEN,
+      minOpenWidth: 320,
+      maxOpenWidth: 720,
+      defaultOpenWidth: 440,
+      side: "right",
+      collapsible: false,
+      resolveMaxOpenWidth: () => 350,
+    });
+    const handle = makeFakeHandle();
+    control.attachResizeHandle(handle);
+    // Right panel: decrease clientX tries to grow; painted stays at 350.
+    handle.dispatch("pointerdown", { pointerId: 1, clientX: 1000 });
+    handle.dispatch("pointermove", { clientX: 900 });
+    handle.dispatch("pointerup", {});
+    assert.equal(control.getWidth(), 350);
+    assert.equal(control.getPreferredWidth(), 600);
+    assert.equal(store.get(STORAGE_OPEN), "600");
+  } finally {
+    teardown();
+  }
+});
+
+test("double-click and Enter under a cap remember the default, not the painted floor", async () => {
+  const { store } = setupEnv({ savedWidth: 600, savedOpen: 600 });
+  try {
+    const createPanelControl = await importControl();
+    let containerHalf = 350;
+    const control = createPanelControl({
+      cssVarName: "--task-orch-panel-width",
+      widthStorageKey: STORAGE_WIDTH,
+      openWidthStorageKey: STORAGE_OPEN,
+      minOpenWidth: 320,
+      maxOpenWidth: 720,
+      defaultOpenWidth: 440,
+      side: "right",
+      collapsible: false,
+      resolveMaxOpenWidth: () => containerHalf,
+    });
+    const handle = makeFakeHandle();
+    control.attachResizeHandle(handle);
+    handle.dispatch("dblclick", {});
+    assert.equal(control.getWidth(), 350, "paint stays capped");
+    assert.equal(control.getPreferredWidth(), 440, "preference becomes the default");
+    assert.equal(store.get(STORAGE_OPEN), "440");
+
+    containerHalf = 700;
+    control.reclampToContainer();
+    assert.equal(control.getWidth(), 440, "widening reveals the default preference");
+
+    // Reset preference high, then Enter under the cap again.
+    containerHalf = 350;
+    control.setWidth(600);
+    handle.dispatch("keydown", { key: "Enter" });
+    assert.equal(control.getPreferredWidth(), 440);
+    assert.equal(control.getWidth(), 350);
+    containerHalf = 700;
+    control.reclampToContainer();
+    assert.equal(control.getWidth(), 440);
+  } finally {
+    teardown();
+  }
+});
+
 // --- minimal DOM stubs ----------------------------------------------------
 
 function makeFakeHandle() {

@@ -1,5 +1,5 @@
 // The Task screen: full-area view of team runs, laid out like mockup 12b —
-// list in the app sidebar, Orchestrator centre, task detail on the right.
+// list in the app sidebar, task detail in the middle, Orchestrator on the right.
 //
 // Presentational only. Every piece of data is a prop and every mutation is a
 // callback; fetching, caching and navigation live in the caller. Mirrors the
@@ -15,6 +15,8 @@ import { createVerbCycler, progressPhaseLabel, VERB_CYCLE_MS } from "../progress
 // The remote pair, not `app.js`'s private copies: these take an injectable
 // clock, which is the only reason a scheduled card is testable at a fixed hour.
 import { formatRelativeTime, formatTimestamp } from "../remote/utils.js";
+import { ToggleLeftPanelIcon } from "./panel-icons.js";
+import { bindTaskWorkspaceResizeHandle } from "./task-workspace-resize.js";
 import { TranscriptPane } from "./transcript-pane.js";
 import {
   availableTeamActions,
@@ -83,6 +85,26 @@ function StatusPill({ status }) {
 // ---- the beta lock ---------------------------------------------------------
 
 /**
+ * Sessions put this control in the chat header when the sidebar collapses.
+ * Tasks hides that header, so the twin lives on the Tasks surface — both the
+ * Orchestrator pane and the locked preview, which never mounts the pane.
+ * CSS shows it only while `body.sidebar-collapsed` is set on the tasks view.
+ */
+function TasksSidebarToggle() {
+  return h(
+    "button",
+    {
+      type: "button",
+      id: "tasks-sidebar-toggle",
+      className: "header-button header-panel-toggle tasks-sidebar-toggle",
+      title: "Show navigation panel (\u2318B)",
+      "aria-label": "Show navigation panel",
+    },
+    h(ToggleLeftPanelIcon)
+  );
+}
+
+/**
  * What the Task screen looks like on a relay without `--beta`.
  *
  * The skeleton is invented — no datum here comes from the relay, and the caller
@@ -104,6 +126,7 @@ function TaskLockedPreview() {
   return h(
     "div",
     { className: "task-screen task-screen-centered task-locked" },
+    h("header", { className: "task-locked-chrome" }, h(TasksSidebarToggle)),
     h(
       "div",
       { className: "task-locked-scenery", "aria-hidden": "true" },
@@ -332,7 +355,7 @@ export function OrchestratorPane({
       h(
         "p",
         { className: "task-welcome-lede" },
-        `${teamStatusLabel(selectedRun.status)}. The seats and branch are on the right.`
+        `${teamStatusLabel(selectedRun.status)}. The seats and branch are on the left.`
       )
     );
   } else {
@@ -345,6 +368,7 @@ export function OrchestratorPane({
     h(
       "header",
       { className: "task-orch-header" },
+      h(TasksSidebarToggle),
       h("div", { className: "task-orch-brand" }, h("span", { className: "task-orch-mark" }, "S"), "Orchestrator"),
       waitingCount > 0
         ? h("span", { className: "task-orch-waiting" }, `${waitingCount} waiting on you`)
@@ -1087,11 +1111,9 @@ export function TeamRoleFlow({ run, onOpenThread, tokenByRole = null }) {
                 : { className: "team-role-name" },
               seat.label
             ),
-            h(
-              "span",
-              { className: "team-role-estimate" },
-              tokens != null ? tokens : "—"
-            )
+            tokens != null
+              ? h("span", { className: "team-role-estimate" }, tokens)
+              : null
           ),
           h("p", { className: "team-role-blurb" }, seat.subTaskTitle || note)
         )
@@ -1372,6 +1394,25 @@ export function TaskDetail({
 
 // ---- the screen ------------------------------------------------------------
 
+/**
+ * Drag handle on the Orchestrator column's left edge. Binds on mount so React
+ * re-renders that replace the node still get a live listener.
+ */
+function TaskWorkspaceResizeHandle() {
+  React.useEffect(() => {
+    const binding = bindTaskWorkspaceResizeHandle();
+    return () => binding?.destroy?.();
+  }, []);
+  return h("div", {
+    className: "task-workspace-resize",
+    id: "task-workspace-resize",
+    role: "separator",
+    "aria-orientation": "vertical",
+    "aria-label": "Resize Orchestrator panel",
+    tabIndex: 0,
+  });
+}
+
 export function TaskTeamScreen({
   runs,
   selectedRunId,
@@ -1412,91 +1453,88 @@ export function TaskTeamScreen({
     selectedRunId && !run && (syncing || (loading && !runs))
   );
 
-  return h(
-    "div",
-    { className: "task-workspace" },
-    h(
-      "div",
-      { className: "task-workspace-center" },
-      h(OrchestratorPane, {
-        runs,
-        selectedRun: run,
-        seenAt,
-        loading,
-        error,
-        waitingCount,
-        onStartTask,
-        onOpenThread,
-        transcriptEntries: orchestrator?.entries ?? null,
-        transcriptLoading: Boolean(orchestrator?.loading),
-        onTranscriptInteract: orchestrator?.onTranscriptInteract || null,
-        transcriptOptions: orchestrator?.transcriptOptions || null,
-        approval: orchestrator?.approval || null,
-        canWrite: orchestrator?.canWrite !== false,
-        composerDisabled: Boolean(orchestrator?.composerDisabled),
-        composerBusy: Boolean(orchestrator?.composerBusy),
-        composerError: orchestrator?.composerError || null,
-        proposals: orchestrator?.proposals || [],
-        onSend: orchestrator?.onSend || null,
-        onPropose: orchestrator?.onPropose || null,
-        onConfirmProposal: orchestrator?.onConfirmProposal || null,
-        onDismissProposal: orchestrator?.onDismissProposal || null,
-        onToggleProposalAutoStart: orchestrator?.onToggleProposalAutoStart || null,
-        onReset: orchestrator?.onReset || null,
-        resetBusy: Boolean(orchestrator?.resetBusy),
-        attachments: orchestrator?.attachments || [],
-        onPasteImages: orchestrator?.onPasteImages || null,
-        onRemoveAttachment: orchestrator?.onRemoveAttachment || null,
-        activity: orchestrator?.activity || null,
-        onStop: orchestrator?.onStop || null,
-        enterSubmits: orchestrator?.enterSubmits,
-      })
-    ),
-    h(
-      "aside",
-      { className: "task-workspace-right", "aria-label": "Task detail" },
-      waitingOnFetch
-        ? h(
+  const detailPane = h(
+    "aside",
+    { className: "task-workspace-detail", "aria-label": "Task detail" },
+    waitingOnFetch
+      ? h(
+          "div",
+          { className: "task-screen task-screen-centered is-embedded" },
+          h("div", { className: "task-screen-empty" }, h("p", null, "Loading task…"))
+        )
+      : selectedRunId
+        ? h(TaskDetail, {
+            run,
+            onBack,
+            onOpenThread,
+            onAction,
+            actionPending,
+            actionError,
+            changesPanel,
+            embedded: true,
+            capacity: capacity || { parallelUsed: "—", parallelCap: "—", todayLabel: "Today —" },
+          })
+        : h(
             "div",
-            { className: "task-screen task-screen-centered is-embedded" },
-            h("div", { className: "task-screen-empty" }, h("p", null, "Loading task…"))
-          )
-        : selectedRunId
-          ? h(TaskDetail, {
-              run,
-              onBack,
-              onOpenThread,
-              onAction,
-              actionPending,
-              actionError,
-              changesPanel,
-              embedded: true,
-              capacity: capacity || { parallelUsed: "—", parallelCap: "—", todayLabel: "Today —" },
-            })
-          : h(
+            { className: "task-screen is-embedded task-workspace-empty" },
+            h(
               "div",
-              { className: "task-screen is-embedded task-workspace-empty" },
+              { className: "task-capacity-line" },
               h(
-                "div",
-                { className: "task-capacity-line" },
-                h(
-                  "span",
-                  null,
-                  `Parallel ${capacity?.parallelUsed ?? "—"}/${capacity?.parallelCap ?? "—"}`
-                ),
-                h(
-                  "span",
-                  null,
-                  ` · ${capacity?.todayLabel || "Today —"}`
-                )
+                "span",
+                null,
+                `Parallel ${capacity?.parallelUsed ?? "—"}/${capacity?.parallelCap ?? "—"}`
               ),
-              h(
-                "div",
-                { className: "task-screen-empty" },
-                h("h3", null, "No task selected"),
-                h("p", null, "Pick one on the left to see its seats and branch.")
-              )
+              h("span", null, ` · ${capacity?.todayLabel || "Today —"}`)
+            ),
+            h(
+              "div",
+              { className: "task-screen-empty" },
+              h("h3", null, "No task selected"),
+              h("p", null, "Pick one on the left to see its seats and branch.")
             )
-    )
+          )
   );
+
+  const orchPane = h(
+    "div",
+    { className: "task-workspace-orch" },
+    h(TaskWorkspaceResizeHandle),
+    h(OrchestratorPane, {
+      runs,
+      selectedRun: run,
+      seenAt,
+      loading,
+      error,
+      waitingCount,
+      onStartTask,
+      onOpenThread,
+      transcriptEntries: orchestrator?.entries ?? null,
+      transcriptLoading: Boolean(orchestrator?.loading),
+      onTranscriptInteract: orchestrator?.onTranscriptInteract || null,
+      transcriptOptions: orchestrator?.transcriptOptions || null,
+      approval: orchestrator?.approval || null,
+      canWrite: orchestrator?.canWrite !== false,
+      composerDisabled: Boolean(orchestrator?.composerDisabled),
+      composerBusy: Boolean(orchestrator?.composerBusy),
+      composerError: orchestrator?.composerError || null,
+      proposals: orchestrator?.proposals || [],
+      onSend: orchestrator?.onSend || null,
+      onPropose: orchestrator?.onPropose || null,
+      onConfirmProposal: orchestrator?.onConfirmProposal || null,
+      onDismissProposal: orchestrator?.onDismissProposal || null,
+      onToggleProposalAutoStart: orchestrator?.onToggleProposalAutoStart || null,
+      onReset: orchestrator?.onReset || null,
+      resetBusy: Boolean(orchestrator?.resetBusy),
+      attachments: orchestrator?.attachments || [],
+      onPasteImages: orchestrator?.onPasteImages || null,
+      onRemoveAttachment: orchestrator?.onRemoveAttachment || null,
+      activity: orchestrator?.activity || null,
+      onStop: orchestrator?.onStop || null,
+      enterSubmits: orchestrator?.enterSubmits,
+    })
+  );
+
+  // Detail in the middle (1fr), Orchestrator on the right (resizable width).
+  return h("div", { className: "task-workspace" }, detailPane, orchPane);
 }

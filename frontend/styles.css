@@ -667,10 +667,10 @@ body.sidebar-collapsed .icon-rail {
 }
 .app-shell[data-view="tasks"] .right-rail,
 .app-shell[data-view="teams"] .right-rail,
-/* The review screen carries its OWN comment rail, so the app-level one would be
-   a second column about the same session, competing for the width the diff
-   needs. */
 .app-shell[data-view="review"] .right-rail {
+  /* Tasks/teams/review own their secondary panes; the session Changes/Reviewer
+   * rail must not keep a grid track. `display: none` (not visibility) so the
+   * collapsed-sidebar templates below can drop to two columns cleanly. */
   display: none;
 }
 
@@ -1935,6 +1935,9 @@ input:focus, textarea:focus, select:focus {
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
+  /* Size container for stacking when the workspace (not the viewport) is narrow. */
+  container-type: inline-size;
+  container-name: task-main;
 }
 
 /* ===== Merge review — full-area (data-view="review", mockup 15a) ===== */
@@ -1979,17 +1982,64 @@ input:focus, textarea:focus, select:focus {
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
+  container-type: inline-size;
+  container-name: task-main;
 }
 
-/* 12b workspace: list lives in the app sidebar; centre = Orchestrator, right = detail. */
+/* 12b workspace: list in the app sidebar; middle = task detail, right = Orchestrator.
+ * Teams Library reuses `.task-workspace` with `.teams-workspace` and keeps a fixed
+ * detail track — it must not inherit `--task-orch-panel-width`. */
 .task-workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
   gap: 0;
   min-height: 0;
   height: 100%;
   overflow: hidden;
 }
+.task-workspace:not(.teams-workspace) {
+  /* Max width is enforced by task-workspace-resize (half the workspace) so the
+   * CSS var always matches the painted track — no CSS min()/50% dead zone. */
+  grid-template-columns: minmax(0, 1fr) var(--task-orch-panel-width, 440px);
+}
+.task-workspace.teams-workspace {
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+}
+.task-workspace-detail {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--border-faint);
+  background: var(--surface-1);
+}
+.task-workspace-orch {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface-0);
+}
+.task-workspace-resize {
+  position: absolute;
+  top: 0;
+  left: -3px;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  background: transparent;
+  z-index: 5;
+  transition: background-color 120ms ease;
+}
+.task-workspace-resize:hover,
+.task-workspace-resize:focus-visible,
+body.is-resizing-panel .task-workspace-resize {
+  background: var(--accent);
+  outline: none;
+}
+.task-workspace-empty {
+  padding-top: 8px;
+}
+
+/* Teams library still uses the older centre/right class names. */
 .task-workspace-center {
   min-width: 0;
   min-height: 0;
@@ -2002,9 +2052,6 @@ input:focus, textarea:focus, select:focus {
   min-height: 0;
   overflow-y: auto;
   background: var(--surface-1);
-}
-.task-workspace-empty {
-  padding-top: 8px;
 }
 
 .task-orch {
@@ -2020,6 +2067,16 @@ input:focus, textarea:focus, select:focus {
   gap: 12px;
   padding: 16px 20px;
   border-bottom: 1px solid var(--border-faint);
+}
+/* Twin of `.chat-header-collapsed-actions`: Tasks hides the chat header, so the
+   reopen control for a collapsed sidebar has to live on this bar instead. */
+#tasks-sidebar-toggle {
+  display: none;
+  flex: 0 0 auto;
+  margin-right: 2px;
+}
+body.sidebar-collapsed .app-shell[data-view="tasks"] #tasks-sidebar-toggle {
+  display: inline-flex;
 }
 .task-orch-brand {
   display: inline-flex;
@@ -2272,9 +2329,41 @@ input:focus, textarea:focus, select:focus {
 }
 .task-screen.is-embedded {
   padding-bottom: 24px;
+  gap: 14px;
 }
 .task-screen.is-embedded .task-screen-header {
   padding: 16px 20px 14px;
+}
+/* Full-screen detail uses 32px gutters; the embedded right pane is ~320px wide,
+   so the same margins leave a ragged inset against the 20px header. One gutter. */
+.task-screen.is-embedded .task-banner,
+.task-screen.is-embedded .task-actions,
+.task-screen.is-embedded .task-screen-hint,
+.task-screen.is-embedded .task-subtasks,
+.task-screen.is-embedded .task-unresolved,
+.task-screen.is-embedded .task-changes {
+  margin-left: 20px;
+  margin-right: 20px;
+}
+.task-screen.is-embedded .task-capacity-line {
+  padding-left: 20px;
+  padding-right: 20px;
+}
+.task-screen.is-embedded .task-detail-titles {
+  min-width: 0;
+}
+.task-screen.is-embedded .task-screen-title {
+  font-size: var(--text-md);
+  line-height: var(--leading-tight);
+  overflow-wrap: anywhere;
+}
+.task-screen.is-embedded .task-screen-subtitle {
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+.task-screen.is-embedded .task-detail-status {
+  flex: 0 0 auto;
+  align-items: flex-end;
 }
 
 .task-sidebar-groups {
@@ -2302,13 +2391,40 @@ input:focus, textarea:focus, select:focus {
 }
 
 @media (max-width: 900px) {
-  .task-workspace {
+  /* Restate the higher-specificity desktop column selectors — a bare
+   * `.task-workspace` loses to `:not(.teams-workspace)` / `.teams-workspace`
+   * and would leave both panes side-by-side above an empty second row. */
+  .task-workspace:not(.teams-workspace),
+  .task-workspace.teams-workspace {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
   }
+  .task-workspace-detail,
   .task-workspace-center {
     border-right: none;
     border-bottom: 1px solid var(--border-faint);
+  }
+  .task-workspace-resize {
+    display: none;
+  }
+}
+
+/* Wide viewport + wide sidebar can leave <640px for the workspace while the
+ * viewport media still thinks we are "desktop". Stack on the mount's inline
+ * size so a 320px Orchestrator floor cannot crush detail to ~160px. */
+@container task-main (max-width: 639px) {
+  .task-workspace:not(.teams-workspace),
+  .task-workspace.teams-workspace {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .task-workspace-detail,
+  .task-workspace-center {
+    border-right: none;
+    border-bottom: 1px solid var(--border-faint);
+  }
+  .task-workspace-resize {
+    display: none;
   }
 }
 
@@ -5650,6 +5766,18 @@ body.sidebar-collapsed .app-shell[data-view="conversation"] {
 body.sidebar-collapsed .app-shell-with-rail[data-view="conversation"] {
   grid-template-columns: 0 minmax(0, 1fr) var(--right-rail-width);
 }
+/* Tasks / teams / review hide the app right-rail. The generic collapsed rule
+ * above still reserved `--right-rail-width` as a third track, so a collapsed
+ * sidebar on Tasks left a blank strip beside the embedded detail. Drop to two
+ * tracks — same contract as the expanded `data-view` rules further up. */
+body.sidebar-collapsed .app-shell[data-view="tasks"],
+body.sidebar-collapsed .app-shell-with-rail[data-view="tasks"],
+body.sidebar-collapsed .app-shell[data-view="teams"],
+body.sidebar-collapsed .app-shell-with-rail[data-view="teams"],
+body.sidebar-collapsed .app-shell[data-view="review"],
+body.sidebar-collapsed .app-shell-with-rail[data-view="review"] {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
 body.sidebar-collapsed .sidebar {
   opacity: 0;
   visibility: hidden;
@@ -5666,6 +5794,17 @@ body.rail-collapsed.sidebar-collapsed .app-shell-with-rail,
 body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="conversation"] {
   grid-template-columns: 0 minmax(0, 1fr) 0;
 }
+/* Same ghost-track trap when only the (unused) rail-collapsed class is set. */
+body.rail-collapsed .app-shell-with-rail[data-view="tasks"],
+body.rail-collapsed .app-shell-with-rail[data-view="teams"],
+body.rail-collapsed .app-shell-with-rail[data-view="review"] {
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+}
+body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="tasks"],
+body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="teams"],
+body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="review"] {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
 body.rail-collapsed .right-rail {
   opacity: 0;
   visibility: hidden;
@@ -5680,6 +5819,11 @@ body.rail-collapsed .right-rail {
   .chat-header-collapsed-actions,
   .sidebar-top-bar { display: none; }
   body.sidebar-collapsed .chat-header-collapsed-actions { display: none; }
+  /* Same lie as the chat-header left toggle: ≤960px keeps the sidebar visible
+     despite a persisted collapsed width, so "Show navigation panel" must go. */
+  body.sidebar-collapsed .app-shell[data-view="tasks"] #tasks-sidebar-toggle {
+    display: none;
+  }
 
   /* Remote phone surface: the sidebar is a slide-in drawer that doubles as the
    * home screen, so keep the Sealwire brand lockup (logo + wordmark) pinned to
@@ -6608,22 +6752,37 @@ body.is-resizing-panel {
   }
   .right-rail { display: none; }
   .sidebar-resize,
-  .right-rail-resize { display: none; }
+  .right-rail-resize,
+  .task-workspace-resize { display: none; }
   /* `.workspace-diff-chip` is shown via its own mobile block above. */
 
   /* Neutralize any persisted collapsed state from desktop — on mobile the
    * panels are managed by the responsive layout (sidebar stacks above chat,
    * rail hidden), not by the toggle buttons. Without these overrides a user
    * who collapsed the sidebar on desktop would land on mobile with an
-   * invisible sidebar and a leftover 3-column grid template. */
+   * invisible sidebar and a leftover 3-column grid template.
+   * View-scoped desktop rules for tasks/teams/review are more specific than
+   * the generic collapsed selectors, so they must be listed here too. */
   body.sidebar-collapsed .app-shell,
   body.sidebar-collapsed .app-shell-with-rail,
   body.sidebar-collapsed .app-shell[data-view="conversation"],
   body.sidebar-collapsed .app-shell-with-rail[data-view="conversation"],
+  body.sidebar-collapsed .app-shell[data-view="tasks"],
+  body.sidebar-collapsed .app-shell-with-rail[data-view="tasks"],
+  body.sidebar-collapsed .app-shell[data-view="teams"],
+  body.sidebar-collapsed .app-shell-with-rail[data-view="teams"],
+  body.sidebar-collapsed .app-shell[data-view="review"],
+  body.sidebar-collapsed .app-shell-with-rail[data-view="review"],
   body.rail-collapsed .app-shell-with-rail,
   body.rail-collapsed .app-shell-with-rail[data-view="conversation"],
+  body.rail-collapsed .app-shell-with-rail[data-view="tasks"],
+  body.rail-collapsed .app-shell-with-rail[data-view="teams"],
+  body.rail-collapsed .app-shell-with-rail[data-view="review"],
   body.sidebar-collapsed.rail-collapsed .app-shell-with-rail,
-  body.sidebar-collapsed.rail-collapsed .app-shell-with-rail[data-view="conversation"] {
+  body.sidebar-collapsed.rail-collapsed .app-shell-with-rail[data-view="conversation"],
+  body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="tasks"],
+  body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="teams"],
+  body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="review"] {
     grid-template-columns: 1fr;
   }
   body.sidebar-collapsed .sidebar {
@@ -6631,6 +6790,11 @@ body.is-resizing-panel {
     opacity: 1;
     pointer-events: auto;
     overflow: visible;
+  }
+  /* Collapsed-state reveal for #tasks-sidebar-toggle must not win here — the
+     sidebar is forced visible, so "Show navigation panel" would be a lie. */
+  body.sidebar-collapsed .app-shell[data-view="tasks"] #tasks-sidebar-toggle {
+    display: none;
   }
 
   /* Bump icon buttons to a tappable size (~36px) — desktop default 22px is
@@ -7752,6 +7916,13 @@ button.team-role-name.is-link {
 .task-locked {
   position: relative;
   overflow: hidden;
+}
+.task-locked-chrome {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  padding: 16px 20px;
 }
 .task-locked-scenery {
   position: absolute;

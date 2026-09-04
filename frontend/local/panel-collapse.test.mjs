@@ -108,6 +108,23 @@ test("collapsed sidebar grid template keeps the 3-column rail intact", () => {
   assert.equal(columns[0], "0", "First column should be 0 when sidebar is collapsed");
 });
 
+test("collapsed sidebar on Tasks does not reserve an empty right-rail column", () => {
+  // Observed: icon-rail up (sidebar collapsed) on Tasks left a ~320px blank
+  // strip to the right of the embedded detail. `body.sidebar-collapsed
+  // .app-shell-with-rail` still declared three tracks; Tasks has no app rail,
+  // so the third track was empty void. Beat that rule with a view-scoped twin.
+  assert.match(
+    styles,
+    /body\.sidebar-collapsed\s+\.app-shell-with-rail\[data-view="tasks"\][^\{]*\{[^}]*grid-template-columns:\s*0\s+minmax\(0,\s*1fr\)/,
+    "collapsed Tasks must be two tracks (0, 1fr), not a ghost rail column"
+  );
+  assert.match(
+    styles,
+    /body\.sidebar-collapsed\s+\.app-shell-with-rail\[data-view="review"\]/,
+    "review has the same no-app-rail contract"
+  );
+});
+
 test("collapsed rail grid template keeps the sidebar column intact", () => {
   const rule = extractRule("body.rail-collapsed .app-shell-with-rail");
   const match = rule.match(/grid-template-columns\s*:\s*([^;]+);/);
@@ -225,6 +242,158 @@ test("mobile media query hides desktop-only chrome (rail, resize handles, toggle
   assert.match(block, /\.right-rail\s*\{\s*display\s*:\s*none\s*;?\s*\}/);
   assert.match(
     block,
-    /\.sidebar-resize\s*,\s*\.right-rail-resize\s*\{\s*display\s*:\s*none\s*;?\s*\}/
+    /\.sidebar-resize\s*,\s*\.right-rail-resize\s*,\s*\.task-workspace-resize\s*\{\s*display\s*:\s*none\s*;?\s*\}/
+  );
+});
+
+test("mobile media query overrides view-scoped collapsed Tasks/Teams/Review grids", () => {
+  // The desktop ghost-track rules use
+  // `body.sidebar-collapsed .app-shell-with-rail[data-view="tasks"]` — higher
+  // specificity than the generic mobile `body.sidebar-collapsed .app-shell-with-rail`
+  // reset. Without matching view selectors inside the mobile block, a phone
+  // inherits `0 1fr` / `sidebar 1fr` instead of a single column.
+  const block = extractMobileMediaBlock();
+  for (const view of ["tasks", "teams", "review"]) {
+    assert.match(
+      block,
+      new RegExp(
+        `body\\.sidebar-collapsed\\s+\\.app-shell-with-rail\\[data-view="${view}"\\]`
+      ),
+      `mobile reset must beat desktop collapsed ${view} grid`
+    );
+    assert.match(
+      block,
+      new RegExp(
+        `body\\.rail-collapsed\\.sidebar-collapsed\\s+\\.app-shell-with-rail\\[data-view="${view}"\\]`
+      ),
+      `mobile reset must beat dual-collapsed ${view} grid`
+    );
+  }
+  assert.match(
+    block,
+    /body\.sidebar-collapsed\s+\.app-shell-with-rail\[data-view="tasks"\][^]*?grid-template-columns:\s*1fr/s,
+    "collapsed Tasks on mobile must force single-column"
+  );
+});
+
+test("Tasks workspace grid is scoped; Teams Library keeps a fixed detail column", () => {
+  // Sharing `--task-orch-panel-width` on every `.task-workspace` lets a Tasks
+  // drag widen the Teams Library detail pane. Tasks owns the CSS var; Teams
+  // keeps the pre-resize minmax(280px, 360px) detail track.
+  // The half-workspace cap lives in the resize controller (not CSS `min(...,
+  // 50%)`) so drag math and rendered width stay in sync.
+  assert.match(
+    styles,
+    /\.task-workspace:not\(\.teams-workspace\)\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+var\(--task-orch-panel-width/s,
+    "Tasks grid must size the Orchestrator from its CSS var"
+  );
+  assert.doesNotMatch(
+    styles,
+    /\.task-workspace:not\(\.teams-workspace\)\s*\{[^}]*min\(var\(--task-orch-panel-width/s,
+    "do not CSS-cap at 50% — that desyncs drag start from rendered width"
+  );
+  assert.match(
+    styles,
+    /\.task-workspace\.teams-workspace\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+minmax\(280px,\s*360px\)/s,
+    "Teams Library must keep its independent 280–360px detail column"
+  );
+});
+
+test("narrow task-workspace media query beats the desktop column selectors", () => {
+  // `.task-workspace:not(.teams-workspace)` and `.teams-workspace` outrank a
+  // bare `.task-workspace` inside @media, so the ≤900px single-column reset
+  // must restate those selectors or the panes stay side-by-side.
+  const marker = ".task-workspace-resize";
+  const atMediaIdx = styles.lastIndexOf("@media (max-width: 900px)");
+  assert.ok(atMediaIdx >= 0, "expected @media (max-width: 900px) for task workspace");
+  const openBrace = styles.indexOf("{", atMediaIdx);
+  let depth = 1;
+  let scan = openBrace + 1;
+  while (scan < styles.length && depth > 0) {
+    const ch = styles[scan];
+    if (ch === "{") depth += 1;
+    else if (ch === "}") depth -= 1;
+    scan += 1;
+  }
+  const block = styles.slice(openBrace + 1, scan - 1);
+  assert.ok(block.includes(marker), "expected resize hide inside the 900px block");
+  assert.match(
+    block,
+    /\.task-workspace:not\(\.teams-workspace\)\s*,\s*\.task-workspace\.teams-workspace\s*\{[^}]*grid-template-columns:\s*1fr/s
+  );
+});
+
+test("Tasks/Teams stack when the main mount is narrower than two panes need", () => {
+  // Viewport media alone misses "wide window + wide sidebar → skinny workspace".
+  // Container queries on the mount (not on `.task-workspace` itself) stack at
+  // <640px so a 320px Orchestrator floor cannot leave a 160px detail strip.
+  assert.match(
+    styles,
+    /container-type:\s*inline-size/,
+    "task/teams mounts must establish a size container"
+  );
+  assert.match(
+    styles,
+    /@container[^{]*\(max-width:\s*639px\)/,
+    "stack when the workspace mount is under 640px"
+  );
+  const atIdx = styles.search(/@container[^{]*\(max-width:\s*639px\)/);
+  assert.ok(atIdx >= 0);
+  const openBrace = styles.indexOf("{", atIdx);
+  let depth = 1;
+  let scan = openBrace + 1;
+  while (scan < styles.length && depth > 0) {
+    const ch = styles[scan];
+    if (ch === "{") depth += 1;
+    else if (ch === "}") depth -= 1;
+    scan += 1;
+  }
+  const block = styles.slice(openBrace + 1, scan - 1);
+  assert.match(
+    block,
+    /\.task-workspace:not\(\.teams-workspace\)\s*,\s*\.task-workspace\.teams-workspace\s*\{[^}]*grid-template-columns:\s*1fr/s
+  );
+});
+
+test("tasks view surfaces a sidebar expand control when the sidebar is collapsed", () => {
+  // The chat header's left-panel toggle is unreachable on Tasks — the whole
+  // header is `display: none`. The Orchestrator header owns the replacement,
+  // and it must only appear in the collapsed state (same pattern as
+  // `.chat-header-collapsed-actions`).
+  assert.match(
+    styles,
+    /body\.sidebar-collapsed\s+\.app-shell\[data-view="tasks"\][^{]*#tasks-sidebar-toggle/,
+    "collapsed Tasks must reveal #tasks-sidebar-toggle"
+  );
+  assert.match(
+    styles,
+    /#tasks-sidebar-toggle\s*\{[^}]*display:\s*none/,
+    "the tasks expand control stays hidden while the sidebar is open"
+  );
+});
+
+test("mobile mode suppresses the tasks sidebar expand control", () => {
+  // ≤960px keeps the sidebar visible despite a persisted collapsed width, so a
+  // "Show navigation panel" button would lie. Mirror the left-panel toggle kill.
+  const block = extractMobileMediaBlock();
+  assert.match(
+    block,
+    /body\.sidebar-collapsed\s+\.app-shell\[data-view="tasks"\]\s+#tasks-sidebar-toggle\s*\{[^}]*display:\s*none/,
+    "collapsed-state reveal must not win on mobile"
+  );
+});
+
+test("embedded task detail shares one horizontal inset, not 32px on some rows and 20px on others", () => {
+  // The right pane looked ragged: header padded to 20px while banner / actions /
+  // sub-tasks still carried the full-screen 32px margins.
+  assert.match(
+    styles,
+    /\.task-screen\.is-embedded\s+\.task-banner[^}]*margin[^;]*20px/,
+    "embedded banner inset must match the header"
+  );
+  assert.match(
+    styles,
+    /\.task-screen\.is-embedded\s+\.task-actions[^}]*margin[^;]*20px/,
+    "embedded actions inset must match the header"
   );
 });

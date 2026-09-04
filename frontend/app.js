@@ -760,6 +760,28 @@ leftPanelControl.attachToggleButton(toggleLeftPanelButton);
 leftPanelControl.attachToggleButton(sidebarTopToggleButton);
 leftPanelControl.subscribe(({ isOpen }) => {
   document.body.classList.toggle("sidebar-collapsed", !isOpen);
+  // Tasks render this control inside React (Orchestrator header). Keep its
+  // pressed state in sync the same way attachToggleButton does for the static
+  // chat-header / sidebar buttons.
+  const tasksToggle = document.getElementById("tasks-sidebar-toggle");
+  if (tasksToggle) {
+    tasksToggle.setAttribute("aria-pressed", isOpen ? "true" : "false");
+    tasksToggle.classList.toggle("is-active", isOpen);
+    tasksToggle.setAttribute(
+      "aria-label",
+      isOpen ? "Hide navigation panel" : "Show navigation panel"
+    );
+    tasksToggle.title = isOpen
+      ? "Hide navigation panel (\u2318B)"
+      : "Show navigation panel (\u2318B)";
+  }
+});
+// Click is delegated: the button is mounted/unmounted with the Tasks view, so
+// attachToggleButton at module load would miss it.
+document.addEventListener("click", (event) => {
+  if (event.target.closest?.("#tasks-sidebar-toggle")) {
+    leftPanelControl.toggle();
+  }
 });
 newSessionComposeButton?.addEventListener("click", () => {
   openStartSessionDialog();
