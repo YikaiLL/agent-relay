@@ -140,6 +140,7 @@ function latchViewOnlyWasWorkingFromDelta(threadId) {
 }
 const transcriptFlushScheduler = createTranscriptFlushScheduler({
   render() {
+    flushPendingTranscriptAppends();
     if (state.session) {
       renderSession(state.session);
     }
@@ -148,6 +149,82 @@ const transcriptFlushScheduler = createTranscriptFlushScheduler({
 
 export function flushRemoteTranscriptRenderForTest() {
   transcriptFlushScheduler.flushNow("test");
+}
+
+// A cached baseEntry is only valid against the transcript array it was read
+// from. In normal flow the array only ever changes at a point this file has
+// already flushed first (a flush itself, an entry patch, a snapshot merge, a
+// gap-repair merge all drain the buffer before touching .transcript), so a
+// dirty entry never survives past its array being replaced. readForDelta's
+// self-clear below is what makes that hold even if some caller reassigns the
+// session out of band — this file's own tests do exactly that (direct
+// `state.session = {...}` between cases) without going through any commit
+// function here.
+function createPendingAppendBuffer() {
+  const map = new Map();
+  let arrayRef = null;
+  return {
+    get size() {
+      return map.size;
+    },
+    [Symbol.iterator]: () => map[Symbol.iterator](),
+    values: () => map.values(),
+    get(itemId) {
+      return map.get(itemId);
+    },
+    readForDelta(transcript, itemId) {
+      if (arrayRef !== transcript) {
+        map.clear();
+        arrayRef = transcript;
+      }
+      return map.get(itemId) || null;
+    },
+    set(itemId, value) {
+      map.set(itemId, value);
+    },
+    clear() {
+      map.clear();
+      arrayRef = null;
+    },
+  };
+}
+
+// Per-token delta buffers: `commitTranscriptDeltaAppend` writes here in O(1)
+// instead of rebuilding the whole transcript array. Two, not one, because
+// live and view-only deltas commit into different session objects
+// (commitLiveSession vs commitViewedSession) and must flush independently.
+const livePendingAppends = createPendingAppendBuffer();
+const viewedPendingAppends = createPendingAppendBuffer();
+
+// Counts actual array rebuilds at flush time — mirrors local's
+// transcriptFullRebuildCount (frontend/local/session/stream.js). Only
+// incremented when a buffer had a dirty (actually-appended) entry, so a flush
+// with nothing pending does not count as a rebuild.
+let transcriptDeltaRebuildCount = 0;
+
+export function __readTranscriptDeltaRebuildCount() {
+  return transcriptDeltaRebuildCount;
+}
+
+export function __resetTranscriptDeltaRebuildCount() {
+  transcriptDeltaRebuildCount = 0;
+}
+
+// Counts transcript.find(...) scans from getPendingAppendEntry's cache-miss
+// path. REVIEW P1: a gap/mismatch/duplicate returns before commitTranscriptDeltaAppend
+// ever writes the buffer, so caching only dirty appends left every repeated
+// non-appending delta for the same item rescanning the full array. The lookup
+// is now cached independently of whether the delta turns out to append
+// anything, so this must stay at 1 per item per flush window regardless of
+// how many rejected deltas land for it in between.
+let transcriptDeltaBaseLookupCount = 0;
+
+export function __readTranscriptDeltaBaseLookupCount() {
+  return transcriptDeltaBaseLookupCount;
+}
+
+export function __resetTranscriptDeltaBaseLookupCount() {
+  transcriptDeltaBaseLookupCount = 0;
 }
 
 function invalidateViewOnlyNavigation() {
@@ -242,6 +319,33 @@ function transcriptDeltaKindToEntryKind(deltaKind) {
   }
 }
 
+// Reads the effective (base + already-buffered) state for one item in O(1)
+// once a delta has touched it this flush window — the array scan only runs
+// on the FIRST delta for an item after each flush clears the buffer, no
+// matter how that delta and any that follow it are decided (append, gap,
+// mismatch, or duplicate). The lookup is cached here, independently of
+// commitTranscriptDeltaAppend's `dirty` write below, specifically so a run of
+// rejected deltas (a duplicate storm, or a gap sitting unrepaired) for the
+// same item does not each pay for its own findIndex.
+function getPendingAppendEntry(buffer, transcript, itemId) {
+  const cached = buffer.readForDelta(transcript, itemId);
+  if (cached) {
+    return cached;
+  }
+  transcriptDeltaBaseLookupCount += 1;
+  const baseEntry = transcript.find((entry) => entry?.item_id === itemId) || null;
+  const pending = {
+    baseEntry,
+    appendText: "",
+    entrySeq: null,
+    resolvedKind: null,
+    turnId: null,
+    dirty: false,
+  };
+  buffer.set(itemId, pending);
+  return pending;
+}
+
 export function applyTranscriptDelta({
   thread_id,
   base_revision,
@@ -272,12 +376,14 @@ export function applyTranscriptDelta({
   // happened to land.
   let currentSession = liveSession;
   let commit = commitLiveSession;
+  let buffer = livePendingAppends;
   let currentThreadId = liveThreadId;
   if (thread_id && liveThreadId && thread_id !== liveThreadId) {
     if (viewOnlyThreadId && thread_id === viewOnlyThreadId && state.session?.view_only) {
       currentSession = state.session;
       currentThreadId = viewOnlyThreadId;
       commit = commitViewedSession;
+      buffer = viewedPendingAppends;
     } else {
       const message = `[transcript-delta] ignored thread=${thread_id} current=${liveThreadId} item=${item_id || "-"} kind=${delta_kind || kind || "-"}`;
       renderLog(message);
@@ -303,7 +409,10 @@ export function applyTranscriptDelta({
   const transcript = currentSession.transcript;
   if (!Array.isArray(transcript)) return;
   const resolvedKind = transcriptDeltaKindToEntryKind(delta_kind || kind);
-  const entryIndex = transcript.findIndex((e) => e.item_id === item_id);
+  // O(1) once an item has been touched this flush window: the array scan
+  // (getPendingAppendEntry's fallback) only runs on the first delta for an
+  // item after each flush clears the buffer, not per token.
+  const pending = getPendingAppendEntry(buffer, transcript, item_id);
   const deltaText = delta ?? "";
   const offset = numericOffset(text_offset);
 
@@ -317,7 +426,10 @@ export function applyTranscriptDelta({
   // superseded before reaching here — that is intentional (a newer snapshot
   // already covers them).
   if (offset != null) {
-    const haveText = entryIndex >= 0 ? (transcript[entryIndex].text ?? "") : "";
+    // Compare against baseText + already-buffered appendText, not the entry's
+    // stored text — a gap/mismatch/duplicate decided while prior deltas for
+    // this item are still sitting unflushed in the buffer must see them.
+    const haveText = `${pending.baseEntry?.text ?? ""}${pending.appendText}`;
     const have = haveText.length;
     if (have < offset) {
       // Missing earlier text: appending here would splice the stream out of
@@ -351,8 +463,8 @@ export function applyTranscriptDelta({
     commitTranscriptDeltaAppend({
       commit,
       currentSession,
-      transcript,
-      entryIndex,
+      buffer,
+      pending,
       item_id,
       appendText: deltaText.slice(have - offset),
       resolvedKind,
@@ -383,8 +495,8 @@ export function applyTranscriptDelta({
   commitTranscriptDeltaAppend({
     commit,
     currentSession,
-    transcript,
-    entryIndex,
+    buffer,
+    pending,
     item_id,
     appendText: deltaText,
     resolvedKind,
@@ -396,11 +508,14 @@ export function applyTranscriptDelta({
   });
 }
 
+// Writes the buffer entry for this item in O(1) — no transcript scan and no
+// array rebuild here. The full-array rebuild (applyPendingAppendsToSession)
+// runs once per flush, not once per delta.
 function commitTranscriptDeltaAppend({
   commit = commitLiveSession,
   currentSession,
-  transcript,
-  entryIndex,
+  buffer,
+  pending,
   item_id,
   appendText,
   resolvedKind,
@@ -410,42 +525,34 @@ function commitTranscriptDeltaAppend({
   server_time,
   viewedThreadId = null,
 }) {
-  const nextTranscript = entryIndex >= 0
-    ? transcript.map((entry, index) => {
-        if (index !== entryIndex) {
-          return entry;
-        }
-        return {
-          ...entry,
-          entry_seq: Number.isSafeInteger(entry_seq) && !Number.isSafeInteger(entry.entry_seq)
-            ? entry_seq
-            : entry.entry_seq,
-          kind: entry.kind || resolvedKind,
-          status: "running",
-          text: `${entry.text ?? ""}${appendText}`,
-          turn_id: entry.turn_id || turn_id || null,
-        };
-      })
-    : [
-        ...transcript,
-        {
-          item_id,
-          turn_id: turn_id ?? null,
-          text: appendText,
-          kind: resolvedKind,
-          status: "running",
-          tool: null,
-          entry_seq: Number.isSafeInteger(entry_seq) ? entry_seq : null,
-        },
-      ];
-  const nextSession = {
-    ...currentSession,
-    transcript: nextTranscript,
-  };
-  // Always advance the revision cursor when we apply a delta, even though the
-  // offset path ignores base_revision for the apply decision. This keeps the
-  // shared per-thread revision monotonic so the command-output base_revision
-  // chain (and snapshot freshness checks) stay intact across interleaving.
+  const baseEntry = pending.baseEntry;
+  // Monotonic across buffered deltas for the same item: once entry_seq/kind/
+  // turn_id are established (by the base array entry, or by an earlier
+  // buffered delta), a later delta must not overwrite them — mirrors the old
+  // per-delta "entry.field || delta's field" logic, which relied on the array
+  // itself being updated synchronously to stay monotonic.
+  const priorEntrySeq = Number.isSafeInteger(baseEntry?.entry_seq)
+    ? baseEntry.entry_seq
+    : pending.entrySeq;
+  buffer.set(item_id, {
+    baseEntry,
+    appendText: pending.appendText + appendText,
+    entrySeq:
+      Number.isSafeInteger(entry_seq) && !Number.isSafeInteger(priorEntrySeq)
+        ? entry_seq
+        : priorEntrySeq ?? null,
+    resolvedKind: baseEntry?.kind || pending.resolvedKind || resolvedKind,
+    turnId: baseEntry?.turn_id || pending.turnId || turn_id || null,
+    // Only a dirty entry gets rebuilt into the array at flush — a cached
+    // lookup that never actually appended anything (every delta for this
+    // item was a duplicate/gap/mismatch) must not force a no-op rewrite.
+    dirty: true,
+  });
+
+  // Advance the revision cursor synchronously, even though the array rebuild
+  // is deferred — the revision/staleness checks above must see every delta,
+  // not just the ones a flush happened to have caught up to.
+  const nextSession = { ...currentSession };
   if (deltaRevision != null) {
     nextSession.transcript_revision = deltaRevision;
   }
@@ -456,6 +563,142 @@ function commitTranscriptDeltaAppend({
   if (viewedThreadId) {
     latchViewOnlyWasWorkingFromDelta(viewedThreadId);
   }
+}
+
+function bufferHasDirtyAppend(buffer) {
+  for (const pending of buffer.values()) {
+    if (pending.dirty) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Applies every DIRTY buffered append to the transcript array in one pass —
+// the single full-array rebuild per flush, replacing the old per-delta
+// rebuild. Clean (cache-only, never-appended) entries are skipped: they exist
+// only so getPendingAppendEntry did not rescan the array for a rejected
+// delta, and rewriting the array for one would be a no-op that still forces
+// `status: "running"` onto an entry nothing actually changed.
+function applyPendingAppendsToSession(session, buffer) {
+  if (!session || !bufferHasDirtyAppend(buffer)) {
+    return session;
+  }
+  const transcript = Array.isArray(session.transcript) ? session.transcript : [];
+  const seen = new Set();
+  const nextTranscript = transcript.map((entry) => {
+    const pending = entry?.item_id ? buffer.get(entry.item_id) : null;
+    if (!pending || !pending.dirty) {
+      return entry;
+    }
+    seen.add(entry.item_id);
+    return {
+      ...entry,
+      entry_seq: Number.isSafeInteger(pending.entrySeq) && !Number.isSafeInteger(entry.entry_seq)
+        ? pending.entrySeq
+        : entry.entry_seq,
+      kind: entry.kind || pending.resolvedKind,
+      status: "running",
+      text: `${entry.text ?? ""}${pending.appendText}`,
+      turn_id: entry.turn_id || pending.turnId || null,
+    };
+  });
+  const newEntries = [];
+  for (const [itemId, pending] of buffer) {
+    if (!pending.dirty || seen.has(itemId)) {
+      continue;
+    }
+    newEntries.push({
+      item_id: itemId,
+      turn_id: pending.turnId ?? null,
+      text: pending.appendText,
+      kind: pending.resolvedKind,
+      status: "running",
+      tool: null,
+      entry_seq: Number.isSafeInteger(pending.entrySeq) ? pending.entrySeq : null,
+    });
+  }
+  transcriptDeltaRebuildCount += 1;
+  return {
+    ...session,
+    transcript: newEntries.length ? [...nextTranscript, ...newEntries] : nextTranscript,
+  };
+}
+
+function flushLivePendingAppends() {
+  if (livePendingAppends.size === 0) {
+    return;
+  }
+  const dirty = bufferHasDirtyAppend(livePendingAppends);
+  const nextLiveSession = dirty
+    ? applyPendingAppendsToSession(state.realSession, livePendingAppends)
+    : state.realSession;
+  // Clear unconditionally, including clean cache-only entries — a flush is
+  // the array's one chance to change shape (repair, an entry patch, a
+  // snapshot merge all drain here too), so a cached baseEntry reference is
+  // not safe to trust past this point even when this item stayed clean.
+  livePendingAppends.clear();
+  if (!dirty || !nextLiveSession) {
+    return;
+  }
+  state.realSession = nextLiveSession;
+  // Mirrors commitLiveSession's own aliasing: state.session IS state.realSession
+  // unless a different thread is pinned view-only, in which case it is a
+  // re-projection (whose transcript is self-referential from state.session, so
+  // it is unaffected by the live buffer applied above).
+  state.session =
+    viewOnlyThreadId && viewOnlyThreadId !== nextLiveSession.active_thread_id
+      ? projectRemoteViewedSession(nextLiveSession, viewOnlyThreadId, state.session)
+      : nextLiveSession;
+}
+
+function flushViewedPendingAppends() {
+  if (viewedPendingAppends.size === 0) {
+    return;
+  }
+  const dirty = bufferHasDirtyAppend(viewedPendingAppends);
+  const nextViewedSession = dirty
+    ? applyPendingAppendsToSession(state.session, viewedPendingAppends)
+    : state.session;
+  viewedPendingAppends.clear();
+  if (dirty && nextViewedSession) {
+    state.session = nextViewedSession;
+  }
+}
+
+// The one place both delta buffers become visible. Every path that reads the
+// live transcript array out of band — a render, an entry-status patch, a
+// snapshot merge, a gap-repair merge — must drain these first, or it acts on
+// an array missing whatever streamed in since the last flush.
+function flushPendingTranscriptAppends() {
+  flushLivePendingAppends();
+  flushViewedPendingAppends();
+}
+
+// Mirrors local's projectTranscriptWindowIfPending: a direct render call
+// often builds its session argument by spreading state.session/state.realSession
+// BEFORE this runs, carrying the pre-flush array through the spread. Match by
+// array identity (not session identity) so the swap still finds it.
+function withFlushedTranscript(session) {
+  if (!session) {
+    return session;
+  }
+  const staleLiveTranscript = state.realSession?.transcript;
+  const staleViewedTranscript = state.session?.transcript;
+  flushPendingTranscriptAppends();
+  if (
+    session.transcript === staleLiveTranscript
+    && state.realSession?.transcript !== staleLiveTranscript
+  ) {
+    return { ...session, transcript: state.realSession.transcript };
+  }
+  if (
+    session.transcript === staleViewedTranscript
+    && state.session?.transcript !== staleViewedTranscript
+  ) {
+    return { ...session, transcript: state.session.transcript };
+  }
+  return session;
 }
 
 // Highest target revision we still owe a repair for, per thread. A Map (not a
@@ -546,6 +789,11 @@ async function runTranscriptRepairLoop(threadId) {
 // dropped live chunk is actually re-fetched and healed rather than only logged.
 async function repairActiveTranscriptTail(threadId, targetRevision) {
   const page = await fetchRawTranscriptPage({ threadId, before: null });
+  // Drain buffered appends before reading the transcript below — otherwise a
+  // delta buffered before this fetch started (for an item the repair page
+  // does not cover) would be carried forward from a stale, pre-buffer array
+  // and its text would be lost once repair overwrites the session.
+  flushPendingTranscriptAppends();
   // Repair whichever session actually holds this thread's transcript: the live one, or
   // the view-only projection when the thread is being read in the background. Writing
   // a background thread's repaired tail into the live session would corrupt the live
@@ -695,6 +943,11 @@ export function applySessionSnapshot(snapshot) {
   if (typeof window !== "undefined" && typeof window.__snapshotCount === "number") {
     window.__snapshotCount++;
   }
+  // Drain buffered appends before any of the merge logic below reads
+  // state.realSession/state.session — otherwise preserveVisibleTranscriptText
+  // compares the incoming snapshot against a transcript missing whatever
+  // streamed in since the last flush.
+  flushPendingTranscriptAppends();
   // Captured before the realSession sync below so an INBOUND pending->real
   // promotion (another device sent the first message) is still visible.
   const previousActiveThreadId =
@@ -1043,6 +1296,13 @@ function settledThreadStatus(status) {
 }
 
 function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null } = {}) {
+  // This function does its own full-array rebuild below (a status/completion
+  // patch is a different write path from the delta buffer, out of scope to
+  // fold together). Without draining first, a buffered-but-unflushed append
+  // for the patched item would sit on a stale cached baseEntry and get
+  // re-applied on TOP of "completed" at the next flush, duplicating text and
+  // regressing status back to "running".
+  flushPendingTranscriptAppends();
   const currentSession = currentLiveSession();
   if (!currentSession) {
     return;
@@ -2246,6 +2506,12 @@ export async function fetchRemoteThreadTranscript(threadId) {
 export function clearSessionRuntime() {
   invalidateViewOnlyNavigation();
   state.realSession = null;
+  // A buffered append is keyed by item_id only; without clearing here, a
+  // stale entry from a previous session (a prior test, a prior relay pairing)
+  // would attach to a different session's identically-named item on the next
+  // delta after this reset.
+  livePendingAppends.clear();
+  viewedPendingAppends.clear();
   clearTranscriptHydration(state);
   // Thread ids are only unique within one relay, so a repair marked in flight (or failed)
   // against thread X here would attach itself to a different relay's thread X after a
@@ -2327,9 +2593,16 @@ function applyRenderedSession(
   // this, a delta timer left over from before a thread switch, a hydration
   // progress step, a promotion, or a settings update fires later and renders
   // a second time on top of what this call already painted.
+  //
+  // withFlushedTranscript also drains the delta buffer and swaps in the fresh
+  // array if `session` was built by spreading state.session/state.realSession
+  // before this call — without it, a call like updateRemoteSessionSettings's
+  // {...state.session, ...overrides} would carry the stale, pre-flush array
+  // through and paint over whatever just streamed in.
+  const flushedSession = withFlushedTranscript(session);
   transcriptFlushScheduler.cancel();
-  renderSession(session);
-  const message = `[session-state] renderSession prev=${previousThreadId} next=${session?.active_thread_id || "-"} state=${state.session?.active_thread_id || "-"} entries=${session?.transcript?.length || 0} hydrate=${hydrateTranscript ? "1" : "0"} hydration_input=${hydrationSnapshot?.active_thread_id || "-"}`;
+  renderSession(flushedSession);
+  const message = `[session-state] renderSession prev=${previousThreadId} next=${flushedSession?.active_thread_id || "-"} state=${state.session?.active_thread_id || "-"} entries=${flushedSession?.transcript?.length || 0} hydrate=${hydrateTranscript ? "1" : "0"} hydration_input=${hydrationSnapshot?.active_thread_id || "-"}`;
   renderLog(message);
   // TODO(remote-monitor-debug): Remove this console mirror once session rendering is stable.
   console.log(message);

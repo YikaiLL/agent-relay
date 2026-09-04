@@ -643,6 +643,7 @@ test("viewing the live thread stays pinned when another client moves live focus"
     applySessionSnapshot,
     applyTranscriptDelta,
     clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
     viewRemoteThread,
   } = await import("./session-ops.js");
 
@@ -695,6 +696,7 @@ test("viewing the live thread stays pinned when another client moves live focus"
     delta_kind: "agent_text",
     revision: 1,
   });
+  flushRemoteTranscriptRenderForTest();
   assert.equal(state.realSession.transcript[0].text, "thread B live");
   assert.equal(state.session.active_thread_id, "thread-a");
   assert.equal(state.session.transcript[0].text, "thread A");
@@ -2673,10 +2675,12 @@ test("applyTranscriptDelta updates existing transcript entries using text and st
     delta_kind: "agent_text",
   });
 
+  // The array rebuild is deferred to flush — the delta itself only writes
+  // the pending-append buffer in O(1).
+  flushRemoteTranscriptRenderForTest();
   assert.equal(state.session.transcript[0].text, "Hello world");
   assert.equal(state.session.transcript[0].status, "running");
   assert.equal(state.session.transcript[0].kind, "agent_text");
-  flushRemoteTranscriptRenderForTest();
 });
 
 test("remote transcript deltas notify the React store once per frame", async () => {
@@ -2718,11 +2722,13 @@ test("remote transcript deltas notify the React store once per frame", async () 
     });
   }
 
-  assert.equal(state.session.transcript[0].text, "one two three");
+  // The array itself lags in the buffer until flush — only the notification
+  // count (nothing painted yet) is observable before it.
   assert.equal(notifications.length, 0);
   flushRemoteTranscriptRenderForTest();
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].transcript[0].text, "one two three");
+  assert.equal(state.session.transcript[0].text, "one two three");
   unsubscribe();
 });
 
@@ -2872,7 +2878,7 @@ test("applyTranscriptDelta does not mutate the previous session snapshot", async
   activeBrowser || installBrowserStubs();
 
   const { state } = await import("./state.js");
-  const { applyTranscriptDelta } = await import("./session-ops.js");
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
 
   const entry = {
     item_id: "item-1",
@@ -2902,6 +2908,10 @@ test("applyTranscriptDelta does not mutate the previous session snapshot", async
   assert.equal(previousSession.transcript[0], entry);
   assert.equal(previousSession.transcript[0].text, "Hello");
   assert.notEqual(state.session, previousSession);
+  // The array rebuild (and with it, a fresh array reference) is deferred to
+  // flush — before that, state.session.transcript still IS previousSession's
+  // array, with the append sitting in the buffer instead.
+  flushRemoteTranscriptRenderForTest();
   assert.notEqual(state.session.transcript, previousSession.transcript);
   assert.equal(state.session.transcript[0].text, "Hello world");
   assert.equal(state.session.transcript_revision, 2);
@@ -2911,7 +2921,7 @@ test("applyTranscriptDelta requires matching base revision when present", async 
   activeBrowser || installBrowserStubs();
 
   const { state } = await import("./state.js");
-  const { applyTranscriptDelta } = await import("./session-ops.js");
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
 
   state.session = {
     active_thread_id: "thread-1",
@@ -2939,6 +2949,8 @@ test("applyTranscriptDelta requires matching base revision when present", async 
     delta_kind: "agent_text",
   });
 
+  // Rejected for a base_revision mismatch — nothing buffered, so this is
+  // observable without a flush.
   assert.equal(state.session.transcript[0].text, "Hello");
   assert.equal(state.session.transcript_revision, 5);
 
@@ -2953,6 +2965,7 @@ test("applyTranscriptDelta requires matching base revision when present", async 
     delta_kind: "agent_text",
   });
 
+  flushRemoteTranscriptRenderForTest();
   assert.equal(state.session.transcript[0].text, "Hello world");
   assert.equal(state.session.transcript_revision, 6);
   assert.equal(state.session.transcript[0].entry_seq, 1);
@@ -2994,7 +3007,7 @@ test("applyTranscriptDelta appends agent text contiguously using text_offset", a
   activeBrowser || installBrowserStubs();
 
   const { state } = await import("./state.js");
-  const { applyTranscriptDelta } = await import("./session-ops.js");
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
 
   state.session = {
     active_thread_id: "thread-1",
@@ -3022,6 +3035,7 @@ test("applyTranscriptDelta appends agent text contiguously using text_offset", a
     text_offset: 5,
   });
 
+  flushRemoteTranscriptRenderForTest();
   assert.equal(state.session.transcript[0].text, "Hello world");
   assert.equal(state.session.transcript[0].status, "running");
   assert.equal(state.session.transcript_revision, 6);
@@ -3031,7 +3045,7 @@ test("applyTranscriptDelta applies agent deltas by text_offset even when base_re
   activeBrowser || installBrowserStubs();
 
   const { state } = await import("./state.js");
-  const { applyTranscriptDelta } = await import("./session-ops.js");
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
 
   // A snapshot (or an interleaved command stream) bumped the revision far past
   // this delta's base_revision. The offset still matches our text, so the delta
@@ -3062,6 +3076,7 @@ test("applyTranscriptDelta applies agent deltas by text_offset even when base_re
     text_offset: 5,
   });
 
+  flushRemoteTranscriptRenderForTest();
   assert.equal(state.session.transcript[0].text, "Hello world");
   assert.equal(state.session.transcript_revision, 41);
 });
@@ -3106,7 +3121,7 @@ test("applyTranscriptDelta appends only the missing tail on a partial re-deliver
   activeBrowser || installBrowserStubs();
 
   const { state } = await import("./state.js");
-  const { applyTranscriptDelta } = await import("./session-ops.js");
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
 
   state.session = {
     active_thread_id: "thread-1",
@@ -3135,6 +3150,7 @@ test("applyTranscriptDelta appends only the missing tail on a partial re-deliver
     text_offset: 5,
   });
 
+  flushRemoteTranscriptRenderForTest();
   assert.equal(state.session.transcript[0].text, "Hello world");
 });
 
@@ -4629,8 +4645,13 @@ test("a delta for the view-only thread updates the projection, not the live sess
   activeBrowser = installBrowserStubs();
 
   const { state, saveRemoteAuth } = await import("./state.js");
-  const { applySessionSnapshot, applyTranscriptDelta, clearSessionRuntime, viewRemoteThread } =
-    await import("./session-ops.js");
+  const {
+    applySessionSnapshot,
+    applyTranscriptDelta,
+    clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
+    viewRemoteThread,
+  } = await import("./session-ops.js");
   const { remoteQueryClient } = await import("./query-client.js");
 
   clearSessionRuntime();
@@ -4709,6 +4730,7 @@ test("a delta for the view-only thread updates the projection, not the live sess
     text_offset: 5,
   });
 
+  flushRemoteTranscriptRenderForTest();
   const viewedEntry = state.session.transcript.find((entry) => entry.item_id === "a-1");
   assert.equal(
     viewedEntry.text,

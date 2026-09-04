@@ -1,0 +1,776 @@
+// Reducer + perf coverage for the remote delta hot path's pending-append
+// buffer (frontend/remote/session-ops.js). The delta path used to do a
+// transcript.findIndex(...) and a full transcript.map(...)/spread rebuild
+// PER TOKEN. Both are now O(1) per delta: findIndex only runs once per item
+// per flush window (getPendingAppendEntry's cache-miss path), and the array
+// rebuild happens once per flush (applyPendingAppendsToSession), not once
+// per delta. These tests exercise the four offset outcomes AGAINST THE
+// BUFFERED VIEW — including the two cases the buffering itself makes
+// possible: a gap detected while an earlier append for the same item is
+// still sitting unflushed, and a re-delivered chunk that spans a flush
+// boundary (part of it already applied to the array, part never buffered).
+
+import assert from "node:assert/strict";
+import test from "node:test";
+import { webcrypto } from "node:crypto";
+
+let activeBrowser = null;
+
+function createElementStub() {
+  return {
+    value: "",
+    textContent: "",
+    innerHTML: "",
+    disabled: false,
+    hidden: false,
+    className: "",
+    placeholder: "",
+    title: "",
+    scrollTop: 0,
+    scrollHeight: 0,
+    dataset: {},
+    addEventListener() {},
+    setAttribute() {},
+    focus() {},
+    querySelectorAll() {
+      return [];
+    },
+    closest() {
+      return null;
+    },
+  };
+}
+
+function createRequest() {
+  return { result: undefined, error: null, onsuccess: null, onerror: null };
+}
+
+function createIndexedDbStub() {
+  const databases = new Map();
+  function createDatabase() {
+    const stores = new Map();
+    return {
+      objectStoreNames: { contains: (name) => stores.has(name) },
+      createObjectStore(name, options = {}) {
+        if (!stores.has(name)) {
+          stores.set(name, { keyPath: options.keyPath || "id", records: new Map() });
+        }
+        return {};
+      },
+      transaction(name) {
+        const storeState = stores.get(name);
+        const transaction = {
+          error: null,
+          oncomplete: null,
+          onabort: null,
+          onerror: null,
+          objectStore() {
+            return {
+              get(key) {
+                const request = createRequest();
+                queueMicrotask(() => {
+                  request.result = storeState.records.get(key);
+                  request.onsuccess?.();
+                  queueMicrotask(() => transaction.oncomplete?.());
+                });
+                return request;
+              },
+              put(value) {
+                const request = createRequest();
+                queueMicrotask(() => {
+                  storeState.records.set(value[storeState.keyPath], value);
+                  request.result = value[storeState.keyPath];
+                  request.onsuccess?.();
+                  queueMicrotask(() => transaction.oncomplete?.());
+                });
+                return request;
+              },
+            };
+          },
+        };
+        return transaction;
+      },
+      close() {},
+    };
+  }
+  return {
+    open(name) {
+      const request = createRequest();
+      queueMicrotask(() => {
+        let database = databases.get(name);
+        const isNew = !database;
+        if (!database) {
+          database = createDatabase();
+          databases.set(name, database);
+        }
+        request.result = database;
+        if (isNew) {
+          request.onupgradeneeded?.();
+        }
+        queueMicrotask(() => request.onsuccess?.());
+      });
+      return request;
+    },
+  };
+}
+
+function installBrowserStubs() {
+  const storage = new Map();
+  const elements = new Map();
+  const pendingTimers = [];
+  const localStorage = {
+    getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+    setItem: (key, value) => storage.set(key, String(value)),
+    removeItem: (key) => storage.delete(key),
+  };
+  const document = {
+    querySelector(selector) {
+      if (!elements.has(selector)) {
+        elements.set(selector, createElementStub());
+      }
+      return elements.get(selector);
+    },
+  };
+  const windowObject = {
+    localStorage,
+    location: { href: "https://remote.example.test/" },
+    history: { replaceState() {} },
+    atob: (value) => Buffer.from(value, "base64").toString("binary"),
+    btoa: (value) => Buffer.from(value, "binary").toString("base64"),
+    crypto: webcrypto,
+    indexedDB: createIndexedDbStub(),
+    setTimeout(callback) {
+      pendingTimers.push(callback);
+      return pendingTimers.length;
+    },
+    clearTimeout(id) {
+      pendingTimers[id - 1] = null;
+    },
+  };
+  globalThis.document = document;
+  globalThis.window = windowObject;
+  globalThis.WebSocket = { OPEN: 1 };
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { platform: "Test Browser" },
+  });
+  Object.defineProperty(globalThis, "crypto", { configurable: true, value: webcrypto });
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: windowObject.indexedDB });
+  activeBrowser = {
+    elements,
+    runTimers() {
+      while (pendingTimers.length) {
+        const callback = pendingTimers.shift();
+        if (callback) callback();
+      }
+    },
+  };
+  return activeBrowser;
+}
+
+function baseEntry() {
+  return {
+    item_id: "item-1",
+    kind: "agent_text",
+    status: "running",
+    text: "Hello",
+    turn_id: "turn-1",
+    tool: null,
+  };
+}
+
+async function freshRemoteSession(extra = {}) {
+  const { state } = await import("./state.js");
+  const { clearSessionRuntime } = await import("./session-ops.js");
+  clearSessionRuntime();
+  state.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 5,
+    transcript: [baseEntry()],
+    ...extra,
+  };
+  state.realSession = state.session;
+  state.socket = null;
+  return state;
+}
+
+test("a partial offset append is buffered and not applied to the array until flush", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSession();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+
+  // RED-FIRST invariant: the array itself must not change before a flush —
+  // only the buffer does. This is the whole point of deferring the rebuild.
+  assert.equal(state.session.transcript[0].text, "Hello", "array must lag until flush");
+
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(state.session.transcript[0].text, "Hello world");
+});
+
+test("a duplicate re-delivery against the buffered view is a no-op", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSession();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 6,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(
+    state.session.transcript[0].text,
+    "Hello world",
+    "the duplicate must be recognized against baseText + buffered appendText, not double-applied"
+  );
+});
+
+// REVIEW P1: the base-entry lookup was only cached on buffer.set — which
+// commitTranscriptDeltaAppend only reaches for an actual append. A duplicate,
+// gap, or mismatch returns before that, so a run of rejected deltas for the
+// same item each paid for their own transcript.find. The lookup must be
+// cached independently of whether a delta turns out to append anything.
+test("repeated non-appending deltas for the same item reuse the cached lookup instead of rescanning per delta", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSession();
+  const {
+    applyTranscriptDelta,
+    flushRemoteTranscriptRenderForTest,
+    __readTranscriptDeltaBaseLookupCount,
+    __resetTranscriptDeltaBaseLookupCount,
+  } = await import("./session-ops.js");
+  window.__transcriptGapRepairCount = 0;
+  __resetTranscriptDeltaBaseLookupCount();
+
+  // Duplicate re-delivery of the full baseText, three times in a row — none
+  // of these append anything.
+  for (let i = 0; i < 3; i += 1) {
+    applyTranscriptDelta({
+      thread_id: "thread-1",
+      base_revision: 5,
+      revision: 5,
+      item_id: "item-1",
+      turn_id: "turn-1",
+      delta: "Hello",
+      delta_kind: "agent_text",
+      text_offset: 0,
+    });
+  }
+  assert.equal(
+    __readTranscriptDeltaBaseLookupCount(),
+    1,
+    "three duplicate deltas for the same item must scan the array once, not three times"
+  );
+
+  // A genuine gap, repeated — also rejected before commitTranscriptDeltaAppend
+  // ever runs.
+  for (let i = 0; i < 2; i += 1) {
+    applyTranscriptDelta({
+      thread_id: "thread-1",
+      base_revision: 5,
+      revision: 6,
+      item_id: "item-1",
+      turn_id: "turn-1",
+      delta: "!!",
+      delta_kind: "agent_text",
+      text_offset: 20,
+    });
+  }
+  assert.equal(
+    __readTranscriptDeltaBaseLookupCount(),
+    1,
+    "a repeated gap for the same item must still reuse the cached lookup, not rescan"
+  );
+  assert.equal(window.__transcriptGapRepairCount, 2, "each gap delta still schedules its own repair");
+
+  // Every delta above was rejected — the array itself was never touched, and
+  // the cache-only entries must not force a rebuild at flush either.
+  const { __readTranscriptDeltaRebuildCount, __resetTranscriptDeltaRebuildCount } =
+    await import("./session-ops.js");
+  __resetTranscriptDeltaRebuildCount();
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(__readTranscriptDeltaRebuildCount(), 0, "a buffer with only cached, non-dirty lookups must not rebuild");
+  assert.equal(state.session.transcript[0].text, "Hello");
+  delete window.__transcriptGapRepairCount;
+});
+
+// Caching a lookup on every delta (the P1 fix above) only stays correct if a
+// cached baseEntry never outlives the array it was read from. Without that,
+// a non-appending delta (rejected, but still cached per the fix above)
+// followed by the transcript array being replaced out of band would leave a
+// stale baseEntry in the buffer for the next delta to wrongly compare
+// against — exactly the failure this covers.
+test("a cached lookup from a rejected delta does not survive the session's transcript array being replaced", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await import("./state.js");
+  const { clearSessionRuntime, applyTranscriptDelta, flushRemoteTranscriptRenderForTest } =
+    await import("./session-ops.js");
+  clearSessionRuntime();
+
+  // First session: a duplicate delta caches (but never dirties) a lookup for
+  // item-1 against THIS array.
+  state.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 5,
+    transcript: [{ ...baseEntry(), text: "Hello world" }],
+  };
+  state.realSession = state.session;
+  state.socket = null;
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 5,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+
+  // A brand new session object replaces the array out of band — the shape
+  // every test in this file that skips clearSessionRuntime relies on being
+  // safe, and the shape a real client hits on a fresh thread switch too.
+  state.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 6,
+    transcript: [{ ...baseEntry(), text: "Hello wor" }],
+  };
+  state.realSession = state.session;
+
+  // Have 9 chars in the NEW array; only "ld" is missing. If the stale cached
+  // baseEntry ("Hello world", 11 chars) were trusted instead, this would be
+  // wrongly read as a duplicate and dropped.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 6,
+    revision: 7,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(state.session.transcript[0].text, "Hello world");
+});
+
+test("a byte mismatch against the buffered view schedules repair instead of corrupting text", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSession();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+  window.__transcriptGapRepairCount = 0;
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " wor",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  // Overlaps the buffered " wor" (offset 6..9 is "or ") with different bytes.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 6,
+    revision: 7,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "XX",
+    delta_kind: "agent_text",
+    text_offset: 6,
+  });
+
+  assert.equal(window.__transcriptGapRepairCount, 1, "the mismatch must be caught against baseText + buffer");
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(
+    state.session.transcript[0].text,
+    "Hello wor",
+    "the buffered (pre-mismatch) text must survive — the mismatched delta itself must not apply"
+  );
+  delete window.__transcriptGapRepairCount;
+});
+
+test("a gap against the buffered view schedules repair instead of corrupting text", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSession();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+  window.__transcriptGapRepairCount = 0;
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " wor",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  // have = 9 (buffered); offset 15 is beyond it even accounting for the buffer.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 6,
+    revision: 7,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "ld!",
+    delta_kind: "agent_text",
+    text_offset: 15,
+  });
+
+  assert.equal(window.__transcriptGapRepairCount, 1);
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(state.session.transcript[0].text, "Hello wor");
+  delete window.__transcriptGapRepairCount;
+});
+
+test("a gap detected while appends are already buffered is computed from the buffered text, not the stale array", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSession();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+  window.__transcriptGapRepairCount = 0;
+
+  // Buffers " wor" without flushing — the array still only holds "Hello" (5
+  // chars), but the effective (buffered) length is 9.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " wor",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+
+  // offset 7 is a GAP against the stale array (have=5) but NOT against the
+  // buffered view (have=9) — it is fully covered re-delivery ("or" at 7..9).
+  // If the gap check read the stale array instead of baseText+appendText, it
+  // would wrongly schedule a repair here.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 6,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "or",
+    delta_kind: "agent_text",
+    text_offset: 7,
+  });
+  assert.equal(
+    window.__transcriptGapRepairCount,
+    0,
+    "re-delivery fully covered by the buffer must not be mistaken for a gap against the stale array"
+  );
+
+  // A genuinely out-of-reach offset (target far past the buffered have=9)
+  // must still be recognized as a real gap, logged with the BUFFERED have.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 6,
+    revision: 7,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "!!!",
+    delta_kind: "agent_text",
+    text_offset: 20,
+  });
+  assert.equal(window.__transcriptGapRepairCount, 1);
+  assert.match(
+    state.clientLogs[0],
+    /have=9\b/,
+    "the gap detail must report the buffered have (9), not the stale array's (5)"
+  );
+
+  // The earlier buffered append must not have been discarded by the gap.
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(state.session.transcript[0].text, "Hello wor");
+  delete window.__transcriptGapRepairCount;
+});
+
+test("re-delivery of a chunk spanning a flush boundary is a duplicate against the flushed array", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSession();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  // Flush clears the buffer and applies " world" to the array — the item's
+  // baseEntry cache is gone, so the next delta for it must re-scan the array.
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(state.session.transcript[0].text, "Hello world");
+
+  // Spans the boundary: chars 3..11 straddle what was buffered ("world") and
+  // what was already in the base array ("lo ").
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 6,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "lo world",
+    delta_kind: "agent_text",
+    text_offset: 3,
+  });
+
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(
+    state.session.transcript[0].text,
+    "Hello world",
+    "the re-delivered chunk must be recognized against the freshly-flushed array, not double-appended"
+  );
+});
+
+test("appends only the missing suffix when a partial re-delivery spans baseText and a currently-buffered appendText", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSession();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+
+  // Buffers " wor" without flushing — have is 9 (base "Hello" + buffered
+  // " wor"), but the array still only holds "Hello".
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " wor",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+
+  // Starts at offset 3 — inside baseText ("Hel|lo") — and its 9 chars reach
+  // to offset 12, past have=9. The overlap (offset 3..9) therefore spans
+  // BOTH baseText (3..5) and the still-unflushed buffered appendText (5..9);
+  // only the missing tail past have ("ld!") must be appended.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 6,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "lo world!",
+    delta_kind: "agent_text",
+    text_offset: 3,
+  });
+
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(state.session.transcript[0].text, "Hello world!");
+});
+
+test("a flush with nothing buffered does not rebuild the array", async () => {
+  activeBrowser || installBrowserStubs();
+  await freshRemoteSession();
+  const {
+    flushRemoteTranscriptRenderForTest,
+    __readTranscriptDeltaRebuildCount,
+    __resetTranscriptDeltaRebuildCount,
+  } = await import("./session-ops.js");
+
+  __resetTranscriptDeltaRebuildCount();
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(__readTranscriptDeltaRebuildCount(), 0);
+});
+
+function buildLargeSession(n) {
+  const ids = Array.from({ length: n }, (_, i) => `item-${i}`);
+  return {
+    active_thread_id: "thread-1",
+    transcript_revision: 0,
+    transcript: ids.map((id, i) => ({
+      item_id: id,
+      kind: "agent_text",
+      status: i === 0 ? "running" : "completed",
+      text: i === 0 ? "" : `msg ${i} ${"x".repeat(120)}`,
+      turn_id: `turn-${i}`,
+      tool: null,
+    })),
+  };
+}
+
+test("the delta path never rebuilds before a flush, and rebuilds exactly once per flush, independent of transcript size", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    flushRemoteTranscriptRenderForTest,
+    clearSessionRuntime,
+    __readTranscriptDeltaRebuildCount,
+    __resetTranscriptDeltaRebuildCount,
+  } = await import("./session-ops.js");
+
+  const TOKENS_PER_FLUSH = 25;
+  const FLUSHES = 5;
+
+  for (const n of [1000, 20000]) {
+    clearSessionRuntime();
+    __resetTranscriptDeltaRebuildCount();
+    state.session = buildLargeSession(n);
+    state.realSession = state.session;
+    state.socket = null;
+
+    let offset = 0;
+    for (let f = 0; f < FLUSHES; f += 1) {
+      for (let t = 0; t < TOKENS_PER_FLUSH; t += 1) {
+        const chunk = ` tok${f * TOKENS_PER_FLUSH + t}`;
+        applyTranscriptDelta({
+          thread_id: "thread-1",
+          item_id: "item-0",
+          turn_id: "turn-0",
+          delta: chunk,
+          delta_kind: "agent_text",
+          text_offset: offset,
+        });
+        offset += chunk.length;
+      }
+      assert.equal(
+        __readTranscriptDeltaRebuildCount(),
+        f,
+        `n=${n}: ${TOKENS_PER_FLUSH} deltas must not rebuild the transcript before their flush`
+      );
+
+      flushRemoteTranscriptRenderForTest();
+
+      assert.equal(
+        __readTranscriptDeltaRebuildCount(),
+        f + 1,
+        `n=${n}: exactly one rebuild per flush, regardless of transcript size`
+      );
+    }
+
+    const streamed = state.session.transcript.find((entry) => entry.item_id === "item-0");
+    const expectedTail = Array.from({ length: TOKENS_PER_FLUSH * FLUSHES }, (_, i) => ` tok${i}`).join("");
+    assert.equal(streamed.text, expectedTail);
+  }
+});
+
+test("local and remote surfaces produce the same transcript text for the same delta sequence", async () => {
+  activeBrowser || installBrowserStubs();
+
+  const { createStreamController } = await import("../local/session/stream.js");
+  const { createTranscriptFlushScheduler } = await import("../shared/transcript-flush-scheduler.js");
+  const { state: remoteState } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    flushRemoteTranscriptRenderForTest,
+    clearSessionRuntime,
+  } = await import("./session-ops.js");
+
+  // Local harness, mirrors frontend/local/session-stream.test.mjs's makeController().
+  const localState = {
+    session: {
+      active_thread_id: "thread-1",
+      transcript: [
+        { item_id: "item-1", kind: "agent_text", status: "running", text: "", tool: null, turn_id: "turn-1" },
+      ],
+      transcript_revision: 0,
+    },
+  };
+  let localController;
+  function renderSessionAndClearPendingFlush(session) {
+    localScheduler.cancel();
+    return localController.projectTranscriptWindowIfPending(session);
+  }
+  const localScheduler = createTranscriptFlushScheduler({
+    render: () => {
+      if (localState.session) renderSessionAndClearPendingFlush(localState.session);
+    },
+  });
+  localController = createStreamController({
+    applySessionSnapshot() {},
+    cancelSessionPoll() {},
+    cancelStreamReconnect() {},
+    handleUnauthorized() {},
+    logLine() {},
+    renderSession: renderSessionAndClearPendingFlush,
+    scheduleSessionPoll() {},
+    scheduleStreamReconnect() {},
+    seedDefaults() {},
+    state: localState,
+    transcriptFlushScheduler: localScheduler,
+  });
+
+  clearSessionRuntime();
+  remoteState.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 0,
+    transcript: [
+      { item_id: "item-1", kind: "agent_text", status: "running", text: "", tool: null, turn_id: "turn-1" },
+    ],
+  };
+  remoteState.realSession = remoteState.session;
+  remoteState.socket = null;
+
+  const chunks = ["Hello", " world", "!", " How", " are", " you", " today", "?"];
+  let offset = 0;
+  let revision = 0;
+  for (const chunk of chunks) {
+    revision += 1;
+    localController.applyLocalTranscriptEntryDelta({
+      thread_id: "thread-1",
+      item_id: "item-1",
+      turn_id: "turn-1",
+      delta: chunk,
+      revision,
+      text_offset: offset,
+    });
+    applyTranscriptDelta({
+      thread_id: "thread-1",
+      item_id: "item-1",
+      turn_id: "turn-1",
+      delta: chunk,
+      delta_kind: "agent_text",
+      revision,
+      text_offset: offset,
+    });
+    offset += chunk.length;
+  }
+  localScheduler.flushNow("test");
+  flushRemoteTranscriptRenderForTest();
+
+  const expectedText = chunks.join("");
+  const localText = localState.session.transcript.find((entry) => entry.item_id === "item-1")?.text;
+  const remoteText = remoteState.session.transcript.find((entry) => entry.item_id === "item-1")?.text;
+
+  assert.equal(localText, expectedText);
+  assert.equal(remoteText, expectedText);
+  assert.equal(localText, remoteText, "local and remote must render identical text for the same delta sequence");
+});
