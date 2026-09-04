@@ -2964,9 +2964,7 @@ impl relay_api::TeamPort for AppState {
 
     async fn update_run(&self, run_id: &str, mutation: relay_api::TeamRunMutation) -> bool {
         let mut relay = self.relay.write().await;
-        let mut found = false;
         let updated = relay.update_team_run(run_id, |run| {
-            found = true;
             mutation(run);
             // The driver chose this phase before the turn it is recording. A rerun
             // accepted meanwhile is younger than that choice and outranks it.
@@ -2975,7 +2973,7 @@ impl relay_api::TeamPort for AppState {
         if updated {
             relay.notify();
         }
-        found && updated
+        updated
     }
 
     async fn update_status(&self, run_id: &str, status: TeamRunStatus) {

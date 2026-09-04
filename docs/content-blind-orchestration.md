@@ -49,7 +49,10 @@ Only these field classes may be visible to Cloud orchestration:
 
 Every Cloud-visible struct is closed and bounded. Unknown fields, unknown
 commands/events, over-limit identifiers or collections, URL/path/command-shaped
-tokens, and arbitrary payload escape hatches must fail decode.
+tokens, and arbitrary payload escape hatches must fail decode. Command and
+event envelopes must keep those limits at decode time, rejecting unknown fields
+before consuming their values and stopping bounded collections before decoding
+over-limit elements.
 
 ## Sensitive Denylist
 
@@ -126,6 +129,7 @@ with explicit events, artifacts, and allowlisted templates.
 
 T4 must replace `TeamRunMutation` with explicit reducer events and a command
 journal. T5 must add local artifact storage, template allowlisting, prompt
-rendering, provider invocation, and egress canary tests. T6-T10 add Cloud
+rendering, provider invocation, egress canary tests, and the same decode-time
+wire bounds for any newly added command/event fields. T6-T10 add Cloud
 transport, entitlement, sidecar IPC, encrypted packaging, and rollout hardening.
 None of those are implemented by this foundation.

@@ -42,6 +42,9 @@ pub enum ProtocolValueError {
         field: &'static str,
         character: char,
     },
+    InvalidTokenShape {
+        field: &'static str,
+    },
     TooManyItems {
         field: &'static str,
         max: usize,
@@ -69,6 +72,9 @@ impl fmt::Display for ProtocolValueError {
             Self::InvalidCharacter { field, character } => {
                 write!(f, "{field} contains invalid character {character:?}")
             }
+            Self::InvalidTokenShape { field } => {
+                write!(f, "{field} must not be path-like")
+            }
             Self::TooManyItems { field, max, actual } => {
                 write!(f, "{field} has too many items ({actual} > {max})")
             }
@@ -92,10 +98,10 @@ impl std::error::Error for ProtocolValueError {}
 
 fn validate_token(
     field: &'static str,
-    raw: impl Into<String>,
+    raw: impl AsRef<str>,
     max_len: usize,
 ) -> Result<String, ProtocolValueError> {
-    let raw = raw.into();
+    let raw = raw.as_ref();
     if raw.is_empty() {
         return Err(ProtocolValueError::Empty(field));
     }
@@ -112,7 +118,10 @@ fn validate_token(
             return Err(ProtocolValueError::InvalidCharacter { field, character });
         }
     }
-    Ok(raw)
+    if raw.starts_with('.') || raw.ends_with('.') || raw.contains("..") {
+        return Err(ProtocolValueError::InvalidTokenShape { field });
+    }
+    Ok(raw.to_string())
 }
 
 fn deserialize_supported_protocol_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
@@ -435,7 +444,7 @@ macro_rules! bounded_token {
         pub struct $name(String);
 
         impl $name {
-            pub fn new(raw: impl Into<String>) -> Result<Self, ProtocolValueError> {
+            pub fn new(raw: impl AsRef<str>) -> Result<Self, ProtocolValueError> {
                 validate_token($field, raw, $max).map(Self)
             }
 
@@ -458,8 +467,38 @@ macro_rules! bounded_token {
             where
                 D: Deserializer<'de>,
             {
-                let raw = String::deserialize(deserializer)?;
-                Self::new(raw).map_err(de::Error::custom)
+                struct TokenVisitor;
+
+                impl<'de> Visitor<'de> for TokenVisitor {
+                    type Value = $name;
+
+                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        write!(f, "a bounded opaque {}", $field)
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        $name::new(value).map_err(de::Error::custom)
+                    }
+
+                    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        self.visit_str(value)
+                    }
+
+                    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        $name::new(value.as_str()).map_err(de::Error::custom)
+                    }
+                }
+
+                deserializer.deserialize_str(TokenVisitor)
             }
         }
     };
@@ -550,17 +589,22 @@ where
             {
                 let capacity = seq.size_hint().unwrap_or(0).min(MAX);
                 let mut items = Vec::with_capacity(capacity);
-                while let Some(item) = seq.next_element()? {
+                loop {
                     if items.len() == MAX {
-                        return Err(de::Error::custom(ProtocolValueError::TooManyItems {
-                            field: "bounded_vector",
-                            max: MAX,
-                            actual: MAX + 1,
-                        }));
+                        if seq.next_element::<IgnoredAny>()?.is_some() {
+                            return Err(de::Error::custom(ProtocolValueError::TooManyItems {
+                                field: "bounded_vector",
+                                max: MAX,
+                                actual: MAX + 1,
+                            }));
+                        }
+                        return Ok(BoundedVec { items });
                     }
+                    let Some(item) = seq.next_element()? else {
+                        return Ok(BoundedVec { items });
+                    };
                     items.push(item);
                 }
-                Ok(BoundedVec { items })
             }
         }
 
@@ -1325,8 +1369,8 @@ pub struct DriverCommandEnvelope {
 /// Closed commands a future content-blind driver may ask the local executor to
 /// perform. Template ids and artifact bindings select audited local behavior;
 /// they do not carry prompts or commands.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DriverCommand {
     RequireWorkspace {},
     StartThread {
@@ -1359,6 +1403,484 @@ pub enum DriverCommand {
     },
 }
 
+const DRIVER_COMMAND_FIELDS: &[&str] = &[
+    "kind",
+    "role",
+    "candidates",
+    "thread",
+    "template_id",
+    "bindings",
+    "scope",
+    "target",
+    "message_template_id",
+    "status",
+];
+
+const DRIVER_COMMAND_KINDS: &[&str] = &[
+    "require_workspace",
+    "start_thread",
+    "resume_or_start_thread",
+    "run_template",
+    "checkpoint_commit",
+    "collect_diff",
+    "merge_base",
+    "commit",
+    "pause_at_boundary",
+    "settle_run",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverCommandField {
+    Kind,
+    Role,
+    Candidates,
+    Thread,
+    TemplateId,
+    Bindings,
+    Scope,
+    Target,
+    MessageTemplateId,
+    Status,
+}
+
+impl DriverCommandField {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Kind => "kind",
+            Self::Role => "role",
+            Self::Candidates => "candidates",
+            Self::Thread => "thread",
+            Self::TemplateId => "template_id",
+            Self::Bindings => "bindings",
+            Self::Scope => "scope",
+            Self::Target => "target",
+            Self::MessageTemplateId => "message_template_id",
+            Self::Status => "status",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DriverCommandField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl<'de> Visitor<'de> for FieldVisitor {
+            type Value = DriverCommandField;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a driver command field")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "kind" => Ok(DriverCommandField::Kind),
+                    "role" => Ok(DriverCommandField::Role),
+                    "candidates" => Ok(DriverCommandField::Candidates),
+                    "thread" => Ok(DriverCommandField::Thread),
+                    "template_id" => Ok(DriverCommandField::TemplateId),
+                    "bindings" => Ok(DriverCommandField::Bindings),
+                    "scope" => Ok(DriverCommandField::Scope),
+                    "target" => Ok(DriverCommandField::Target),
+                    "message_template_id" => Ok(DriverCommandField::MessageTemplateId),
+                    "status" => Ok(DriverCommandField::Status),
+                    _ => Err(de::Error::unknown_field(value, DRIVER_COMMAND_FIELDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverCommandKind {
+    RequireWorkspace,
+    StartThread,
+    ResumeOrStartThread,
+    RunTemplate,
+    CheckpointCommit,
+    CollectDiff,
+    MergeBase,
+    Commit,
+    PauseAtBoundary,
+    SettleRun,
+}
+
+impl DriverCommandKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RequireWorkspace => "require_workspace",
+            Self::StartThread => "start_thread",
+            Self::ResumeOrStartThread => "resume_or_start_thread",
+            Self::RunTemplate => "run_template",
+            Self::CheckpointCommit => "checkpoint_commit",
+            Self::CollectDiff => "collect_diff",
+            Self::MergeBase => "merge_base",
+            Self::Commit => "commit",
+            Self::PauseAtBoundary => "pause_at_boundary",
+            Self::SettleRun => "settle_run",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DriverCommandKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct KindVisitor;
+
+        impl<'de> Visitor<'de> for KindVisitor {
+            type Value = DriverCommandKind;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a driver command kind")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "require_workspace" => Ok(DriverCommandKind::RequireWorkspace),
+                    "start_thread" => Ok(DriverCommandKind::StartThread),
+                    "resume_or_start_thread" => Ok(DriverCommandKind::ResumeOrStartThread),
+                    "run_template" => Ok(DriverCommandKind::RunTemplate),
+                    "checkpoint_commit" => Ok(DriverCommandKind::CheckpointCommit),
+                    "collect_diff" => Ok(DriverCommandKind::CollectDiff),
+                    "merge_base" => Ok(DriverCommandKind::MergeBase),
+                    "commit" => Ok(DriverCommandKind::Commit),
+                    "pause_at_boundary" => Ok(DriverCommandKind::PauseAtBoundary),
+                    "settle_run" => Ok(DriverCommandKind::SettleRun),
+                    _ => Err(de::Error::unknown_variant(value, DRIVER_COMMAND_KINDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(KindVisitor)
+    }
+}
+
+fn read_map_field<'de, A, T>(
+    map: &mut A,
+    slot: &mut Option<T>,
+    field: &'static str,
+) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+    T: Deserialize<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(field));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
+fn required_map_field<T, E>(slot: Option<T>, field: &'static str) -> Result<T, E>
+where
+    E: de::Error,
+{
+    slot.ok_or_else(|| de::Error::missing_field(field))
+}
+
+fn reject_command_extra<T, E>(
+    slot: Option<T>,
+    field: &'static str,
+    kind: &'static str,
+) -> Result<(), E>
+where
+    E: de::Error,
+{
+    if slot.is_some() {
+        return Err(de::Error::custom(format!(
+            "field {field} is not valid for {kind} command"
+        )));
+    }
+    Ok(())
+}
+
+fn command_field_allowed_for_kind(kind: DriverCommandKind, field: DriverCommandField) -> bool {
+    match kind {
+        DriverCommandKind::RequireWorkspace
+        | DriverCommandKind::CheckpointCommit
+        | DriverCommandKind::PauseAtBoundary => false,
+        DriverCommandKind::StartThread => matches!(field, DriverCommandField::Role),
+        DriverCommandKind::ResumeOrStartThread => {
+            matches!(
+                field,
+                DriverCommandField::Role | DriverCommandField::Candidates
+            )
+        }
+        DriverCommandKind::RunTemplate => matches!(
+            field,
+            DriverCommandField::Thread
+                | DriverCommandField::Role
+                | DriverCommandField::TemplateId
+                | DriverCommandField::Bindings
+        ),
+        DriverCommandKind::CollectDiff => matches!(field, DriverCommandField::Scope),
+        DriverCommandKind::MergeBase => matches!(field, DriverCommandField::Target),
+        DriverCommandKind::Commit => matches!(
+            field,
+            DriverCommandField::MessageTemplateId | DriverCommandField::Bindings
+        ),
+        DriverCommandKind::SettleRun => matches!(field, DriverCommandField::Status),
+    }
+}
+
+impl<'de> Deserialize<'de> for DriverCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CommandVisitor;
+
+        impl<'de> Visitor<'de> for CommandVisitor {
+            type Value = DriverCommand;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a closed driver command object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut kind = None;
+                let mut role = None;
+                let mut candidates = None;
+                let mut thread = None;
+                let mut template_id = None;
+                let mut bindings = None;
+                let mut scope = None;
+                let mut target = None;
+                let mut message_template_id = None;
+                let mut status = None;
+
+                while let Some(field) = map.next_key()? {
+                    if let Some(kind) = kind {
+                        if field != DriverCommandField::Kind
+                            && !command_field_allowed_for_kind(kind, field)
+                        {
+                            return Err(de::Error::custom(format!(
+                                "field {} is not valid for {} command",
+                                field.as_str(),
+                                kind.as_str()
+                            )));
+                        }
+                    }
+                    match field {
+                        DriverCommandField::Kind => read_map_field(&mut map, &mut kind, "kind")?,
+                        DriverCommandField::Role => read_map_field(&mut map, &mut role, "role")?,
+                        DriverCommandField::Candidates => {
+                            read_map_field(&mut map, &mut candidates, "candidates")?
+                        }
+                        DriverCommandField::Thread => {
+                            read_map_field(&mut map, &mut thread, "thread")?
+                        }
+                        DriverCommandField::TemplateId => {
+                            read_map_field(&mut map, &mut template_id, "template_id")?
+                        }
+                        DriverCommandField::Bindings => {
+                            read_map_field(&mut map, &mut bindings, "bindings")?
+                        }
+                        DriverCommandField::Scope => read_map_field(&mut map, &mut scope, "scope")?,
+                        DriverCommandField::Target => {
+                            read_map_field(&mut map, &mut target, "target")?
+                        }
+                        DriverCommandField::MessageTemplateId => read_map_field(
+                            &mut map,
+                            &mut message_template_id,
+                            "message_template_id",
+                        )?,
+                        DriverCommandField::Status => {
+                            read_map_field(&mut map, &mut status, "status")?
+                        }
+                    }
+                }
+
+                let kind: DriverCommandKind = required_map_field(kind, "kind")?;
+                match kind {
+                    DriverCommandKind::RequireWorkspace => {
+                        reject_command_extra(role, "role", kind.as_str())?;
+                        reject_command_extra(candidates, "candidates", kind.as_str())?;
+                        reject_command_extra(thread, "thread", kind.as_str())?;
+                        reject_command_extra(template_id, "template_id", kind.as_str())?;
+                        reject_command_extra(bindings, "bindings", kind.as_str())?;
+                        reject_command_extra(scope, "scope", kind.as_str())?;
+                        reject_command_extra(target, "target", kind.as_str())?;
+                        reject_command_extra(
+                            message_template_id,
+                            "message_template_id",
+                            kind.as_str(),
+                        )?;
+                        reject_command_extra(status, "status", kind.as_str())?;
+                        Ok(DriverCommand::RequireWorkspace {})
+                    }
+                    DriverCommandKind::StartThread => {
+                        let role = required_map_field(role, "role")?;
+                        reject_command_extra(candidates, "candidates", kind.as_str())?;
+                        reject_command_extra(thread, "thread", kind.as_str())?;
+                        reject_command_extra(template_id, "template_id", kind.as_str())?;
+                        reject_command_extra(bindings, "bindings", kind.as_str())?;
+                        reject_command_extra(scope, "scope", kind.as_str())?;
+                        reject_command_extra(target, "target", kind.as_str())?;
+                        reject_command_extra(
+                            message_template_id,
+                            "message_template_id",
+                            kind.as_str(),
+                        )?;
+                        reject_command_extra(status, "status", kind.as_str())?;
+                        Ok(DriverCommand::StartThread { role })
+                    }
+                    DriverCommandKind::ResumeOrStartThread => {
+                        let role = required_map_field(role, "role")?;
+                        let candidates = required_map_field(candidates, "candidates")?;
+                        reject_command_extra(thread, "thread", kind.as_str())?;
+                        reject_command_extra(template_id, "template_id", kind.as_str())?;
+                        reject_command_extra(bindings, "bindings", kind.as_str())?;
+                        reject_command_extra(scope, "scope", kind.as_str())?;
+                        reject_command_extra(target, "target", kind.as_str())?;
+                        reject_command_extra(
+                            message_template_id,
+                            "message_template_id",
+                            kind.as_str(),
+                        )?;
+                        reject_command_extra(status, "status", kind.as_str())?;
+                        Ok(DriverCommand::ResumeOrStartThread { role, candidates })
+                    }
+                    DriverCommandKind::RunTemplate => {
+                        let thread = required_map_field(thread, "thread")?;
+                        let role = required_map_field(role, "role")?;
+                        let template_id = required_map_field(template_id, "template_id")?;
+                        let bindings = required_map_field(bindings, "bindings")?;
+                        reject_command_extra(candidates, "candidates", kind.as_str())?;
+                        reject_command_extra(scope, "scope", kind.as_str())?;
+                        reject_command_extra(target, "target", kind.as_str())?;
+                        reject_command_extra(
+                            message_template_id,
+                            "message_template_id",
+                            kind.as_str(),
+                        )?;
+                        reject_command_extra(status, "status", kind.as_str())?;
+                        Ok(DriverCommand::RunTemplate {
+                            thread,
+                            role,
+                            template_id,
+                            bindings,
+                        })
+                    }
+                    DriverCommandKind::CheckpointCommit => {
+                        reject_command_extra(role, "role", kind.as_str())?;
+                        reject_command_extra(candidates, "candidates", kind.as_str())?;
+                        reject_command_extra(thread, "thread", kind.as_str())?;
+                        reject_command_extra(template_id, "template_id", kind.as_str())?;
+                        reject_command_extra(bindings, "bindings", kind.as_str())?;
+                        reject_command_extra(scope, "scope", kind.as_str())?;
+                        reject_command_extra(target, "target", kind.as_str())?;
+                        reject_command_extra(
+                            message_template_id,
+                            "message_template_id",
+                            kind.as_str(),
+                        )?;
+                        reject_command_extra(status, "status", kind.as_str())?;
+                        Ok(DriverCommand::CheckpointCommit {})
+                    }
+                    DriverCommandKind::CollectDiff => {
+                        let scope = required_map_field(scope, "scope")?;
+                        reject_command_extra(role, "role", kind.as_str())?;
+                        reject_command_extra(candidates, "candidates", kind.as_str())?;
+                        reject_command_extra(thread, "thread", kind.as_str())?;
+                        reject_command_extra(template_id, "template_id", kind.as_str())?;
+                        reject_command_extra(bindings, "bindings", kind.as_str())?;
+                        reject_command_extra(target, "target", kind.as_str())?;
+                        reject_command_extra(
+                            message_template_id,
+                            "message_template_id",
+                            kind.as_str(),
+                        )?;
+                        reject_command_extra(status, "status", kind.as_str())?;
+                        Ok(DriverCommand::CollectDiff { scope })
+                    }
+                    DriverCommandKind::MergeBase => {
+                        let target = required_map_field(target, "target")?;
+                        reject_command_extra(role, "role", kind.as_str())?;
+                        reject_command_extra(candidates, "candidates", kind.as_str())?;
+                        reject_command_extra(thread, "thread", kind.as_str())?;
+                        reject_command_extra(template_id, "template_id", kind.as_str())?;
+                        reject_command_extra(bindings, "bindings", kind.as_str())?;
+                        reject_command_extra(scope, "scope", kind.as_str())?;
+                        reject_command_extra(
+                            message_template_id,
+                            "message_template_id",
+                            kind.as_str(),
+                        )?;
+                        reject_command_extra(status, "status", kind.as_str())?;
+                        Ok(DriverCommand::MergeBase { target })
+                    }
+                    DriverCommandKind::Commit => {
+                        let message_template_id =
+                            required_map_field(message_template_id, "message_template_id")?;
+                        let bindings = required_map_field(bindings, "bindings")?;
+                        reject_command_extra(role, "role", kind.as_str())?;
+                        reject_command_extra(candidates, "candidates", kind.as_str())?;
+                        reject_command_extra(thread, "thread", kind.as_str())?;
+                        reject_command_extra(template_id, "template_id", kind.as_str())?;
+                        reject_command_extra(scope, "scope", kind.as_str())?;
+                        reject_command_extra(target, "target", kind.as_str())?;
+                        reject_command_extra(status, "status", kind.as_str())?;
+                        Ok(DriverCommand::Commit {
+                            message_template_id,
+                            bindings,
+                        })
+                    }
+                    DriverCommandKind::PauseAtBoundary => {
+                        reject_command_extra(role, "role", kind.as_str())?;
+                        reject_command_extra(candidates, "candidates", kind.as_str())?;
+                        reject_command_extra(thread, "thread", kind.as_str())?;
+                        reject_command_extra(template_id, "template_id", kind.as_str())?;
+                        reject_command_extra(bindings, "bindings", kind.as_str())?;
+                        reject_command_extra(scope, "scope", kind.as_str())?;
+                        reject_command_extra(target, "target", kind.as_str())?;
+                        reject_command_extra(
+                            message_template_id,
+                            "message_template_id",
+                            kind.as_str(),
+                        )?;
+                        reject_command_extra(status, "status", kind.as_str())?;
+                        Ok(DriverCommand::PauseAtBoundary {})
+                    }
+                    DriverCommandKind::SettleRun => {
+                        let status = required_map_field(status, "status")?;
+                        reject_command_extra(role, "role", kind.as_str())?;
+                        reject_command_extra(candidates, "candidates", kind.as_str())?;
+                        reject_command_extra(thread, "thread", kind.as_str())?;
+                        reject_command_extra(template_id, "template_id", kind.as_str())?;
+                        reject_command_extra(bindings, "bindings", kind.as_str())?;
+                        reject_command_extra(scope, "scope", kind.as_str())?;
+                        reject_command_extra(target, "target", kind.as_str())?;
+                        reject_command_extra(
+                            message_template_id,
+                            "message_template_id",
+                            kind.as_str(),
+                        )?;
+                        Ok(DriverCommand::SettleRun { status })
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_map(CommandVisitor)
+    }
+}
+
 /// Diff target selected without exposing refs or paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1389,8 +1911,8 @@ pub struct DriverEventEnvelope {
 }
 
 /// Closed events a local executor may return to a content-blind driver.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DriverEvent {
     CommandAccepted {},
     CommandRejected {
@@ -1423,6 +1945,434 @@ pub enum DriverEvent {
     RunSettled {
         status: DriverRunStatus,
     },
+}
+
+const DRIVER_EVENT_FIELDS: &[&str] = &[
+    "kind",
+    "reason",
+    "thread",
+    "role",
+    "outcome",
+    "artifact",
+    "changed",
+    "available",
+    "cursor",
+    "status",
+];
+
+const DRIVER_EVENT_KINDS: &[&str] = &[
+    "command_accepted",
+    "command_rejected",
+    "workspace_ready",
+    "thread_ready",
+    "turn_finished",
+    "diff_collected",
+    "merge_base_resolved",
+    "commit_recorded",
+    "cursor_advanced",
+    "run_settled",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverEventField {
+    Kind,
+    Reason,
+    Thread,
+    Role,
+    Outcome,
+    Artifact,
+    Changed,
+    Available,
+    Cursor,
+    Status,
+}
+
+impl DriverEventField {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Kind => "kind",
+            Self::Reason => "reason",
+            Self::Thread => "thread",
+            Self::Role => "role",
+            Self::Outcome => "outcome",
+            Self::Artifact => "artifact",
+            Self::Changed => "changed",
+            Self::Available => "available",
+            Self::Cursor => "cursor",
+            Self::Status => "status",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DriverEventField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl<'de> Visitor<'de> for FieldVisitor {
+            type Value = DriverEventField;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a driver event field")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "kind" => Ok(DriverEventField::Kind),
+                    "reason" => Ok(DriverEventField::Reason),
+                    "thread" => Ok(DriverEventField::Thread),
+                    "role" => Ok(DriverEventField::Role),
+                    "outcome" => Ok(DriverEventField::Outcome),
+                    "artifact" => Ok(DriverEventField::Artifact),
+                    "changed" => Ok(DriverEventField::Changed),
+                    "available" => Ok(DriverEventField::Available),
+                    "cursor" => Ok(DriverEventField::Cursor),
+                    "status" => Ok(DriverEventField::Status),
+                    _ => Err(de::Error::unknown_field(value, DRIVER_EVENT_FIELDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverEventKind {
+    CommandAccepted,
+    CommandRejected,
+    WorkspaceReady,
+    ThreadReady,
+    TurnFinished,
+    DiffCollected,
+    MergeBaseResolved,
+    CommitRecorded,
+    CursorAdvanced,
+    RunSettled,
+}
+
+impl DriverEventKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandAccepted => "command_accepted",
+            Self::CommandRejected => "command_rejected",
+            Self::WorkspaceReady => "workspace_ready",
+            Self::ThreadReady => "thread_ready",
+            Self::TurnFinished => "turn_finished",
+            Self::DiffCollected => "diff_collected",
+            Self::MergeBaseResolved => "merge_base_resolved",
+            Self::CommitRecorded => "commit_recorded",
+            Self::CursorAdvanced => "cursor_advanced",
+            Self::RunSettled => "run_settled",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DriverEventKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct KindVisitor;
+
+        impl<'de> Visitor<'de> for KindVisitor {
+            type Value = DriverEventKind;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a driver event kind")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "command_accepted" => Ok(DriverEventKind::CommandAccepted),
+                    "command_rejected" => Ok(DriverEventKind::CommandRejected),
+                    "workspace_ready" => Ok(DriverEventKind::WorkspaceReady),
+                    "thread_ready" => Ok(DriverEventKind::ThreadReady),
+                    "turn_finished" => Ok(DriverEventKind::TurnFinished),
+                    "diff_collected" => Ok(DriverEventKind::DiffCollected),
+                    "merge_base_resolved" => Ok(DriverEventKind::MergeBaseResolved),
+                    "commit_recorded" => Ok(DriverEventKind::CommitRecorded),
+                    "cursor_advanced" => Ok(DriverEventKind::CursorAdvanced),
+                    "run_settled" => Ok(DriverEventKind::RunSettled),
+                    _ => Err(de::Error::unknown_variant(value, DRIVER_EVENT_KINDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(KindVisitor)
+    }
+}
+
+fn reject_event_extra<T, E>(
+    slot: Option<T>,
+    field: &'static str,
+    kind: &'static str,
+) -> Result<(), E>
+where
+    E: de::Error,
+{
+    if slot.is_some() {
+        return Err(de::Error::custom(format!(
+            "field {field} is not valid for {kind} event"
+        )));
+    }
+    Ok(())
+}
+
+fn required_artifact<E>(slot: Option<Option<ArtifactRef>>) -> Result<ArtifactRef, E>
+where
+    E: de::Error,
+{
+    required_map_field(slot, "artifact")?
+        .ok_or_else(|| de::Error::custom("artifact must not be null"))
+}
+
+fn event_field_allowed_for_kind(kind: DriverEventKind, field: DriverEventField) -> bool {
+    match kind {
+        DriverEventKind::CommandAccepted | DriverEventKind::WorkspaceReady => false,
+        DriverEventKind::CommandRejected => matches!(field, DriverEventField::Reason),
+        DriverEventKind::ThreadReady => {
+            matches!(field, DriverEventField::Thread | DriverEventField::Role)
+        }
+        DriverEventKind::TurnFinished => {
+            matches!(
+                field,
+                DriverEventField::Outcome | DriverEventField::Artifact
+            )
+        }
+        DriverEventKind::DiffCollected => {
+            matches!(
+                field,
+                DriverEventField::Changed | DriverEventField::Artifact
+            )
+        }
+        DriverEventKind::MergeBaseResolved => {
+            matches!(
+                field,
+                DriverEventField::Available | DriverEventField::Artifact
+            )
+        }
+        DriverEventKind::CommitRecorded => {
+            matches!(
+                field,
+                DriverEventField::Changed | DriverEventField::Artifact
+            )
+        }
+        DriverEventKind::CursorAdvanced => matches!(field, DriverEventField::Cursor),
+        DriverEventKind::RunSettled => matches!(field, DriverEventField::Status),
+    }
+}
+
+impl<'de> Deserialize<'de> for DriverEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EventVisitor;
+
+        impl<'de> Visitor<'de> for EventVisitor {
+            type Value = DriverEvent;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a closed driver event object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut kind = None;
+                let mut reason = None;
+                let mut thread = None;
+                let mut role = None;
+                let mut outcome = None;
+                let mut artifact = None;
+                let mut changed = None;
+                let mut available = None;
+                let mut cursor = None;
+                let mut status = None;
+
+                while let Some(field) = map.next_key()? {
+                    if let Some(kind) = kind {
+                        if field != DriverEventField::Kind
+                            && !event_field_allowed_for_kind(kind, field)
+                        {
+                            return Err(de::Error::custom(format!(
+                                "field {} is not valid for {} event",
+                                field.as_str(),
+                                kind.as_str()
+                            )));
+                        }
+                    }
+                    match field {
+                        DriverEventField::Kind => read_map_field(&mut map, &mut kind, "kind")?,
+                        DriverEventField::Reason => {
+                            read_map_field(&mut map, &mut reason, "reason")?
+                        }
+                        DriverEventField::Thread => {
+                            read_map_field(&mut map, &mut thread, "thread")?
+                        }
+                        DriverEventField::Role => read_map_field(&mut map, &mut role, "role")?,
+                        DriverEventField::Outcome => {
+                            read_map_field(&mut map, &mut outcome, "outcome")?
+                        }
+                        DriverEventField::Artifact => {
+                            read_map_field(&mut map, &mut artifact, "artifact")?
+                        }
+                        DriverEventField::Changed => {
+                            read_map_field(&mut map, &mut changed, "changed")?
+                        }
+                        DriverEventField::Available => {
+                            read_map_field(&mut map, &mut available, "available")?
+                        }
+                        DriverEventField::Cursor => {
+                            read_map_field(&mut map, &mut cursor, "cursor")?
+                        }
+                        DriverEventField::Status => {
+                            read_map_field(&mut map, &mut status, "status")?
+                        }
+                    }
+                }
+
+                let kind: DriverEventKind = required_map_field(kind, "kind")?;
+                match kind {
+                    DriverEventKind::CommandAccepted => {
+                        reject_event_extra(reason, "reason", kind.as_str())?;
+                        reject_event_extra(thread, "thread", kind.as_str())?;
+                        reject_event_extra(role, "role", kind.as_str())?;
+                        reject_event_extra(outcome, "outcome", kind.as_str())?;
+                        reject_event_extra(artifact, "artifact", kind.as_str())?;
+                        reject_event_extra(changed, "changed", kind.as_str())?;
+                        reject_event_extra(available, "available", kind.as_str())?;
+                        reject_event_extra(cursor, "cursor", kind.as_str())?;
+                        reject_event_extra(status, "status", kind.as_str())?;
+                        Ok(DriverEvent::CommandAccepted {})
+                    }
+                    DriverEventKind::CommandRejected => {
+                        let reason = required_map_field(reason, "reason")?;
+                        reject_event_extra(thread, "thread", kind.as_str())?;
+                        reject_event_extra(role, "role", kind.as_str())?;
+                        reject_event_extra(outcome, "outcome", kind.as_str())?;
+                        reject_event_extra(artifact, "artifact", kind.as_str())?;
+                        reject_event_extra(changed, "changed", kind.as_str())?;
+                        reject_event_extra(available, "available", kind.as_str())?;
+                        reject_event_extra(cursor, "cursor", kind.as_str())?;
+                        reject_event_extra(status, "status", kind.as_str())?;
+                        Ok(DriverEvent::CommandRejected { reason })
+                    }
+                    DriverEventKind::WorkspaceReady => {
+                        reject_event_extra(reason, "reason", kind.as_str())?;
+                        reject_event_extra(thread, "thread", kind.as_str())?;
+                        reject_event_extra(role, "role", kind.as_str())?;
+                        reject_event_extra(outcome, "outcome", kind.as_str())?;
+                        reject_event_extra(artifact, "artifact", kind.as_str())?;
+                        reject_event_extra(changed, "changed", kind.as_str())?;
+                        reject_event_extra(available, "available", kind.as_str())?;
+                        reject_event_extra(cursor, "cursor", kind.as_str())?;
+                        reject_event_extra(status, "status", kind.as_str())?;
+                        Ok(DriverEvent::WorkspaceReady {})
+                    }
+                    DriverEventKind::ThreadReady => {
+                        let thread = required_map_field(thread, "thread")?;
+                        let role = required_map_field(role, "role")?;
+                        reject_event_extra(reason, "reason", kind.as_str())?;
+                        reject_event_extra(outcome, "outcome", kind.as_str())?;
+                        reject_event_extra(artifact, "artifact", kind.as_str())?;
+                        reject_event_extra(changed, "changed", kind.as_str())?;
+                        reject_event_extra(available, "available", kind.as_str())?;
+                        reject_event_extra(cursor, "cursor", kind.as_str())?;
+                        reject_event_extra(status, "status", kind.as_str())?;
+                        Ok(DriverEvent::ThreadReady { thread, role })
+                    }
+                    DriverEventKind::TurnFinished => {
+                        let outcome = required_map_field(outcome, "outcome")?;
+                        let artifact = artifact.unwrap_or(None);
+                        reject_event_extra(reason, "reason", kind.as_str())?;
+                        reject_event_extra(thread, "thread", kind.as_str())?;
+                        reject_event_extra(role, "role", kind.as_str())?;
+                        reject_event_extra(changed, "changed", kind.as_str())?;
+                        reject_event_extra(available, "available", kind.as_str())?;
+                        reject_event_extra(cursor, "cursor", kind.as_str())?;
+                        reject_event_extra(status, "status", kind.as_str())?;
+                        Ok(DriverEvent::TurnFinished { outcome, artifact })
+                    }
+                    DriverEventKind::DiffCollected => {
+                        let changed = required_map_field(changed, "changed")?;
+                        let artifact = required_artifact(artifact)?;
+                        reject_event_extra(reason, "reason", kind.as_str())?;
+                        reject_event_extra(thread, "thread", kind.as_str())?;
+                        reject_event_extra(role, "role", kind.as_str())?;
+                        reject_event_extra(outcome, "outcome", kind.as_str())?;
+                        reject_event_extra(available, "available", kind.as_str())?;
+                        reject_event_extra(cursor, "cursor", kind.as_str())?;
+                        reject_event_extra(status, "status", kind.as_str())?;
+                        Ok(DriverEvent::DiffCollected { changed, artifact })
+                    }
+                    DriverEventKind::MergeBaseResolved => {
+                        let available = required_map_field(available, "available")?;
+                        let artifact = artifact.unwrap_or(None);
+                        reject_event_extra(reason, "reason", kind.as_str())?;
+                        reject_event_extra(thread, "thread", kind.as_str())?;
+                        reject_event_extra(role, "role", kind.as_str())?;
+                        reject_event_extra(outcome, "outcome", kind.as_str())?;
+                        reject_event_extra(changed, "changed", kind.as_str())?;
+                        reject_event_extra(cursor, "cursor", kind.as_str())?;
+                        reject_event_extra(status, "status", kind.as_str())?;
+                        Ok(DriverEvent::MergeBaseResolved {
+                            available,
+                            artifact,
+                        })
+                    }
+                    DriverEventKind::CommitRecorded => {
+                        let changed = required_map_field(changed, "changed")?;
+                        let artifact = artifact.unwrap_or(None);
+                        reject_event_extra(reason, "reason", kind.as_str())?;
+                        reject_event_extra(thread, "thread", kind.as_str())?;
+                        reject_event_extra(role, "role", kind.as_str())?;
+                        reject_event_extra(outcome, "outcome", kind.as_str())?;
+                        reject_event_extra(available, "available", kind.as_str())?;
+                        reject_event_extra(cursor, "cursor", kind.as_str())?;
+                        reject_event_extra(status, "status", kind.as_str())?;
+                        Ok(DriverEvent::CommitRecorded { changed, artifact })
+                    }
+                    DriverEventKind::CursorAdvanced => {
+                        let cursor = required_map_field(cursor, "cursor")?;
+                        reject_event_extra(reason, "reason", kind.as_str())?;
+                        reject_event_extra(thread, "thread", kind.as_str())?;
+                        reject_event_extra(role, "role", kind.as_str())?;
+                        reject_event_extra(outcome, "outcome", kind.as_str())?;
+                        reject_event_extra(artifact, "artifact", kind.as_str())?;
+                        reject_event_extra(changed, "changed", kind.as_str())?;
+                        reject_event_extra(available, "available", kind.as_str())?;
+                        reject_event_extra(status, "status", kind.as_str())?;
+                        Ok(DriverEvent::CursorAdvanced { cursor })
+                    }
+                    DriverEventKind::RunSettled => {
+                        let status = required_map_field(status, "status")?;
+                        reject_event_extra(reason, "reason", kind.as_str())?;
+                        reject_event_extra(thread, "thread", kind.as_str())?;
+                        reject_event_extra(role, "role", kind.as_str())?;
+                        reject_event_extra(outcome, "outcome", kind.as_str())?;
+                        reject_event_extra(artifact, "artifact", kind.as_str())?;
+                        reject_event_extra(changed, "changed", kind.as_str())?;
+                        reject_event_extra(available, "available", kind.as_str())?;
+                        reject_event_extra(cursor, "cursor", kind.as_str())?;
+                        Ok(DriverEvent::RunSettled { status })
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_map(EventVisitor)
+    }
 }
 
 /// Closed refusal reasons. Human-readable diagnostics stay local.
@@ -1717,6 +2667,128 @@ mod tests {
     }
 
     #[test]
+    fn all_command_and_event_variants_round_trip() {
+        let bindings = BoundedVec::new(
+            "bindings",
+            vec![binding(
+                ArtifactBindingSlot::Plan,
+                "artifact.plan.1",
+                ArtifactKind::Plan,
+            )],
+        )
+        .unwrap();
+        let commands = vec![
+            DriverCommand::RequireWorkspace {},
+            DriverCommand::StartThread {
+                role: DriverRole::Tl,
+            },
+            DriverCommand::ResumeOrStartThread {
+                role: DriverRole::Dev,
+                candidates: BoundedVec::new(
+                    "candidates",
+                    vec![ThreadHandle::new("thread-1").unwrap()],
+                )
+                .unwrap(),
+            },
+            DriverCommand::RunTemplate {
+                thread: ThreadHandle::new("thread-2").unwrap(),
+                role: DriverRole::Reviewer,
+                template_id: token("review.template"),
+                bindings: bindings.clone(),
+            },
+            DriverCommand::CheckpointCommit {},
+            DriverCommand::CollectDiff {
+                scope: DiffScope::Head,
+            },
+            DriverCommand::MergeBase {
+                target: MergeBaseTarget::PinnedTarget,
+            },
+            DriverCommand::Commit {
+                message_template_id: token("commit.message"),
+                bindings,
+            },
+            DriverCommand::PauseAtBoundary {},
+            DriverCommand::SettleRun {
+                status: DriverRunStatus::Cancelled,
+            },
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            let envelope = command_envelope(command, index as u64 + 1);
+            let encoded = serde_json::to_string(&envelope).expect("serialize command");
+            let decoded: DriverCommandEnvelope =
+                serde_json::from_str(&encoded).expect("deserialize command");
+            assert_eq!(decoded, envelope);
+        }
+
+        let cursor = DriverCursor {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            backend: OrchestrationBackendKind::Cloud,
+            status: DriverRunStatus::Running,
+            phase: DriverPhase::SubTasks,
+            state_revision: 9,
+            last_command_seq: 8,
+            last_event_seq: 7,
+            in_flight_command_id: Some(CommandId::new("cmd-8").unwrap()),
+            current_sub_task_index: 1,
+            sub_task_count: 3,
+            current_rounds_used: 1,
+            max_review_rounds: 2,
+            design_review_rounds: 1,
+            mr_rounds_used: 0,
+            tl_generation: 2,
+            pause_requested: false,
+            awaiting_user: true,
+            artifacts: BoundedVec::new(
+                "artifacts",
+                vec![artifact("artifact.cursor.1", ArtifactKind::Plan)],
+            )
+            .unwrap(),
+        };
+        let events = vec![
+            DriverEvent::CommandAccepted {},
+            DriverEvent::CommandRejected {
+                reason: CommandRejection::UnknownRevision,
+            },
+            DriverEvent::WorkspaceReady {},
+            DriverEvent::ThreadReady {
+                thread: ThreadHandle::new("thread-3").unwrap(),
+                role: DriverRole::Dev,
+            },
+            DriverEvent::TurnFinished {
+                outcome: TurnOutcomeKind::Blocked,
+                artifact: None,
+            },
+            DriverEvent::TurnFinished {
+                outcome: TurnOutcomeKind::Replied,
+                artifact: Some(artifact("artifact.turn.1", ArtifactKind::TranscriptDigest)),
+            },
+            DriverEvent::DiffCollected {
+                changed: false,
+                artifact: artifact("artifact.diff.1", ArtifactKind::WorkspaceDiff),
+            },
+            DriverEvent::MergeBaseResolved {
+                available: false,
+                artifact: None,
+            },
+            DriverEvent::CommitRecorded {
+                changed: true,
+                artifact: Some(artifact("artifact.report.1", ArtifactKind::Report)),
+            },
+            DriverEvent::CursorAdvanced { cursor },
+            DriverEvent::RunSettled {
+                status: DriverRunStatus::Failed,
+            },
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            let envelope = event_envelope(event, index as u64 + 1);
+            let encoded = serde_json::to_string(&envelope).expect("serialize event");
+            let decoded: DriverEventEnvelope =
+                serde_json::from_str(&encoded).expect("deserialize event");
+            assert_eq!(decoded, envelope);
+        }
+    }
+
+    #[test]
     fn protocol_negotiation_selects_highest_overlap() {
         let selected = negotiate_protocol(
             ProtocolRange::new(1, 1).unwrap(),
@@ -1759,8 +2831,34 @@ mod tests {
         assert!(ThreadHandle::new("/tmp/repo").is_err());
         assert!(ThreadHandle::new("https://example.test/run").is_err());
         assert!(ThreadHandle::new("shell echo hi").is_err());
+        assert!(matches!(
+            ArtifactId::new(".."),
+            Err(ProtocolValueError::InvalidTokenShape {
+                field: "artifact_id"
+            })
+        ));
+        assert!(matches!(
+            ArtifactId::new(".artifact"),
+            Err(ProtocolValueError::InvalidTokenShape {
+                field: "artifact_id"
+            })
+        ));
+        assert!(matches!(
+            ArtifactId::new("artifact..one"),
+            Err(ProtocolValueError::InvalidTokenShape {
+                field: "artifact_id"
+            })
+        ));
+        assert!(ArtifactId::new("artifact.plan.1").is_ok());
         let too_long = "x".repeat(MAX_OPAQUE_ID_LEN + 1);
         assert!(CommandId::new(too_long).is_err());
+
+        let path_like_artifact: Result<ArtifactRef, _> =
+            serde_json::from_str(r#"{"artifact_id":"..","kind":"plan","revision":1}"#);
+        assert!(
+            path_like_artifact.is_err(),
+            "path-shaped artifact ids must fail decode"
+        );
     }
 
     #[test]
@@ -1799,6 +2897,126 @@ mod tests {
         assert!(
             decoded.is_err(),
             "oversized candidate lists must fail closed"
+        );
+    }
+
+    #[test]
+    fn command_decode_rejects_unknown_payload_without_reading_value() {
+        let command_with_invalid_payload = r#"{
+            "protocol_version":1,
+            "command_id":"cmd-1",
+            "sequence":1,
+            "expected_revision":1,
+            "command":{"kind":"require_workspace","payload":@@@}
+        }"#;
+        let err = serde_json::from_str::<DriverCommandEnvelope>(command_with_invalid_payload)
+            .expect_err("unknown command fields must fail before payload decode")
+            .to_string();
+        assert!(
+            err.contains("unknown field `payload`"),
+            "unexpected command decode error: {err}"
+        );
+
+        let command_with_wrong_field = r#"{
+            "protocol_version":1,
+            "command_id":"cmd-1",
+            "sequence":1,
+            "expected_revision":1,
+            "command":{"kind":"require_workspace","bindings":@@@}
+        }"#;
+        let err = serde_json::from_str::<DriverCommandEnvelope>(command_with_wrong_field)
+            .expect_err("wrong command fields must fail before payload decode")
+            .to_string();
+        assert!(
+            err.contains("field bindings is not valid for require_workspace command"),
+            "unexpected command field decode error: {err}"
+        );
+
+        let event_with_invalid_payload = r#"{
+            "protocol_version":1,
+            "event_id":"event-1",
+            "sequence":1,
+            "command_id":"cmd-1",
+            "observed_revision":1,
+            "event":{"kind":"command_accepted","log":@@@}
+        }"#;
+        let err = serde_json::from_str::<DriverEventEnvelope>(event_with_invalid_payload)
+            .expect_err("unknown event fields must fail before payload decode")
+            .to_string();
+        assert!(
+            err.contains("unknown field `log`"),
+            "unexpected event decode error: {err}"
+        );
+
+        let event_with_wrong_field = r#"{
+            "protocol_version":1,
+            "event_id":"event-1",
+            "sequence":1,
+            "command_id":"cmd-1",
+            "observed_revision":1,
+            "event":{"kind":"command_accepted","cursor":@@@}
+        }"#;
+        let err = serde_json::from_str::<DriverEventEnvelope>(event_with_wrong_field)
+            .expect_err("wrong event fields must fail before payload decode")
+            .to_string();
+        assert!(
+            err.contains("field cursor is not valid for command_accepted event"),
+            "unexpected event field decode error: {err}"
+        );
+    }
+
+    #[test]
+    fn bounded_collections_stop_before_decoding_over_limit_item() {
+        let mut candidates = (0..MAX_CANDIDATE_THREADS)
+            .map(|index| format!("\"thread-{index}\""))
+            .collect::<Vec<_>>();
+        candidates.push(r#""/tmp/secret""#.to_string());
+        let json = format!(
+            r#"{{
+                "protocol_version":1,
+                "command_id":"cmd-1",
+                "sequence":1,
+                "expected_revision":1,
+                "command":{{
+                    "kind":"resume_or_start_thread",
+                    "role":"dev",
+                    "candidates":[{}]
+                }}
+            }}"#,
+            candidates.join(",")
+        );
+        let err = serde_json::from_str::<DriverCommandEnvelope>(&json)
+            .expect_err("over-limit candidates must fail")
+            .to_string();
+        assert!(
+            err.contains("too many items"),
+            "expected collection bound error, got {err}"
+        );
+        assert!(
+            !err.contains("invalid character"),
+            "over-limit candidate item should not be decoded as a thread handle: {err}"
+        );
+
+        let too_long = "x".repeat(MAX_OPAQUE_ID_LEN + 1);
+        let json = format!(
+            r#"{{
+                "protocol_version":1,
+                "command_id":"cmd-1",
+                "sequence":1,
+                "expected_revision":1,
+                "command":{{
+                    "kind":"resume_or_start_thread",
+                    "role":"dev",
+                    "candidates":["{too_long}"]
+                }}
+            }}"#
+        );
+        let err = serde_json::from_str::<DriverCommandEnvelope>(&json)
+            .expect_err("over-limit thread handles must fail")
+            .to_string();
+        assert!(
+            err.contains("thread_handle is too long"),
+            "unexpected token bound error: {err}"
         );
     }
 
@@ -2301,596 +3519,5 @@ mod tests {
         assert!(encoded.contains("artifact.task.1"));
         assert!(encoded.contains("\"state_revision\":4"));
         assert!(encoded.contains("\"awaiting_user\":true"));
-    }
-}
-
-#[cfg(test)]
-mod scratch_adversarial {
-    use super::*;
-
-    fn envelope(command_body: &str) -> String {
-        format!(
-            r#"{{"protocol_version":1,"command_id":"cmd-1","sequence":1,"expected_revision":1,"command":{command_body}}}"#
-        )
-    }
-
-    #[test]
-    fn s01_duplicate_tag_key() {
-        for body in [
-            r#"{"kind":"require_workspace","kind":"start_thread"}"#,
-            r#"{"kind":"start_thread","kind":"require_workspace","role":"tl"}"#,
-            r#"{"kind":"require_workspace","kind":"CANARY"}"#,
-        ] {
-            let r = serde_json::from_str::<DriverCommandEnvelope>(&envelope(body));
-            println!("s01 {body} => {:?}", r.map(|v| format!("{:?}", v.command)));
-        }
-    }
-
-    #[test]
-    fn s02_nested_cursor_unknown_field_inside_tagged_event() {
-        let raw = r#"{
-            "protocol_version":1,"event_id":"e","sequence":1,"command_id":"c","observed_revision":1,
-            "event":{"kind":"cursor_advanced","cursor":{
-                "protocol_version":1,"backend":"cloud","status":"running","phase":"sub_tasks",
-                "state_revision":1,"last_command_seq":1,"last_event_seq":1,
-                "current_sub_task_index":0,"sub_task_count":1,"current_rounds_used":0,
-                "max_review_rounds":2,"design_review_rounds":0,"mr_rounds_used":0,
-                "tl_generation":1,"pause_requested":false,"awaiting_user":false,"artifacts":[],
-                "cwd":"/tmp/CANARY"}}}"#;
-        let r = serde_json::from_str::<DriverEventEnvelope>(raw);
-        println!("s02 nested cursor unknown field => {:?}", r.is_err());
-        assert!(r.is_err(), "SMUGGLED: {r:?}");
-    }
-
-    #[test]
-    fn s03_nested_artifact_unknown_field_inside_tagged_event() {
-        let raw = r#"{
-            "protocol_version":1,"event_id":"e","sequence":1,"command_id":"c","observed_revision":1,
-            "event":{"kind":"diff_collected","changed":true,
-              "artifact":{"artifact_id":"a1","kind":"workspace_diff","revision":1,"path":"/tmp/CANARY"}}}"#;
-        let r = serde_json::from_str::<DriverEventEnvelope>(raw);
-        println!("s03 nested artifact unknown field => {:?}", r.is_err());
-        assert!(r.is_err(), "SMUGGLED: {r:?}");
-    }
-
-    #[test]
-    fn s04_protocol_range_pub_field_bypass_round_trip() {
-        let bogus = ProtocolRange { min: 3, max: 2 };
-        let encoded = serde_json::to_string(&bogus).unwrap();
-        let back = serde_json::from_str::<ProtocolRange>(&encoded);
-        println!("s04 {encoded} => {back:?}");
-        let zero = ProtocolRange { min: 0, max: 0 };
-        let encoded0 = serde_json::to_string(&zero).unwrap();
-        println!(
-            "s04 zero {encoded0} => {:?}",
-            serde_json::from_str::<ProtocolRange>(&encoded0)
-        );
-        let hello = ProtocolHello {
-            supported: bogus,
-            driver_version: DriverVersion::new("d.1").unwrap(),
-            backend: OrchestrationBackendKind::Cloud,
-        };
-        let he = serde_json::to_string(&hello).unwrap();
-        println!(
-            "s04 hello {he} => {:?}",
-            serde_json::from_str::<ProtocolHello>(&he)
-        );
-    }
-
-    #[test]
-    fn s05_cursor_pub_field_bypass_round_trip() {
-        let mut cursor = DriverCursor {
-            protocol_version: 999,
-            backend: OrchestrationBackendKind::Cloud,
-            status: DriverRunStatus::Running,
-            phase: DriverPhase::SubTasks,
-            state_revision: 1,
-            last_command_seq: 1,
-            last_event_seq: 1,
-            in_flight_command_id: None,
-            current_sub_task_index: 0,
-            sub_task_count: 1,
-            current_rounds_used: 0,
-            max_review_rounds: 2,
-            design_review_rounds: 0,
-            mr_rounds_used: 0,
-            tl_generation: 1,
-            pause_requested: false,
-            awaiting_user: false,
-            artifacts: BoundedVec::empty(),
-        };
-        let encoded = serde_json::to_string(&cursor).unwrap();
-        println!(
-            "s05 protocol_version 999 round trip => {:?}",
-            serde_json::from_str::<DriverCursor>(&encoded).is_err()
-        );
-        cursor.protocol_version = 0;
-        let encoded = serde_json::to_string(&cursor).unwrap();
-        println!(
-            "s05 protocol_version 0 round trip => {:?}",
-            serde_json::from_str::<DriverCursor>(&encoded).is_err()
-        );
-    }
-
-    #[test]
-    fn s06_token_grammar_accepts_relative_path_components() {
-        for raw in ["..", ".", "...", "-", "_", "..-..", ".git", "-rf"] {
-            println!("s06 token {raw:?} => {:?}", ArtifactId::new(raw).is_ok());
-        }
-        assert!(
-            ArtifactId::new("..").is_ok(),
-            "expected `..` to be accepted (documenting)"
-        );
-    }
-
-    #[test]
-    fn s07_backend_ref_round_trips() {
-        for backend in [
-            OrchestrationBackendRef::LegacyEmbedded,
-            OrchestrationBackendRef::Cloud {
-                protocol_version: 1,
-                driver_version: DriverVersion::new("d.1").unwrap(),
-                cloud_run_id: DriverRunId::new("r.1").unwrap(),
-            },
-            OrchestrationBackendRef::LocalSidecar {
-                protocol_version: 1,
-                driver_version: DriverVersion::new("d.1").unwrap(),
-            },
-            OrchestrationBackendRef::UnknownNonExecuting,
-        ] {
-            let encoded = serde_json::to_string(&backend).unwrap();
-            let back: OrchestrationBackendRef = serde_json::from_str(&encoded).unwrap();
-            println!("s07 {encoded} => same={}", back == backend);
-            assert_eq!(back, backend, "asymmetric round trip for {encoded}");
-        }
-    }
-
-    #[test]
-    fn s08_backend_ref_future_shape_is_lossy_on_resave() {
-        let future = r#"{"kind":"cloud","protocol_version":2,"driver_version":"d.2","cloud_run_id":"r.2","region":"eu"}"#;
-        let decoded: OrchestrationBackendRef = serde_json::from_str(future).unwrap();
-        let resaved = serde_json::to_string(&decoded).unwrap();
-        println!("s08 {future}\n  -> {decoded:?}\n  -> {resaved}");
-        assert_eq!(resaved, r#"{"kind":"unknown_non_executing"}"#);
-    }
-
-    #[test]
-    fn s09_driver_progress_duplicate_keys_take_the_first() {
-        let p: DriverProgress =
-            serde_json::from_str(r#"{"state_revision":1,"state_revision":99}"#).unwrap();
-        println!("s09 duplicate state_revision => {}", p.state_revision);
-        let b: OrchestrationBackendRef =
-            serde_json::from_str(r#"{"kind":"legacy_embedded","kind":"legacy_embedded"}"#).unwrap();
-        println!("s09 duplicate kind backend => {b:?}");
-    }
-
-    #[test]
-    fn s10_driver_progress_number_shapes() {
-        for raw in [
-            r#"{"state_revision":18446744073709551615}"#,
-            r#"{"state_revision":18446744073709551616}"#,
-            r#"{"state_revision":1e3}"#,
-            r#"{"state_revision":-1}"#,
-            r#"{"state_revision":1.0}"#,
-        ] {
-            let p: DriverProgress = serde_json::from_str(raw).unwrap();
-            println!("s10 {raw} => {}", p.state_revision);
-        }
-    }
-
-    #[test]
-    fn s11_negotiate_with_unvalidated_ranges() {
-        for (l, p) in [
-            (ProtocolRange { min: 0, max: 0 }, ProtocolRange::current()),
-            (ProtocolRange::current(), ProtocolRange { min: 0, max: 0 }),
-            (ProtocolRange::current(), ProtocolRange { min: 5, max: 1 }),
-            (ProtocolRange { min: 5, max: 1 }, ProtocolRange::current()),
-            (
-                ProtocolRange::current(),
-                ProtocolRange {
-                    min: 0,
-                    max: u32::MAX,
-                },
-            ),
-        ] {
-            println!("s11 local={l:?} peer={p:?} => {:?}", negotiate_protocol(l, p));
-        }
-    }
-
-    #[test]
-    fn s12_duplicate_known_field_in_tagged_variant() {
-        for body in [
-            r#"{"kind":"start_thread","role":"tl","role":"dev"}"#,
-            r#"{"kind":"settle_run","status":"done","status":"failed"}"#,
-        ] {
-            let r = serde_json::from_str::<DriverCommandEnvelope>(&envelope(body));
-            println!("s12 {body} => {:?}", r.map(|v| format!("{:?}", v.command)));
-        }
-    }
-
-    #[test]
-    fn s13_top_level_duplicate_and_unknown() {
-        for raw in [
-            r#"{"protocol_version":1,"command_id":"cmd-1","sequence":1,"expected_revision":1,"command":{"kind":"require_workspace"},"note":"CANARY"}"#,
-            r#"{"protocol_version":1,"command_id":"cmd-1","command_id":"cmd-2","sequence":1,"expected_revision":1,"command":{"kind":"require_workspace"}}"#,
-        ] {
-            println!(
-                "s13 => {:?}",
-                serde_json::from_str::<DriverCommandEnvelope>(raw).is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn s14_bounded_vec_exact_max_and_non_seq() {
-        let items: Vec<String> = (0..MAX_CANDIDATE_THREADS)
-            .map(|i| format!("\"thread-{i}\""))
-            .collect();
-        let raw = format!("[{}]", items.join(","));
-        let v: Result<BoundedVec<ThreadHandle, MAX_CANDIDATE_THREADS>, _> =
-            serde_json::from_str(&raw);
-        println!("s14 exact MAX => ok={}", v.is_ok());
-        let v2: Result<BoundedVec<ThreadHandle, MAX_CANDIDATE_THREADS>, _> =
-            serde_json::from_str(r#"{"a":"b"}"#);
-        println!("s14 map => err={}", v2.is_err());
-        let v3: Result<BoundedVec<ThreadHandle, MAX_CANDIDATE_THREADS>, _> =
-            serde_json::from_str("null");
-        println!("s14 null => err={}", v3.is_err());
-    }
-
-    #[test]
-    fn s15_via_serde_json_value_path() {
-        let raw = serde_json::json!({
-            "protocol_version":1,"command_id":"cmd-1","sequence":1,"expected_revision":1,
-            "command":{"kind":"require_workspace","payload":"CANARY"}
-        });
-        println!(
-            "s15 from_value unknown field => err={}",
-            serde_json::from_value::<DriverCommandEnvelope>(raw).is_err()
-        );
-        let raw2 = serde_json::json!({
-            "protocol_version":1,"command_id":"cmd-1","sequence":1,"expected_revision":1,
-            "command":{"kind":"start_thread","role":"tl","prompt":"CANARY"}
-        });
-        println!(
-            "s15 from_value unknown field on struct variant => err={}",
-            serde_json::from_value::<DriverCommandEnvelope>(raw2).is_err()
-        );
-    }
-
-    #[test]
-    fn s16_hello_unknown_fields() {
-        println!(
-            "s16 hello extra => err={}",
-            serde_json::from_str::<ProtocolHello>(
-                r#"{"supported":{"min":1,"max":1},"driver_version":"d","backend":"cloud","note":"CANARY"}"#
-            )
-            .is_err()
-        );
-        println!(
-            "s16 range extra => err={}",
-            serde_json::from_str::<ProtocolHello>(
-                r#"{"supported":{"min":1,"max":1,"note":"CANARY"},"driver_version":"d","backend":"cloud"}"#
-            )
-            .is_err()
-        );
-        println!(
-            "s16 negotiation extra => err={}",
-            serde_json::from_str::<ProtocolNegotiation>(
-                r#"{"selected_version":1,"note":"CANARY"}"#
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn s17_zero_field_variants_accept_non_map_content() {
-        for body in [
-            r#"{"kind":"require_workspace"}"#,
-            r#"{"kind":"checkpoint_commit"}"#,
-            r#"{"kind":"pause_at_boundary"}"#,
-        ] {
-            println!(
-                "s17 {body} => ok={}",
-                serde_json::from_str::<DriverCommandEnvelope>(&envelope(body)).is_ok()
-            );
-        }
-        for body in [
-            r#"{"kind":"require_workspace","artifact":{"artifact_id":"a","kind":"plan","revision":1}}"#,
-        ] {
-            println!(
-                "s17 smuggle {body} => err={}",
-                serde_json::from_str::<DriverCommandEnvelope>(&envelope(body)).is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn s18_turn_finished_missing_optional_artifact() {
-        let raw = r#"{"protocol_version":1,"event_id":"e","sequence":1,"command_id":"c","observed_revision":1,"event":{"kind":"turn_finished","outcome":"replied"}}"#;
-        println!(
-            "s18 missing artifact => {:?}",
-            serde_json::from_str::<DriverEventEnvelope>(raw).is_ok()
-        );
-        let v = DriverEvent::TurnFinished {
-            outcome: TurnOutcomeKind::Silent,
-            artifact: None,
-        };
-        println!("s18 serialized => {}", serde_json::to_string(&v).unwrap());
-    }
-}
-
-#[cfg(test)]
-mod scratch_adversarial2 {
-    use super::*;
-
-    fn art(id: &str) -> ArtifactRef {
-        ArtifactRef {
-            artifact_id: ArtifactId::new(id).unwrap(),
-            kind: ArtifactKind::Plan,
-            revision: 3,
-            size_bytes: None,
-        }
-    }
-
-    fn cursor() -> DriverCursor {
-        DriverCursor {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            backend: OrchestrationBackendKind::Cloud,
-            status: DriverRunStatus::Running,
-            phase: DriverPhase::SubTasks,
-            state_revision: u64::MAX,
-            last_command_seq: 9007199254740993,
-            last_event_seq: 7,
-            in_flight_command_id: Some(CommandId::new("cmd-8").unwrap()),
-            current_sub_task_index: 1,
-            sub_task_count: 3,
-            current_rounds_used: 1,
-            max_review_rounds: 2,
-            design_review_rounds: 1,
-            mr_rounds_used: 0,
-            tl_generation: 2,
-            pause_requested: false,
-            awaiting_user: true,
-            artifacts: BoundedVec::new("artifacts", vec![art("a.1"), art("a.2")]).unwrap(),
-        }
-    }
-
-    #[test]
-    fn t01_every_command_variant_round_trips() {
-        let bindings = BoundedVec::new(
-            "bindings",
-            vec![ArtifactBinding {
-                slot: ArtifactBindingSlot::Plan,
-                artifact: art("a.1"),
-            }],
-        )
-        .unwrap();
-        let commands = vec![
-            DriverCommand::RequireWorkspace {},
-            DriverCommand::StartThread {
-                role: DriverRole::Tl,
-            },
-            DriverCommand::ResumeOrStartThread {
-                role: DriverRole::Dev,
-                candidates: BoundedVec::new("c", vec![ThreadHandle::new("t-1").unwrap()]).unwrap(),
-            },
-            DriverCommand::ResumeOrStartThread {
-                role: DriverRole::Dev,
-                candidates: BoundedVec::empty(),
-            },
-            DriverCommand::RunTemplate {
-                thread: ThreadHandle::new("t-2").unwrap(),
-                role: DriverRole::Reviewer,
-                template_id: TemplateId::new("tpl.1").unwrap(),
-                bindings: bindings.clone(),
-            },
-            DriverCommand::CheckpointCommit {},
-            DriverCommand::CollectDiff {
-                scope: DiffScope::Head,
-            },
-            DriverCommand::MergeBase {
-                target: MergeBaseTarget::PinnedTarget,
-            },
-            DriverCommand::Commit {
-                message_template_id: TemplateId::new("m.1").unwrap(),
-                bindings,
-            },
-            DriverCommand::PauseAtBoundary {},
-            DriverCommand::SettleRun {
-                status: DriverRunStatus::Cancelled,
-            },
-        ];
-        for command in commands {
-            let env = DriverCommandEnvelope {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
-                command_id: CommandId::new("cmd-1").unwrap(),
-                sequence: u64::MAX,
-                expected_revision: u64::MAX - 1,
-                command,
-            };
-            let encoded = serde_json::to_string(&env).unwrap();
-            match serde_json::from_str::<DriverCommandEnvelope>(&encoded) {
-                Ok(back) => assert_eq!(back, env, "value changed for {encoded}"),
-                Err(e) => panic!("ROUND TRIP FAILED {encoded}: {e}"),
-            }
-        }
-        println!("t01 all command variants round trip");
-    }
-
-    #[test]
-    fn t02_every_event_variant_round_trips() {
-        let events = vec![
-            DriverEvent::CommandAccepted {},
-            DriverEvent::CommandRejected {
-                reason: CommandRejection::UnknownRevision,
-            },
-            DriverEvent::WorkspaceReady {},
-            DriverEvent::ThreadReady {
-                thread: ThreadHandle::new("t-3").unwrap(),
-                role: DriverRole::Dev,
-            },
-            DriverEvent::TurnFinished {
-                outcome: TurnOutcomeKind::Blocked,
-                artifact: None,
-            },
-            DriverEvent::TurnFinished {
-                outcome: TurnOutcomeKind::Replied,
-                artifact: Some(art("a.9")),
-            },
-            DriverEvent::DiffCollected {
-                changed: false,
-                artifact: art("a.10"),
-            },
-            DriverEvent::MergeBaseResolved {
-                available: false,
-                artifact: None,
-            },
-            DriverEvent::CommitRecorded {
-                changed: true,
-                artifact: Some(art("a.11")),
-            },
-            DriverEvent::CursorAdvanced { cursor: cursor() },
-            DriverEvent::RunSettled {
-                status: DriverRunStatus::Failed,
-            },
-        ];
-        for event in events {
-            let env = DriverEventEnvelope {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
-                event_id: EventId::new("e-1").unwrap(),
-                sequence: u64::MAX,
-                command_id: CommandId::new("cmd-1").unwrap(),
-                observed_revision: u64::MAX - 3,
-                event,
-            };
-            let encoded = serde_json::to_string(&env).unwrap();
-            match serde_json::from_str::<DriverEventEnvelope>(&encoded) {
-                Ok(back) => assert_eq!(back, env, "VALUE CHANGED for {encoded}"),
-                Err(e) => panic!("ROUND TRIP FAILED {encoded}: {e}"),
-            }
-        }
-        println!("t02 all event variants round trip");
-    }
-
-    #[test]
-    fn t03_oversized_candidates_error_reason() {
-        let json = format!(
-            r#"{{"protocol_version":1,"command_id":"cmd-1","sequence":1,"expected_revision":1,"command":{{"kind":"resume_or_start_thread","role":"dev","candidates":[{}]}}}}"#,
-            (0..=MAX_CANDIDATE_THREADS)
-                .map(|i| format!("\"thread-{i}\""))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        println!(
-            "t03 oversized => {:?}",
-            serde_json::from_str::<DriverCommandEnvelope>(&json).map(|_| ()).unwrap_err()
-        );
-        let cursor_json = format!(
-            r#"{{"protocol_version":1,"event_id":"e","sequence":1,"command_id":"c","observed_revision":1,"event":{{"kind":"cursor_advanced","cursor":{{"protocol_version":1,"backend":"cloud","status":"running","phase":"sub_tasks","state_revision":1,"last_command_seq":1,"last_event_seq":1,"current_sub_task_index":0,"sub_task_count":1,"current_rounds_used":0,"max_review_rounds":2,"design_review_rounds":0,"mr_rounds_used":0,"tl_generation":1,"pause_requested":false,"awaiting_user":false,"artifacts":[{}]}}}}}}"#,
-            (0..=MAX_CURSOR_ARTIFACTS)
-                .map(|i| format!(r#"{{"artifact_id":"a{i}","kind":"plan","revision":1}}"#))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        println!(
-            "t03 oversized nested cursor artifacts => {:?}",
-            serde_json::from_str::<DriverEventEnvelope>(&cursor_json).map(|_| ()).unwrap_err()
-        );
-    }
-
-    #[test]
-    fn t04_bound_is_not_a_decode_time_input_bound_for_tagged_payloads() {
-        // Direct (untagged) BoundedVec: parser should stop at MAX+1 and never
-        // reach the trailing garbage.
-        let mut direct = String::from("[");
-        for i in 0..(MAX_CANDIDATE_THREADS + 5) {
-            direct.push_str(&format!("\"t-{i}\","));
-        }
-        direct.push_str("@@@GARBAGE@@@]");
-        let d = serde_json::from_str::<BoundedVec<ThreadHandle, MAX_CANDIDATE_THREADS>>(&direct);
-        println!("t04 direct => {:?}", d.map(|_| ()).unwrap_err());
-
-        // Same array inside an internally tagged variant.
-        let tagged = format!(
-            r#"{{"protocol_version":1,"command_id":"c","sequence":1,"expected_revision":1,"command":{{"kind":"resume_or_start_thread","role":"dev","candidates":{direct}}}}}"#
-        );
-        let t = serde_json::from_str::<DriverCommandEnvelope>(&tagged);
-        println!("t04 tagged  => {:?}", t.map(|_| ()).unwrap_err());
-    }
-
-    #[test]
-    fn t05_tagged_enum_rejects_non_map_and_string_variants() {
-        for body in ["\"require_workspace\"", "[]", "5", "null", "true"] {
-            let raw = format!(
-                r#"{{"protocol_version":1,"command_id":"c","sequence":1,"expected_revision":1,"command":{body}}}"#
-            );
-            println!(
-                "t05 command={body} => err={}",
-                serde_json::from_str::<DriverCommandEnvelope>(&raw).is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn t06_driver_progress_drops_future_fields_on_resave() {
-        let future = r#"{"state_revision":42,"last_command_seq":7,"last_event_seq":6,"in_flight_command_id":"cmd-a","in_flight_event_id":"evt-a","journal_epoch":3}"#;
-        let p: DriverProgress = serde_json::from_str(future).unwrap();
-        println!("t06 {future}\n  -> {}", serde_json::to_string(&p).unwrap());
-    }
-
-    #[test]
-    fn t07_command_id_over_limit_silently_dropped_in_progress() {
-        let long = "c".repeat(MAX_OPAQUE_ID_LEN + 1);
-        let raw = format!(r#"{{"state_revision":5,"in_flight_command_id":"{long}"}}"#);
-        let p: DriverProgress = serde_json::from_str(&raw).unwrap();
-        println!(
-            "t07 state_revision={} in_flight={:?}",
-            p.state_revision,
-            p.in_flight_command_id.as_ref().map(|c| c.as_str())
-        );
-    }
-
-    #[test]
-    fn t08_cursor_artifacts_default_when_absent() {
-        let raw = r#"{"protocol_version":1,"backend":"cloud","status":"running","phase":"sub_tasks","state_revision":1,"last_command_seq":1,"last_event_seq":1,"current_sub_task_index":0,"sub_task_count":1,"current_rounds_used":0,"max_review_rounds":2,"design_review_rounds":0,"mr_rounds_used":0,"tl_generation":1,"pause_requested":false,"awaiting_user":false}"#;
-        println!(
-            "t08 absent artifacts => {:?}",
-            serde_json::from_str::<DriverCursor>(raw).map(|c| c.artifacts.as_slice().len())
-        );
-        let raw_null = raw.replace("}", r#","artifacts":null}"#);
-        println!(
-            "t08 null artifacts => err={}",
-            serde_json::from_str::<DriverCursor>(&raw_null).is_err()
-        );
-    }
-
-    #[test]
-    fn t09_backend_ref_from_serde_json_value() {
-        let v = serde_json::json!({"kind":"legacy_embedded"});
-        println!(
-            "t09 from_value legacy => {:?}",
-            serde_json::from_value::<OrchestrationBackendRef>(v)
-        );
-        let v2 = serde_json::json!({"kind":"cloud","protocol_version":1,"driver_version":"d","cloud_run_id":"r"});
-        println!(
-            "t09 from_value cloud => {:?}",
-            serde_json::from_value::<OrchestrationBackendRef>(v2)
-        );
-    }
-
-    #[test]
-    fn t10_negotiation_selected_version_bounds() {
-        let n = negotiate_protocol(
-            ProtocolRange::new(1, u32::MAX).unwrap(),
-            ProtocolRange::new(1, u32::MAX).unwrap(),
-        )
-        .unwrap();
-        println!("t10 selected={}", n.selected_version);
-        let encoded = serde_json::to_string(&n).unwrap();
-        println!(
-            "t10 round trip ok={}",
-            serde_json::from_str::<ProtocolNegotiation>(&encoded).is_ok()
-        );
     }
 }
