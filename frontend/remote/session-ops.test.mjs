@@ -5603,6 +5603,131 @@ test("applyTranscriptEntryPatch writes the window, not just the array — the pa
   assert.equal(state.session.transcript.find((entry) => entry.item_id === "item-2")?.status, "completed");
 });
 
+// P1: applyTranscriptEntryPatch merged patchedEntry into the window with
+// content_state forced to "full" unconditionally — including for a
+// status-only completion (no text field at all). For an item whose real body
+// was never delivered (still "omitted"/"preview" in the window), that forced
+// promotion tells snapshotTailNeedsFullText the body is already authoritative,
+// so a subsequent snapshot describing the same item as non-full never
+// re-arms hydration — the real body is never fetched.
+test("a status-only completion patch must not promote an omitted window entry to 'full' — hydration must still be able to fetch the real body", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await import("./state.js");
+  const { applyTranscriptEvent, clearSessionRuntime } = await import("./session-ops.js");
+
+  clearSessionRuntime();
+  state.realSession = state.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 1,
+    transcript: [
+      { item_id: "item-1", kind: "agent_text", status: "running", text: null, turn_id: "turn-1", tool: null },
+    ],
+  };
+  state.socket = null;
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([
+    [
+      "item-1",
+      {
+        item_id: "item-1",
+        kind: "agent_text",
+        status: "running",
+        text: null,
+        turn_id: "turn-1",
+        tool: null,
+        content_state: "omitted",
+      },
+    ],
+  ]);
+  state.transcriptHydrationOrder = ["item-1"];
+
+  // A completion event carrying no body text — the true final text was
+  // never streamed as a delta and still lives only on the server.
+  applyTranscriptEvent({
+    kind: "transcript_entry_completed",
+    thread_id: "thread-1",
+    item_id: "item-1",
+    entry_kind: "agent_text",
+    turn_id: "turn-1",
+    revision: 2,
+  });
+
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-1")?.content_state,
+    "omitted",
+    "a status-only patch must never promote the cached body to full — it does not own a body"
+  );
+  assert.equal(
+    state.session.transcript.find((entry) => entry.item_id === "item-1")?.status,
+    "completed",
+    "the status change itself must still be visible immediately, independent of the content_state fix"
+  );
+});
+
+// P1: applyTranscriptEntryPatch wrote unconditionally into the window
+// whenever transcriptHydrationThreadId was set, with no check that the
+// window actually held anything yet. A patch landing while hydration was
+// merely ARMED for this thread (order still empty) therefore created a
+// one-entry "loaded" window — transcriptWindowIsLoaded starts returning true
+// off that single patched item — and the very next delta for a DIFFERENT,
+// already-visible item rebuilds the array purely from that one-entry window,
+// silently dropping every other row on screen.
+test("a completion patch before hydration has loaded anything must not turn an empty window into a one-entry one", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await import("./state.js");
+  const { applyTranscriptDelta, applyTranscriptEvent, clearSessionRuntime, flushRemoteTranscriptRenderForTest } =
+    await import("./session-ops.js");
+
+  clearSessionRuntime();
+  state.realSession = state.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 1,
+    transcript: [
+      { item_id: "item-1", kind: "agent_text", status: "running", text: "", turn_id: "turn-1", tool: null },
+      { item_id: "item-2", kind: "agent_text", status: "running", text: "", turn_id: "turn-2", tool: null },
+      { item_id: "item-3", kind: "agent_text", status: "running", text: "", turn_id: "turn-3", tool: null },
+    ],
+  };
+  state.socket = null;
+  // Hydration has been armed for this thread but nothing has landed yet.
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map();
+  state.transcriptHydrationOrder = [];
+
+  applyTranscriptEvent({
+    kind: "transcript_entry_completed",
+    thread_id: "thread-1",
+    item_id: "item-3",
+    entry_kind: "agent_text",
+    text: "done",
+    turn_id: "turn-3",
+    revision: 2,
+  });
+
+  assert.equal(
+    state.transcriptHydrationOrder.length,
+    0,
+    "a patch alone must never be the thing that makes an unhydrated window look loaded"
+  );
+
+  // A delta for a DIFFERENT item, still visible in the array — if the patch
+  // above had wrongly loaded the window, this would settle the array down to
+  // just the window's one entry.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "X",
+    delta_kind: "agent_text",
+    text_offset: 0,
+  });
+  flushRemoteTranscriptRenderForTest();
+
+  const rendered = state.session.transcript;
+  assert.equal(rendered.length, 3, "item-2 must not have been dropped by a window the patch alone should never have loaded");
+  assert.ok(rendered.some((entry) => entry.item_id === "item-2"));
+});
+
 test("commitLiveSession settles before publishing a re-projection for a pinned background thread", async () => {
   activeBrowser || installBrowserStubs();
   const { state } = await pinBackgroundThreadWithWindow();

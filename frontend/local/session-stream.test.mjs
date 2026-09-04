@@ -509,3 +509,52 @@ test("a patch survives a later delta for another item re-arming the pending proj
     "the patch must survive the later delta re-arming the window projection — it must have reached the window itself"
   );
 });
+
+// P1: applyLocalTranscriptEntryPatch wrote into the window unconditionally —
+// unlike the delta path a few lines up, it never checked transcriptWindowIsLoaded
+// first. A patch landing while hydration was merely armed for this thread
+// (transcriptHydrationThreadId set, but entries/order still empty) therefore
+// created a one-entry "loaded" window off that single patched item, and the
+// very next delta for a DIFFERENT, already-visible item then settles the
+// array down to just the window's contents — dropping every untouched row.
+test("a completion patch before hydration has loaded anything must not turn an empty window into a one-entry one", () => {
+  const { clock, controller, renders, state } = makeController();
+  state.session.transcript.push(
+    { item_id: "agent-2", kind: "agent_text", status: "running", text: "", tool: null, turn_id: "turn-2" },
+    { item_id: "agent-3", kind: "agent_text", status: "running", text: "", tool: null, turn_id: "turn-3" }
+  );
+  // Hydration has been armed for this thread but nothing has landed yet.
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map();
+  state.transcriptHydrationOrder = [];
+
+  controller.applyLocalTranscriptEntryPatch(
+    { item_id: "agent-3", status: "completed", text: "done", thread_id: "thread-1" },
+    { defaultStatus: "completed" }
+  );
+
+  assert.equal(
+    state.transcriptHydrationOrder.length,
+    0,
+    "a patch alone must never be the thing that makes an unhydrated window look loaded"
+  );
+
+  // A delta for a DIFFERENT item, still visible in the array — if the patch
+  // above had wrongly loaded the window, this would settle the array down to
+  // just the window's one entry.
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "X",
+    item_id: "agent-1",
+    revision: 1,
+    thread_id: "thread-1",
+  });
+  clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+
+  const rendered = renders[renders.length - 1].transcript;
+  assert.equal(
+    rendered.length,
+    3,
+    "agent-2 must not have been dropped by a window the patch alone should never have loaded"
+  );
+  assert.ok(rendered.some((entry) => entry.item_id === "agent-2"));
+});

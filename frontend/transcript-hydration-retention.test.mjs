@@ -9,6 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  applyTranscriptPatchOverlay,
   createClearedTranscriptHydrationPatch,
   stashTranscriptHydrationForThread,
   restoreTranscriptHydrationForThread,
@@ -103,6 +104,29 @@ test("a stash is independent of later live mutations to the active slot", () => 
   // mutation of the (since-reused) live slot.
   assert.deepEqual(state.transcriptHydrationOrder, ["a1", "a2"]);
   assert.equal(state.transcriptHydrationEntries.get("a2").text, "body-a2");
+});
+
+test("a pending patch overlay survives leaving a thread and coming back, and does not leak into a different thread switched to in between", () => {
+  const state = hydratedThreadState("thread-A", ["a1", "a2"]);
+  // A completion patch landed for a2 just before the pin/switch away.
+  applyTranscriptPatchOverlay(state, "thread-A", { item_id: "a2", status: "completed" });
+
+  stashTranscriptHydrationForThread(state);
+  Object.assign(state, restoreTranscriptHydrationForThread(state, "thread-B"));
+  assert.equal(
+    state.transcriptPatchOverlay.size,
+    0,
+    "thread-B must not inherit thread-A's pending overlay"
+  );
+
+  stashTranscriptHydrationForThread(state); // stash B (empty -> no-op)
+  Object.assign(state, restoreTranscriptHydrationForThread(state, "thread-A"));
+
+  assert.equal(
+    state.transcriptPatchOverlay.get("a2")?.status,
+    "completed",
+    "the overlay pending for a2 must travel with its window across the switch away and back"
+  );
 });
 
 test("a genuine reset drops every retained window so stale history can't resurface", () => {

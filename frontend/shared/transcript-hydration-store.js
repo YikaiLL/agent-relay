@@ -12,6 +12,10 @@ export function createClearedTranscriptHydrationPatch() {
     transcriptHydrationStatus: "idle",
     transcriptHydrationTailReady: false,
     transcriptHydrationThreadId: null,
+    // Same lifetime as the window itself — a clear/switch away from a thread
+    // must not leave that thread's pending patch overlays to bleed into
+    // whatever loads into this slot next.
+    transcriptPatchOverlay: new Map(),
   };
 }
 
@@ -58,6 +62,10 @@ export function stashTranscriptHydrationForThread(state, extra = null) {
     olderCursor: state.transcriptHydrationOlderCursor ?? null,
     signature: state.transcriptHydrationSignature ?? null,
     tailReady: Boolean(state.transcriptHydrationTailReady),
+    // A patch overlay pending for the LEAVING thread (e.g. a completion that
+    // landed just before a pin switch) must travel with its window, not be
+    // dropped on the floor or bleed into the thread switched to.
+    overlay: new Map(state.transcriptPatchOverlay instanceof Map ? state.transcriptPatchOverlay : []),
     ...(extra ? { extra } : {}),
   });
   while (cache.size > MAX_RETAINED_HYDRATION_THREADS) {
@@ -103,6 +111,7 @@ export function restoreTranscriptHydrationForThread(state, threadId) {
     // Leave status idle: the next snapshot's prepareTranscriptHydration recomputes
     // whether the tail still needs a fetch, merging onto the restored window.
     transcriptHydrationStatus: "idle",
+    transcriptPatchOverlay: new Map(stash.overlay instanceof Map ? stash.overlay : []),
   };
 }
 
@@ -877,6 +886,9 @@ export function applyTranscriptDeltaToWindow(state, delta) {
         : existing.entry_seq,
       content_state: CONTENT_STATE_FULL,
     });
+    // The item is streaming again for real — a status like "completed" left
+    // by an earlier patch overlay is now stale.
+    clearTranscriptPatchOverlay(state, itemId);
     return true;
   }
   const appendText = deltaText;
@@ -898,57 +910,69 @@ export function applyTranscriptDeltaToWindow(state, delta) {
     entry_seq: Number.isSafeInteger(delta.entry_seq) ? delta.entry_seq : null,
     content_state: startsAtZero ? CONTENT_STATE_FULL : CONTENT_STATE_PREVIEW,
   });
+  clearTranscriptPatchOverlay(state, itemId);
   if (!order.includes(itemId)) {
     order.push(itemId);
   }
   return startsAtZero;
 }
 
-/// Upsert a non-delta entry patch (started/completed/patched: status, tool,
-/// or a text REPLACEMENT rather than an append) into the loaded window, IN
-/// PLACE — the array-only twin of applyTranscriptDeltaToWindow above, and for
-/// the same reason: the rendered transcript is rebuilt from this window
-/// (settleTranscriptProjection), so a patch applied only to the array is
-/// invisible to that rebuild and a LATER delta re-arming the pending
-/// projection reverts it.
+/// Non-delta entry patch (started/completed/patched: status, tool, or a text
+/// REPLACEMENT) overlaid onto the window's own cached entry AT PROJECTION
+/// TIME (renderedTranscriptFromWindow) — never written into `entries`/`order`
+/// itself. See .sealwire/PLAN.md, "Invalidate; do not write": a patch does
+/// not own a body the way a delta or a hydration/snapshot merge does. The
+/// function this replaces wrote directly into the window and always forced
+/// `content_state: "full"`, which (a) marked a status-only completion (no
+/// text) permanently authoritative, so hydration's re-fetch gate
+/// (snapshotTailNeedsFullText) never ran again for it, and (b) — for local,
+/// which called it with no loaded-window check — could turn a still-empty
+/// window "loaded" off one patched item, hijacking the next delta's
+/// projection into showing only that item.
 ///
-/// `patchedEntry` is the already-merged {item_id, kind, status, text, tool,
-/// turn_id} the array write uses — this mirrors that merge against the
-/// window's own existing copy (which can differ from the array's) rather
-/// than assuming the two agree.
+/// No-ops, touching neither `entries` nor `order`, unless the window is
+/// already loaded for `threadId` AND already tracks this item — an
+/// unhydrated window must never be created by a patch alone, and a patch for
+/// an item the window has never seen (no delta, no hydration page) has
+/// nothing to overlay onto. That item's patched fields still land directly
+/// in the caller's own array rebuild (session-ops.js / stream.js); the
+/// tradeoff accepted here is the same shape as the pinned-thread one in
+/// PLAN.md — a later, unrelated settle can revert that ONE array-only write,
+/// which is strictly narrower than the two P1s this replaces.
 ///
-/// Returns true when the window changed.
-export function applyTranscriptPatchToWindow(state, patchedEntry) {
+/// The overlay entry is cleared the moment a fresher, authoritative write
+/// lands for the item — see applyTranscriptDeltaToWindow and
+/// createMergedSnapshotTailPatch — so a stale patch can never outlive the
+/// real data superseding it.
+export function applyTranscriptPatchOverlay(state, threadId, patchedEntry) {
   const itemId = patchedEntry?.item_id;
-  if (!itemId) {
+  if (
+    !itemId
+    || !transcriptWindowIsLoaded(state, threadId)
+    || !state.transcriptHydrationEntries.has(itemId)
+  ) {
     return false;
   }
-  const threadId = state.transcriptHydrationThreadId;
-  if (!threadId) {
-    return false;
-  }
-  const entries = state.transcriptHydrationEntries;
-  const order = state.transcriptHydrationOrder;
-  if (!(entries instanceof Map) || !Array.isArray(order)) {
-    return false;
-  }
-  const existing = entries.get(itemId);
-  entries.set(itemId, {
-    ...existing,
-    ...patchedEntry,
-    kind: patchedEntry.kind || existing?.kind || "agent_text",
-    text: patchedEntry.text ?? existing?.text ?? null,
-    tool: patchedEntry.tool ?? existing?.tool ?? null,
-    turn_id: patchedEntry.turn_id || existing?.turn_id || null,
-    // A live patch is authoritative, first-party content — not a compacted
-    // snapshot preview — so it must outrank a `preview`/`omitted` cached
-    // shell the same way a delta's grown body does (selectTranscriptText).
-    content_state: "full",
+  ensureTranscriptPatchOverlay(state).set(itemId, {
+    status: patchedEntry.status ?? null,
+    text: patchedEntry.text ?? null,
+    tool: patchedEntry.tool ?? null,
+    turn_id: patchedEntry.turn_id ?? null,
   });
-  if (!order.includes(itemId)) {
-    order.push(itemId);
-  }
   return true;
+}
+
+function ensureTranscriptPatchOverlay(state) {
+  if (!(state.transcriptPatchOverlay instanceof Map)) {
+    state.transcriptPatchOverlay = new Map();
+  }
+  return state.transcriptPatchOverlay;
+}
+
+function clearTranscriptPatchOverlay(state, itemId) {
+  if (state.transcriptPatchOverlay instanceof Map) {
+    state.transcriptPatchOverlay.delete(itemId);
+  }
 }
 
 /// Is the hydration window loaded for this thread? Shared by local and
@@ -981,7 +1005,29 @@ export function renderedTranscriptFromWindow(state, session) {
   ) {
     return session?.transcript || [];
   }
-  return order.map((itemId) => entries.get(itemId)).filter(Boolean);
+  const overlay = state.transcriptPatchOverlay;
+  return order
+    .map((itemId) => {
+      const entry = entries.get(itemId);
+      if (!entry) {
+        return null;
+      }
+      const patch = overlay instanceof Map ? overlay.get(itemId) : null;
+      if (!patch) {
+        return entry;
+      }
+      // Overlaid onto a COPY — the cache's own text/content_state are left
+      // alone, so a still-preview/omitted body stays eligible for hydration's
+      // re-fetch gate no matter what a status-only patch says.
+      return {
+        ...entry,
+        status: patch.status ?? entry.status,
+        text: patch.text ?? entry.text,
+        tool: patch.tool ?? entry.tool,
+        turn_id: patch.turn_id ?? entry.turn_id,
+      };
+    })
+    .filter(Boolean);
 }
 
 function createMergedSnapshotTailPatch(state, snapshot, signature) {
@@ -1012,6 +1058,9 @@ function createMergedSnapshotTailPatch(state, snapshot, signature) {
       itemId,
       mergeTranscriptEntry(existing, prepareSnapshotOverlayEntry(existing, entry))
     );
+    // The snapshot's own view of this item is authoritative now, whatever it
+    // says — a patch overlay recorded before this merge is superseded.
+    clearTranscriptPatchOverlay(state, itemId);
     tailIds.push(itemId);
   }
   // In place: an id that is not ordered yet — genuinely new, or orphaned out of

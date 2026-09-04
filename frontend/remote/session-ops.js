@@ -1264,23 +1264,16 @@ function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null 
     status: incoming.status || defaultStatus || "completed",
     turn_id: incoming.turn_id || event.turn_id || null,
   };
-  // Also land in the window when it is loaded for THIS thread — never
-  // assume the window's thread agrees with the live thread a patch always
-  // targets (a background thread can be pinned view-only, in which case the
-  // window follows the PIN, not the live thread). Writing this patch's array
+  // Also overlay onto the window for THIS thread — never assume the
+  // window's thread agrees with the live thread a patch always targets (a
+  // background thread can be pinned view-only, in which case the window
+  // follows the PIN, not the live thread). Writing this patch's array
   // rebuild alone would be invisible to settleTranscriptProjection, which
   // rebuilds the array purely from the window whenever something else is
-  // still pending — reverting this patch the next time that happens.
-  // Also land in the window when it is loaded for THIS thread — never
-  // assume the window's thread agrees with the live thread a patch always
-  // targets (a background thread can be pinned view-only, in which case the
-  // window follows the PIN, not the live thread). Writing this patch's array
-  // rebuild alone would be invisible to settleTranscriptProjection, which
-  // rebuilds the array purely from the window whenever something else is
-  // still pending — reverting this patch the next time that happens.
-  if (transcriptWindowIsLoaded(state, currentThreadId)) {
-    applyEntryPatchToWindow(state, entryPatch);
-  }
+  // still pending — reverting this patch the next time that happens. A
+  // no-op when the window isn't loaded for this thread, or doesn't yet
+  // track this item — see applyTranscriptPatchOverlay.
+  applyEntryPatchToWindow(state, currentThreadId, entryPatch);
   const entryIndex = currentSession.transcript.findIndex((entry) => entry.item_id === itemId);
   const nextTranscript = entryIndex >= 0
     ? currentSession.transcript.map((entry, index) => {

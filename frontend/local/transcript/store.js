@@ -14,7 +14,7 @@ import {
   stashTranscriptHydrationForThread,
   clearTranscriptHydrationThreadCache,
   applyTranscriptDeltaToWindow,
-  applyTranscriptPatchToWindow,
+  applyTranscriptPatchOverlay,
   markTranscriptWindowNeedsRepair,
   renderedTranscriptFromWindow,
   resolveDeltaAppend,
@@ -53,11 +53,12 @@ export function appendTranscriptDelta(state, delta) {
   return applyTranscriptDeltaToWindow(state, delta);
 }
 
-/// Apply a non-delta entry patch (started/completed/patched) to the loaded
-/// window. The array-only twin of appendTranscriptDelta above — see
-/// applyTranscriptPatchToWindow.
-export function applyEntryPatchToWindow(state, patchedEntry) {
-  return applyTranscriptPatchToWindow(state, patchedEntry);
+/// Overlay a non-delta entry patch (started/completed/patched) onto the
+/// loaded window at projection time — see applyTranscriptPatchOverlay. A
+/// no-op unless the window is already loaded for `threadId` and already
+/// tracks this item.
+export function applyEntryPatchToWindow(state, threadId, patchedEntry) {
+  return applyTranscriptPatchOverlay(state, threadId, patchedEntry);
 }
 
 /// Mark every loaded entry non-authoritative after a delta gap (a lagged stream).
