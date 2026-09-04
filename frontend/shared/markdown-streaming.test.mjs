@@ -21,7 +21,7 @@ import {
   __test__,
 } from "./markdown.js";
 
-const { findStreamingSplitOffset, unterminatedFenceMarker } = __test__;
+const { findStreamingSplitOffset, unterminatedFenceMarker, closeUnterminatedFence } = __test__;
 
 const h = React.createElement;
 
@@ -115,6 +115,36 @@ test("a fence-shaped line with only trailing whitespace DOES close the fence", (
   assert.equal(text.slice(offset), "After, still typ");
 });
 
+// A fence opened inside a list item is itself indented (to align with the
+// item's content column). Closing it with an unindented "```" dedents the
+// closer out of the list item, so it fails to close the real fence and
+// instead opens a second, empty one at the top level.
+test("closeUnterminatedFence preserves the opening fence's indentation for a fence nested in a list", () => {
+  const tail = "- item\n\n  ```js\n  const x = 1;";
+  assert.equal(closeUnterminatedFence(tail), "- item\n\n  ```js\n  const x = 1;\n  ```");
+});
+
+test("a fence nested in a list closes inside the list item, with no stray empty code block", () => {
+  const text = "- item\n\n  ```js\n  const x = 1;";
+  const html = renderStreaming(text);
+  const preCount = (html.match(/<pre>/g) || []).length;
+  assert.equal(preCount, 1, "must render exactly one code block, not a stray second (empty) one");
+  assert.match(html, /const x = 1;/);
+});
+
+// If the tail already ends with "\n", appending "\n" + marker inserts a blank
+// line that becomes a visible empty line inside the closed code block.
+test("closeUnterminatedFence adds a separator newline only when the tail doesn't already end with one", () => {
+  assert.equal(closeUnterminatedFence("```js\nconst x = 1;\n"), "```js\nconst x = 1;\n```");
+  assert.equal(closeUnterminatedFence("```js\nconst x = 1;"), "```js\nconst x = 1;\n```");
+});
+
+test("a tail already ending in a newline does not gain a visible blank line before the synthetic closer", () => {
+  const text = "Intro.\n\n```js\nconst x = 1;\n";
+  const html = renderStreaming(text);
+  assert.doesNotMatch(html, /const x = 1;\n\n/, "no blank line must appear inside the code block");
+});
+
 // -- Boundary rule: lists -----------------------------------------------------
 
 test("no split between two loose ordered-list items", () => {
@@ -143,6 +173,35 @@ test("ordered-list numbering never restarts mid-stream", () => {
   assert.doesNotMatch(html, /<ol start=/, "the (single, whole) list starts at 1 — no start= override");
   assert.match(html, /<li>first<\/li>/);
   assert.match(html, /<li>second<\/li>/);
+});
+
+// A run of MULTIPLE blank lines must be judged by the next NON-blank line,
+// not the line immediately following the first blank (which is itself
+// another blank line, and never looks like a continuation) — otherwise the
+// boundary is wrongly called safe one blank line too early.
+test("no split between two ordered-list items separated by multiple blank lines", () => {
+  const text = "1. one\n\n\n1. two";
+  assert.equal(findStreamingSplitOffset(text), null);
+});
+
+test("no split between two unordered-list items separated by multiple blank lines", () => {
+  const text = "- one\n\n\n- two";
+  assert.equal(findStreamingSplitOffset(text), null);
+});
+
+test("an ordered list separated by multiple blank lines never renders as two restarted lists", () => {
+  const text = "1. one\n\n\n1. two";
+  const html = renderStreaming(text);
+  const olCount = (html.match(/<ol/g) || []).length;
+  assert.equal(olCount, 1, "the list must render as one <ol>, never split into two");
+  assert.doesNotMatch(html, /<ol start=/, "the (single, whole) list starts at 1 — no start= override");
+});
+
+test("a run of blank lines before unrelated prose still swallows the WHOLE run into the prefix", () => {
+  const text = "Paragraph one.\n\n\nMore text, still typ";
+  const offset = findStreamingSplitOffset(text);
+  assert.equal(text.slice(0, offset), "Paragraph one.\n\n\n");
+  assert.equal(text.slice(offset), "More text, still typ");
 });
 
 // -- Boundary rule: blockquotes -----------------------------------------------

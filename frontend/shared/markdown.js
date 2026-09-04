@@ -175,7 +175,7 @@ export function __getMarkdownCacheSizeForTests() {
 // the tail — identical cost to calling renderMarkdown directly, so this is
 // never worse than today, only sometimes better.
 
-const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const FENCE_LINE_RE = /^( {0,3})(`{3,}|~{3,})(.*)$/;
 const LIST_MARKER_RE = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)/;
 const BLOCKQUOTE_RE = /^ {0,3}>/;
 // Coarser than tracking CommonMark's exact continuation width — which varies
@@ -199,27 +199,30 @@ function isListOrBlockquoteContinuation(line) {
 // matching the exact fence character — agent output is overwhelmingly
 // backtick fences, and refusing a split slightly more often near a tilde
 // fence is safe (the rule's job is to refuse rather than split wrongly).
-function toggleFence(openMarker, line) {
+// Carries the opener's indentation too, so a synthetic closer can match it
+// (see closeUnterminatedFence) instead of dedenting out of a list item.
+function toggleFence(openFence, line) {
   const fenceMatch = FENCE_LINE_RE.exec(line);
   if (!fenceMatch) {
-    return openMarker;
+    return openFence;
   }
-  const marker = fenceMatch[1];
-  const rest = fenceMatch[2];
-  if (openMarker == null) {
-    return marker;
+  const indent = fenceMatch[1];
+  const marker = fenceMatch[2];
+  const rest = fenceMatch[3];
+  if (openFence == null) {
+    return { marker, indent };
   }
   // CommonMark: a closing fence is the marker run plus optional trailing
   // whitespace ONLY — anything else after it (an info string, stray text) is
   // just code content, not a closer, e.g. "```not-a-closer" inside an open
   // ```-fence stays inside it.
-  const isCloser = marker[0] === openMarker[0] && marker.length >= openMarker.length && rest.trim() === "";
+  const isCloser = marker[0] === openFence.marker[0] && marker.length >= openFence.marker.length && rest.trim() === "";
   if (isCloser) {
     return null;
   }
   // A fence-shaped line that doesn't validly close (wrong character, too
   // short, or trailing content) is just code content — state is unchanged.
-  return openMarker;
+  return openFence;
 }
 
 // Returns the character offset of the last safe prefix/tail boundary in
@@ -235,12 +238,17 @@ function findStreamingSplitOffset(text) {
     const line = lines[i];
     const wasFenceLine = FENCE_LINE_RE.test(line);
     openFence = toggleFence(openFence, line);
+    const isBlank = !wasFenceLine && openFence == null && line.trim() === "";
+    // A run of several blank lines must be judged by the first NON-blank line
+    // after it, not by the line immediately following the first blank (which
+    // is just another blank line, and never looks like a continuation) — so
+    // only the LAST blank line of a run is a candidate boundary.
+    const nextLine = lines[i + 1];
+    const isEndOfBlankRun = isBlank && (nextLine === undefined || nextLine.trim() !== "");
     if (
-      !wasFenceLine
-      && openFence == null
-      && line.trim() === ""
+      isEndOfBlankRun
       && i + 1 < lines.length
-      && !isListOrBlockquoteContinuation(lines[i + 1])
+      && !isListOrBlockquoteContinuation(nextLine)
     ) {
       // Safe: everything through this line's trailing newline is a complete,
       // unambiguous prefix.
@@ -257,7 +265,7 @@ function findStreamingSplitOffset(text) {
 // itself end mid-fence — close it synthetically so it parses as a complete,
 // well-formed code block on its own rather than relying on end-of-input to
 // implicitly close it.
-function unterminatedFenceMarker(text) {
+function unterminatedFenceState(text) {
   let openFence = null;
   for (const line of text.split("\n")) {
     openFence = toggleFence(openFence, line);
@@ -265,9 +273,23 @@ function unterminatedFenceMarker(text) {
   return openFence;
 }
 
+function unterminatedFenceMarker(text) {
+  const state = unterminatedFenceState(text);
+  return state ? state.marker : null;
+}
+
+// Matches the opener's indentation — a fence nested in a list item is itself
+// indented, and an unindented closer dedents out of the item, failing to
+// close the real fence and opening a second, empty one at the top level. Adds
+// a separator newline only if the tail doesn't already end with one, or that
+// newline becomes a visible blank line inside the closed code block.
 function closeUnterminatedFence(text) {
-  const marker = unterminatedFenceMarker(text);
-  return marker ? `${text}\n${marker}` : text;
+  const state = unterminatedFenceState(text);
+  if (!state) {
+    return text;
+  }
+  const separator = text.endsWith("\n") ? "" : "\n";
+  return `${text}${separator}${state.indent}${state.marker}`;
 }
 
 export function renderStreamingMarkdown(text) {
@@ -290,4 +312,5 @@ export const __test__ = {
   safeUrl,
   findStreamingSplitOffset,
   unterminatedFenceMarker,
+  closeUnterminatedFence,
 };
