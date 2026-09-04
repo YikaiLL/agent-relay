@@ -2491,8 +2491,17 @@ impl RelayState {
     pub(crate) fn update_team_run<F: FnOnce(&mut TeamRun)>(&mut self, id: &str, update: F) -> bool {
         match self.team_runs.get_mut(id) {
             Some(run) => {
+                let run_before = run.clone();
+                let execution_started_before = run.orchestration_execution_started();
                 update(run);
-                true
+                if run.orchestration_backend != run_before.orchestration_backend
+                    && (execution_started_before || run.orchestration_execution_started())
+                {
+                    *run = run_before;
+                    false
+                } else {
+                    true
+                }
             }
             None => false,
         }
@@ -2631,7 +2640,10 @@ impl RelayState {
 
     /// Clone persisted team runs for restore.
     ///
-    /// Three cases, and only the first is unlike every other run map here:
+    /// Four cases, and only the first two are unlike every other run map here:
+    /// - Future or unknown orchestration backends are kept in the session but
+    ///   marked failed before any live-driver reconciliation. This relay build
+    ///   cannot safely resume them, even if their status was `Paused`.
     /// - `Paused` restores VERBATIM. It has no driver on purpose; resuming it is
     ///   the whole feature. `mark_interrupted_if_stranded` enforces the exemption.
     /// - `PausePending` / `AwaitingUser` settle to `Paused`. Both had a live
@@ -2645,22 +2657,24 @@ impl RelayState {
             .iter()
             .map(|(id, run)| {
                 let mut run = run.clone();
-                match run.status {
-                    TeamRunStatus::PausePending => {
-                        run.settle_paused(
-                            "the relay restarted while the team was pausing",
-                            TeamPauseKind::Boundary,
-                        );
-                    }
-                    TeamRunStatus::AwaitingUser => {
-                        run.rollback_current_round();
-                        run.settle_paused(
-                            "the relay restarted while the team was waiting on your answer; that step will be re-run",
-                            TeamPauseKind::Boundary,
-                        );
-                    }
-                    _ => {
-                        run.mark_interrupted_if_stranded();
+                if !run.mark_restored_non_executing_backend() {
+                    match run.status {
+                        TeamRunStatus::PausePending => {
+                            run.settle_paused(
+                                "the relay restarted while the team was pausing",
+                                TeamPauseKind::Boundary,
+                            );
+                        }
+                        TeamRunStatus::AwaitingUser => {
+                            run.rollback_current_round();
+                            run.settle_paused(
+                                "the relay restarted while the team was waiting on your answer; that step will be re-run",
+                                TeamPauseKind::Boundary,
+                            );
+                        }
+                        _ => {
+                            run.mark_interrupted_if_stranded();
+                        }
                     }
                 }
                 (id.clone(), run)
@@ -6003,6 +6017,252 @@ mod tests {
         let decoded: PersistedRelayState = serde_json::from_value(encoded)
             .expect("an unknown status must not fail the whole file");
         assert_eq!(decoded.team_runs["t1"].status, TeamRunStatus::Failed);
+    }
+
+    #[test]
+    fn legacy_team_run_session_fixture_preserves_all_canaries_and_run_fields() {
+        let fixture = include_str!("fixtures/team_run_legacy_session.json");
+        let persisted: PersistedRelayState =
+            serde_json::from_str(fixture).expect("legacy persisted session fixture must load");
+        let encoded = serde_json::to_string(&persisted).expect("legacy fixture must re-serialize");
+
+        let mut missing = Vec::new();
+        for canary in [
+            "CANARY_ACCEPTANCE",
+            "CANARY_CONTEXT_PROSE",
+            "CANARY_FINDING_TEXT",
+            "CANARY_PAUSE_REASON",
+            "CANARY_RESEED_REASON",
+            "CANARY_RESULT_SUMMARY",
+            "CANARY_RULES",
+            "CANARY_RUN_ERROR",
+            "CANARY_SCOPE",
+            "CANARY_SUBTASK_BRIEF",
+            "CANARY_SUBTASK_ERROR",
+            "CANARY_SUBTASK_TITLE",
+            "CANARY_TASK_TITLE",
+            "CANARY_UNRESOLVED_FINDING",
+            "CANARY_USER_NOTE",
+            "CANARY_VERDICT_SUMMARY",
+        ] {
+            if !encoded.contains(canary) {
+                missing.push(canary);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "legacy local-only canaries must survive decode/encode: {missing:?}"
+        );
+
+        let original: serde_json::Value =
+            serde_json::from_str(fixture).expect("legacy fixture must parse");
+        let round_tripped: serde_json::Value =
+            serde_json::from_str(&encoded).expect("re-encoded fixture must parse");
+        let round_tripped_run = &round_tripped["team_runs"]["team_legacy"];
+
+        fn assert_json_subset(
+            expected: &serde_json::Value,
+            actual: &serde_json::Value,
+            path: &str,
+        ) {
+            match (expected, actual) {
+                (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
+                    for (key, expected_value) in expected {
+                        let child_path = format!("{path}.{key}");
+                        let actual_value = actual
+                            .get(key)
+                            .unwrap_or_else(|| panic!("missing legacy field {child_path}"));
+                        assert_json_subset(expected_value, actual_value, &child_path);
+                    }
+                }
+                (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
+                    assert_eq!(
+                        actual.len(),
+                        expected.len(),
+                        "array length changed at {path}"
+                    );
+                    for (index, expected_value) in expected.iter().enumerate() {
+                        assert_json_subset(
+                            expected_value,
+                            &actual[index],
+                            &format!("{path}[{index}]"),
+                        );
+                    }
+                }
+                _ => assert_eq!(actual, expected, "legacy value changed at {path}"),
+            }
+        }
+
+        assert_json_subset(
+            &original["team_runs"]["team_legacy"],
+            round_tripped_run,
+            "team_runs.team_legacy",
+        );
+    }
+
+    #[test]
+    fn legacy_team_run_session_fixture_loads_as_legacy_embedded_without_losing_fields() {
+        let fixture = include_str!("fixtures/team_run_legacy_session.json");
+        let persisted: PersistedRelayState =
+            serde_json::from_str(fixture).expect("legacy persisted session fixture must load");
+        let run = persisted
+            .team_runs
+            .get("team_legacy")
+            .expect("fixture names a team run");
+
+        assert_eq!(
+            run.orchestration_backend,
+            relay_api::orchestration::OrchestrationBackendRef::LegacyEmbedded
+        );
+        assert_eq!(run.driver_progress, Default::default());
+        assert_eq!(run.status, TeamRunStatus::Paused);
+        assert_eq!(run.phase, crate::state::TeamPhase::SubTasks);
+        assert_eq!(run.spec.title, "CANARY_TASK_TITLE");
+        assert_eq!(run.spec.context, "CANARY_CONTEXT_PROSE");
+        assert_eq!(run.sub_tasks[0].brief, "CANARY_SUBTASK_BRIEF");
+        assert_eq!(
+            run.sub_tasks[0].last_verdict.as_ref().unwrap().findings[0],
+            "CANARY_FINDING_TEXT"
+        );
+        assert_eq!(run.pending_user_notes[0], "CANARY_USER_NOTE");
+        assert_eq!(run.unresolved[0], "CANARY_UNRESOLVED_FINDING");
+        assert_eq!(run.error.as_deref(), Some("CANARY_RUN_ERROR"));
+
+        let encoded = serde_json::to_string(&persisted).expect("re-serialize fixture");
+        for canary in [
+            "CANARY_TASK_TITLE",
+            "CANARY_CONTEXT_PROSE",
+            "CANARY_SUBTASK_BRIEF",
+            "CANARY_FINDING_TEXT",
+            "CANARY_USER_NOTE",
+            "CANARY_UNRESOLVED_FINDING",
+            "CANARY_RUN_ERROR",
+        ] {
+            assert!(
+                encoded.contains(canary),
+                "legacy local-only field {canary} must survive decode/encode"
+            );
+        }
+
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        let restored_run = restored.team_run("team_legacy").unwrap();
+        assert_eq!(restored_run.status, TeamRunStatus::Paused);
+        assert!(restored_run.status.is_resumable());
+        assert_eq!(
+            restored_run.orchestration_backend,
+            relay_api::orchestration::OrchestrationBackendRef::LegacyEmbedded
+        );
+    }
+
+    #[test]
+    fn unknown_backend_session_fixture_loads_but_restores_non_executing() {
+        let fixture = include_str!("fixtures/team_run_unknown_backend_session.json");
+        let persisted: PersistedRelayState =
+            serde_json::from_str(fixture).expect("future backend session fixture must load");
+        let run = persisted
+            .team_runs
+            .get("team_future")
+            .expect("fixture names a team run");
+
+        assert_eq!(
+            run.orchestration_backend,
+            relay_api::orchestration::OrchestrationBackendRef::UnknownNonExecuting
+        );
+        assert_eq!(run.driver_progress.state_revision, 42);
+        assert_eq!(run.driver_progress.last_command_seq, 7);
+        assert_eq!(run.driver_progress.last_event_seq, 6);
+        assert_eq!(
+            run.driver_progress
+                .in_flight_command_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some("cmd-future")
+        );
+        assert_eq!(run.spec.title, "CANARY_FUTURE_TITLE");
+
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        let restored_run = restored
+            .team_run("team_future")
+            .expect("unknown backend run must survive restore");
+        assert_eq!(restored_run.status, TeamRunStatus::Failed);
+        assert!(!restored_run.status.is_resumable());
+        assert!(
+            restored_run
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does not understand"),
+            "the restored run should explain why it cannot execute"
+        );
+        assert_eq!(
+            restored_run.orchestration_backend,
+            relay_api::orchestration::OrchestrationBackendRef::UnknownNonExecuting
+        );
+    }
+
+    #[test]
+    fn unknown_backend_fixture_with_malformed_progress_still_loads_the_session() {
+        let fixture = include_str!("fixtures/team_run_unknown_backend_session.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(fixture).expect("fixture must parse as json");
+        raw["team_runs"]["team_future"]["driver_progress"]["in_flight_command_id"] =
+            serde_json::Value::String("https://example.test/cmd".to_string());
+        raw["team_runs"]["team_future"]["driver_progress"]["last_event_seq"] =
+            serde_json::json!({"future": true});
+
+        let persisted: PersistedRelayState =
+            serde_json::from_value(raw).expect("malformed future progress must not drop session");
+        let run = persisted
+            .team_runs
+            .get("team_future")
+            .expect("fixture names a team run");
+        assert_eq!(
+            run.orchestration_backend,
+            relay_api::orchestration::OrchestrationBackendRef::UnknownNonExecuting
+        );
+        assert_eq!(run.driver_progress.state_revision, 42);
+        assert_eq!(run.driver_progress.last_command_seq, 7);
+        assert_eq!(run.driver_progress.last_event_seq, 0);
+        assert!(run.driver_progress.in_flight_command_id.is_none());
+
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        let restored_run = restored.team_run("team_future").unwrap();
+        assert_eq!(restored_run.status, TeamRunStatus::Failed);
+        assert!(!restored_run.status.is_resumable());
+    }
+
+    #[test]
+    fn relay_update_run_preserves_backend_after_execution_starts() {
+        let mut relay = test_relay();
+        relay.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+
+        let cloud = relay_api::orchestration::OrchestrationBackendRef::Cloud {
+            protocol_version: relay_api::orchestration::CURRENT_PROTOCOL_VERSION,
+            driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
+            cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+        };
+        assert!(
+            !relay.update_team_run("t1", |run| {
+                run.orchestration_backend = cloud;
+                run.phase = crate::state::TeamPhase::MrGate;
+            }),
+            "backend retargeting after execution begins must be rejected"
+        );
+
+        let run = relay.team_run("t1").unwrap();
+        assert_eq!(
+            run.orchestration_backend,
+            relay_api::orchestration::OrchestrationBackendRef::LegacyEmbedded,
+            "the closure seam must not retarget a run after execution begins"
+        );
+        assert_eq!(
+            run.phase,
+            crate::state::TeamPhase::Intake,
+            "illegal backend writes are rejected atomically"
+        );
     }
 
     #[test]

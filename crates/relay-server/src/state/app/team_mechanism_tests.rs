@@ -166,6 +166,58 @@ async fn the_public_host_preserves_a_deliberately_blocked_driver_return() {
 }
 
 #[tokio::test]
+async fn team_port_update_run_reports_and_silences_rejected_backend_retargets() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    {
+        let mut run = crate::state::TeamRun::new(
+            "team-retarget".to_string(),
+            crate::state::TaskSpec::default(),
+            root,
+            "device-1".to_string(),
+        );
+        run.status = crate::state::TeamRunStatus::Running;
+        app.relay.write().await.insert_team_run(run);
+    }
+
+    let before_revision = app.snapshot().await.revision;
+    let cloud = relay_api::orchestration::OrchestrationBackendRef::Cloud {
+        protocol_version: relay_api::orchestration::CURRENT_PROTOCOL_VERSION,
+        driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
+        cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+    };
+
+    let updated = relay_api::TeamPort::update_run(
+        &app,
+        "team-retarget",
+        Box::new(move |run| {
+            run.orchestration_backend = cloud;
+            run.phase = crate::state::TeamPhase::MrGate;
+        }),
+    )
+    .await;
+
+    assert!(!updated, "the TeamPort wrapper must surface the rejection");
+    assert_eq!(
+        app.snapshot().await.revision,
+        before_revision,
+        "rejected updates must not notify surfaces"
+    );
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-retarget")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        run.orchestration_backend,
+        relay_api::orchestration::OrchestrationBackendRef::LegacyEmbedded
+    );
+    assert_eq!(run.phase, crate::state::TeamPhase::Intake);
+}
+
+#[tokio::test]
 async fn missing_workspace_is_not_flattened_into_an_absent_commit_or_merge_base() {
     let (_repo, root) = init_team_repo().await;
     let (app, _) = build_review_app(&root, &["codex"]).await;

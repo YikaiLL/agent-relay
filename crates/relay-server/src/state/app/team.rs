@@ -407,6 +407,7 @@ locally and trust it before starting a task team there"
         let (target, _device_id) = self
             .authorize_team_action(Some(&requested), device_id.clone())
             .await?;
+        self.require_embedded_team_backend(&target).await?;
         // Checked before the record moves: a reopen into a tree that is gone
         // would leave the run un-finished with nowhere to work.
         if let Err(error) = self.require_team_workspace(&target).await {
@@ -545,6 +546,7 @@ locally and trust it before starting a task team there"
                 status.as_str()
             ));
         }
+        self.require_embedded_team_backend(&run_id).await?;
         // The worktree is where every seat's turns run and cannot be relocated, so
         // a resume into a tree that is gone would fail at the first turn with a
         // provider error instead of a reason. This blocks the run and says so.
@@ -644,6 +646,11 @@ over on resume"
                 guard.disarm();
                 return;
             };
+            if let Err(error) = app.require_embedded_team_backend(&run_id).await {
+                app.fail_team_run(&run_id, error).await;
+                guard.disarm();
+                return;
+            }
             let port: std::sync::Arc<dyn relay_api::TeamPort> = std::sync::Arc::new(app.clone());
             driver.drive(port, run_id.clone()).await;
 
@@ -1679,6 +1686,17 @@ over on resume"
 
     pub(super) async fn team_run_snapshot(&self, run_id: &str) -> Option<TeamRun> {
         self.relay.read().await.team_run(run_id).cloned()
+    }
+
+    async fn require_embedded_team_backend(&self, run_id: &str) -> Result<(), String> {
+        let run = self
+            .team_run_snapshot(run_id)
+            .await
+            .ok_or_else(|| "there is no task with that id".to_string())?;
+        match run.orchestration_backend.non_executing_reason() {
+            Some(reason) => Err(reason.to_string()),
+            None => Ok(()),
+        }
     }
 
     async fn settled_team_turn_refusal(&self, run_id: &str) -> Option<String> {
@@ -2947,17 +2965,17 @@ impl relay_api::TeamPort for AppState {
     async fn update_run(&self, run_id: &str, mutation: relay_api::TeamRunMutation) -> bool {
         let mut relay = self.relay.write().await;
         let mut found = false;
-        relay.update_team_run(run_id, |run| {
+        let updated = relay.update_team_run(run_id, |run| {
             found = true;
             mutation(run);
             // The driver chose this phase before the turn it is recording. A rerun
             // accepted meanwhile is younger than that choice and outranks it.
             run.hold_phase_for_waiting_sub_tasks();
         });
-        if found {
+        if updated {
             relay.notify();
         }
-        found
+        found && updated
     }
 
     async fn update_status(&self, run_id: &str, status: TeamRunStatus) {
