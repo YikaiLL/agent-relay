@@ -336,7 +336,7 @@ test("a delta immediately followed by a direct render (session_meta_updated) sti
 // with the just-streamed token invisible, permanently (nothing else was
 // ever going to render it). cancelPendingTranscriptFlush must settle too.
 test("cancelPendingTranscriptFlush settles the pending projection, so a direct render right after paints the fresh text, not the stale array", () => {
-  const { controller, state, transcriptFlushScheduler, cancelPendingTranscriptFlush } = makeController();
+  const { controller, state, renders, transcriptFlushScheduler, cancelPendingTranscriptFlush } = makeController();
   state.transcriptHydrationThreadId = "thread-1";
   state.transcriptHydrationEntries = new Map([
     ["agent-1", { ...state.session.transcript[0] }],
@@ -355,20 +355,34 @@ test("cancelPendingTranscriptFlush settles the pending projection, so a direct r
   assert.equal(state.session.transcript[0].text, "");
   assert.equal(transcriptFlushScheduler.stats().pending, true);
 
-  // Mirrors app.js's wrappedRenderSession: cancel the pending flush, THEN
-  // paint state.session directly — no ctx.renderSession involved.
-  cancelPendingTranscriptFlush();
-  const directlyRenderedSession = state.session;
+  // Reproduces app.js's wrappedRenderSession EXACTLY (frontend/app.js:1184):
+  // every direct `renderer.renderSession(state.session)` call site there
+  // (~30 of them) passes state.session, calls cancelPendingTranscriptFlush()
+  // first — never ctx.renderSession — then hands the (possibly reassigned)
+  // session to the real renderer. `renders` below stands in for that
+  // renderer, so the assertion is on what it actually RECEIVED, not on
+  // state.session read back out independently of any render call.
+  function wrappedRenderSession(session) {
+    const wasLiveSession = session === state.session;
+    cancelPendingTranscriptFlush();
+    if (wasLiveSession) {
+      session = state.session;
+    }
+    renders.push(session);
+  }
+
+  wrappedRenderSession(state.session);
 
   assert.equal(
     transcriptFlushScheduler.stats().pending,
     false,
-    "the scheduled catch-up must be cancelled — the direct render below satisfies it"
+    "the scheduled catch-up must be cancelled — the direct render satisfies it"
   );
+  assert.equal(renders.length, 1, "the renderer must have been invoked exactly once");
   assert.equal(
-    directlyRenderedSession.transcript[0].text,
+    renders[0].transcript[0].text,
     "one",
-    "a bare cancel would leave this stale — cancelPendingTranscriptFlush must also settle the window projection"
+    "a bare cancel would leave this stale — the RENDERER must receive the settled text, not the pre-projection array"
   );
 });
 
@@ -433,5 +447,65 @@ test("an entry patch for one item, landing between a delta for another item and 
     rendered.find((entry) => entry.item_id === "agent-2").text,
     "done",
     "and the patch itself must still land"
+  );
+});
+
+// P1: settling before a patch reads the array only protects THAT ONE flush.
+// A patch that never writes into the hydration window is still invisible to
+// it — so a SECOND delta after the patch (still before the flush) re-arms
+// transcriptWindowProjectionPending, and the eventual settle rebuilds the
+// array PURELY from the window, which has never heard of the patch. The
+// patch must therefore also land in the window itself, not just the array.
+test("a patch survives a later delta for another item re-arming the pending projection before the flush", () => {
+  const { clock, controller, renders, state } = makeController();
+  state.session.transcript.push({
+    item_id: "agent-2",
+    kind: "agent_text",
+    status: "running",
+    text: "",
+    tool: null,
+    turn_id: "turn-2",
+  });
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([
+    ["agent-1", { ...state.session.transcript[0] }],
+    ["agent-2", { ...state.session.transcript[1] }],
+  ]);
+  state.transcriptHydrationOrder = ["agent-1", "agent-2"];
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "one",
+    item_id: "agent-1",
+    revision: 1,
+    thread_id: "thread-1",
+  });
+  controller.applyLocalTranscriptEntryPatch(
+    { item_id: "agent-2", status: "completed", text: "done", thread_id: "thread-1" },
+    { defaultStatus: "completed" }
+  );
+  // A second delta for agent-1 lands AFTER the patch, still before the
+  // flush — this re-arms the pending window projection the patch's own
+  // settle-before-read already cleared once.
+  controller.applyLocalTranscriptEntryDelta({
+    delta: " two",
+    item_id: "agent-1",
+    revision: 2,
+    thread_id: "thread-1",
+  });
+  assert.equal(renders.length, 0, "still coalescing");
+
+  clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+
+  assert.equal(renders.length, 1);
+  const rendered = renders[0].transcript;
+  assert.equal(
+    rendered.find((entry) => entry.item_id === "agent-1").text,
+    "one two",
+    "both deltas for agent-1 must land"
+  );
+  assert.equal(
+    rendered.find((entry) => entry.item_id === "agent-2").text,
+    "done",
+    "the patch must survive the later delta re-arming the window projection — it must have reached the window itself"
   );
 });

@@ -898,6 +898,53 @@ export function applyTranscriptDeltaToWindow(state, delta) {
   return startsAtZero;
 }
 
+/// Upsert a non-delta entry patch (started/completed/patched: status, tool,
+/// or a text REPLACEMENT rather than an append) into the loaded window, IN
+/// PLACE — the array-only twin of applyTranscriptDeltaToWindow above, and for
+/// the same reason: the rendered transcript is rebuilt from this window
+/// (settleTranscriptProjection), so a patch applied only to the array is
+/// invisible to that rebuild and a LATER delta re-arming the pending
+/// projection reverts it.
+///
+/// `patchedEntry` is the already-merged {item_id, kind, status, text, tool,
+/// turn_id} the array write uses — this mirrors that merge against the
+/// window's own existing copy (which can differ from the array's) rather
+/// than assuming the two agree.
+///
+/// Returns true when the window changed.
+export function applyTranscriptPatchToWindow(state, patchedEntry) {
+  const itemId = patchedEntry?.item_id;
+  if (!itemId) {
+    return false;
+  }
+  const threadId = state.transcriptHydrationThreadId;
+  if (!threadId) {
+    return false;
+  }
+  const entries = state.transcriptHydrationEntries;
+  const order = state.transcriptHydrationOrder;
+  if (!(entries instanceof Map) || !Array.isArray(order)) {
+    return false;
+  }
+  const existing = entries.get(itemId);
+  entries.set(itemId, {
+    ...existing,
+    ...patchedEntry,
+    kind: patchedEntry.kind || existing?.kind || "agent_text",
+    text: patchedEntry.text ?? existing?.text ?? null,
+    tool: patchedEntry.tool ?? existing?.tool ?? null,
+    turn_id: patchedEntry.turn_id || existing?.turn_id || null,
+    // A live patch is authoritative, first-party content — not a compacted
+    // snapshot preview — so it must outrank a `preview`/`omitted` cached
+    // shell the same way a delta's grown body does (selectTranscriptText).
+    content_state: "full",
+  });
+  if (!order.includes(itemId)) {
+    order.push(itemId);
+  }
+  return true;
+}
+
 function createMergedSnapshotTailPatch(state, snapshot, signature) {
   // Mutate the live window IN PLACE — do not clone the whole map/array every
   // snapshot (the O(n) copy that froze long sessions; see

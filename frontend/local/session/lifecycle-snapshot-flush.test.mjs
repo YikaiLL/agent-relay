@@ -49,6 +49,7 @@ globalThis.window = {
 
 const { createLifecycleController, snapshotIsInteractive } = await import("./lifecycle.js");
 const { createStreamController } = await import("./stream.js");
+const { settleTranscriptProjection } = await import("../transcript/store.js");
 const {
   createTranscriptFlushScheduler,
   TRANSCRIPT_FLUSH_MIN_WINDOW_MS,
@@ -161,9 +162,15 @@ function buildHarness() {
     isHidden: () => false,
   });
 
-  function renderSessionAndClearPendingFlush(session) {
+  // Mirrors session-controller.js's real renderSessionAndClearPendingFlush:
+  // settle, not just cancel, before painting. The only caller (render()
+  // above) always passes state.session itself, so re-reading it after
+  // settle (which reassigns state.session) is enough — no spread-copy
+  // session to reconcile here.
+  function renderSessionAndClearPendingFlush(_session) {
     transcriptFlushScheduler.cancel();
-    return renderSession(session);
+    settleTranscriptProjection(state);
+    return renderSession(state.session);
   }
 
   const ctx = {
@@ -239,6 +246,67 @@ test("a snapshot interleaved with a pending delta flush renders exactly once, ke
     h.rendered[0].transcript.find((candidate) => candidate.item_id === "agent-1").text,
     "Hello world",
     "the longer delta text must survive over the snapshot's truncated preview"
+  );
+});
+
+// P1: restoreHydratedTranscriptSnapshot (transcript-hydration-store.js)
+// overlays a snapshot's tail onto the window WITHOUT writing the result back
+// into state.transcriptHydrationEntries/order — it is a per-render overlay,
+// not a persisted merge (its own comment: "never clone the whole window
+// every snapshot"). So a brand-new entry the snapshot introduces exists only
+// in the returned `merged.transcript`, never in the window Map. If a delta
+// for some OTHER item is still pending settlement when this snapshot lands,
+// settling later (e.g. at the next flush) rebuilds the array PURELY from the
+// window via renderedTranscriptFromWindow — which has never heard of the new
+// entry — and the entry silently disappears. The fix settles BEFORE the
+// snapshot overlay runs, so nothing is left pending to later re-derive from
+// the (window-only) old state and clobber the fresher merged transcript.
+test("a snapshot introducing a brand-new entry keeps it after a same-flush pending delta for another item", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot({ transcript: [entry("agent-1", "Hello", { status: "running" })] });
+  h.state.transcriptHydrationOrder = ["agent-1"];
+  h.state.transcriptHydrationEntries = new Map([
+    ["agent-1", entry("agent-1", "Hello", { status: "running" })],
+  ]);
+
+  // A live delta for agent-1 queues a coalesced render — a projection is now
+  // pending, unrelated to the snapshot below.
+  h.stream.applyLocalTranscriptEntryDelta({
+    item_id: "agent-1",
+    thread_id: THREAD,
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  assert.equal(h.rendered.length, 0, "the delta must still be coalescing");
+
+  // Before the flush, an ordinary snapshot arrives introducing "agent-2" — an
+  // entry the hydration window has never seen. It coalesces into the same
+  // pending flush (turn state and approvals are unchanged).
+  h.lifecycle.applySessionSnapshot(
+    baseSnapshot({
+      active_turn_id: null,
+      transcript: [
+        entry("agent-1", "Hel", { status: "running", content_state: "preview" }),
+        entry("agent-2", "a brand new tool result", { status: "completed" }),
+      ],
+    })
+  );
+  assert.equal(h.rendered.length, 0, "the snapshot must also coalesce with the pending delta");
+
+  h.clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+
+  assert.equal(h.rendered.length, 1);
+  const rendered = h.rendered[0].transcript;
+  assert.equal(
+    rendered.find((candidate) => candidate.item_id === "agent-1")?.text,
+    "Hello world",
+    "the pending delta's text must still survive"
+  );
+  assert.ok(
+    rendered.some((candidate) => candidate.item_id === "agent-2"),
+    "the snapshot's brand-new entry must not disappear when the pending delta settles"
   );
 });
 

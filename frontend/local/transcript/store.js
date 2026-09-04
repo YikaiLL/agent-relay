@@ -14,6 +14,7 @@ import {
   stashTranscriptHydrationForThread,
   clearTranscriptHydrationThreadCache,
   applyTranscriptDeltaToWindow,
+  applyTranscriptPatchToWindow,
   markTranscriptWindowNeedsRepair,
   resolveDeltaAppend,
 } from "../../shared/transcript-hydration-store.js";
@@ -48,6 +49,13 @@ export function switchTranscriptHydrationThread(state, nextThreadId) {
 /// must land here to survive — see applyTranscriptDeltaToWindow.
 export function appendTranscriptDelta(state, delta) {
   return applyTranscriptDeltaToWindow(state, delta);
+}
+
+/// Apply a non-delta entry patch (started/completed/patched) to the loaded
+/// window. The array-only twin of appendTranscriptDelta above — see
+/// applyTranscriptPatchToWindow.
+export function applyEntryPatchToWindow(state, patchedEntry) {
+  return applyTranscriptPatchToWindow(state, patchedEntry);
 }
 
 /// Mark every loaded entry non-authoritative after a delta gap (a lagged stream).

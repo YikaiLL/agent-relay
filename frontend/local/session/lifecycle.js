@@ -53,6 +53,7 @@ import {
 import {
   clearTranscriptHydration,
   restoreHydratedTranscript,
+  settleTranscriptProjection,
   switchTranscriptHydrationThread,
 } from "../transcript/store.js";
 import { threadAttention } from "../../shared/thread-attention.js";
@@ -986,6 +987,14 @@ export function createLifecycleController(ctx) {
     syncLiveTranscriptEntryDetailsFromSnapshot(state, snapshot);
     // Stashed raw (pre-merge) for hydration to read — see selectHydrationSnapshot.
     state.rawSessionSnapshot = snapshot;
+    // restoreHydratedTranscript overlays this snapshot's tail onto the window
+    // WITHOUT writing the overlay back into the window itself (it deliberately
+    // avoids an O(n) copy on every snapshot) — so `merged` below can be fresher
+    // than state.transcriptHydrationEntries/order. Settle any pending delta
+    // projection FIRST: otherwise it stays pending, and a later flush rebuilds
+    // straight from the (older) window, silently reverting the snapshot-only
+    // entries and status updates `merged` is about to introduce.
+    settleTranscriptProjection(state);
     const merged = restoreHydratedTranscript(state, snapshot);
     // Approval/AskUserQuestion/turn-state changes paint at once — locally a
     // snapshot is the only way a turn's completion reaches this surface at

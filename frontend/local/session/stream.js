@@ -2,6 +2,7 @@ import { openSessionStream, sessionStreamUrl } from "../../session-stream.js";
 import { applyDeltaToViewOnlyPin } from "../view-only-thread.js";
 import {
   appendTranscriptDelta,
+  applyEntryPatchToWindow,
   invalidateTranscriptWindowForRepair,
   markTranscriptWindowProjectionPending,
   resolveDeltaAppend,
@@ -472,6 +473,12 @@ export function createStreamController(ctx) {
       status: entry.status || defaultStatus || "completed",
       turn_id: entry.turn_id || event.turn_id || null,
     };
+    // Also land in the window, not just the array below: settling before a
+    // read (above) only protects the ONE flush right after this patch — a
+    // later delta re-arms the pending projection, and settling THAT rebuilds
+    // the array purely from the window (settleTranscriptProjection), which
+    // never heard of this patch unless it is written here too.
+    applyEntryPatchToWindow(state, patchedEntry);
     const entryIndex = state.session.transcript.findIndex(
       (candidate) => candidate?.item_id === patchedEntry.item_id
     );

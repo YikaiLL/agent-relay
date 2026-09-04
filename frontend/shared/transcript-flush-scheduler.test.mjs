@@ -319,16 +319,27 @@ test("a persistently slow render stays stretched across three consecutive schedu
   }
 
   scheduler.queue("transcript_entry_delta");
-  fireNextTimer(); // flush 1: renders inside the initial 100ms window
+  fireNextTimer(); // flush 1 (cold start): renders inside the initial 100ms window, then stretches
   scheduler.queue("transcript_entry_delta");
-  fireNextTimer(); // flush 2: still 150ms — must have stretched to 300
+  fireNextTimer(); // flush 2 (post-warm-up #1): still 150ms — must have stayed at 300
   scheduler.queue("transcript_entry_delta");
-  fireNextTimer(); // flush 3: still 150ms — must NOT have decayed back to 100
+  fireNextTimer(); // flush 3 (post-warm-up #2): still 150ms — must NOT have decayed back to 100
+  scheduler.queue("transcript_entry_delta");
+  fireNextTimer(); // flush 4 (post-warm-up #3): still 150ms — a third consecutive stretched schedule
 
   assert.deepEqual(
     requestedDelays,
-    [100, 300, 300],
-    "a render that never gets faster than 150ms must stay stretched at 300 once it has stretched once"
+    [100, 300, 300, 300],
+    "the cold start reads the 100ms floor; every schedule after the first stretch must read 300"
+  );
+  // The specific property under test: at least three CONSECUTIVE delays
+  // AFTER warm-up all read 300 — not just one that happens to follow the
+  // first stretch (which the old windowBeforeRender comparison also got
+  // right) before decaying back on the next.
+  assert.deepEqual(
+    requestedDelays.slice(1),
+    [300, 300, 300],
+    "three consecutive post-warm-up delays must all read 300 — a bug that decays every OTHER flush would still pass a shorter check"
   );
 });
 
