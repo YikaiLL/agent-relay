@@ -44,6 +44,13 @@ export function createTranscriptFlushScheduler({
   let renderCount = 0;
   let lastRenderDurationMs = 0;
   let lastFlushReason = null;
+  // Sticky until a render actually proves itself fast enough under the
+  // window it was given. NOT re-derived by comparing lastRenderDurationMs
+  // against the live `windowMs` — that value is reassigned at the end of
+  // every render, so a second comparison against it (e.g. the next queue())
+  // would measure the last render against the WRONG window and decay
+  // one flush early even though nothing has actually gotten faster.
+  let renderOutlastedWindow = false;
 
   function isPending() {
     return timerHandle != null;
@@ -55,8 +62,8 @@ export function createTranscriptFlushScheduler({
 
   // Two step conditions, not a ramp: there is no meaningful "half stretched"
   // window, so this jumps between the two ends of the clamped range.
-  function nextWindowMs() {
-    const stretch = lastRenderDurationMs > windowMs || Boolean(isHidden());
+  function computeWindowMs() {
+    const stretch = renderOutlastedWindow || Boolean(isHidden());
     return clampWindow(stretch ? TRANSCRIPT_FLUSH_MAX_WINDOW_MS : TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
   }
 
@@ -72,11 +79,15 @@ export function createTranscriptFlushScheduler({
     generation += 1;
     pendingChars = 0;
     lastFlushReason = reason || lastFlushReason;
+    // The window THIS render is being measured against — captured before
+    // computeWindowMs() below reassigns `windowMs` for the NEXT flush.
+    const windowBeforeRender = windowMs;
     const startedAt = now();
     render();
     lastRenderDurationMs = Math.max(0, now() - startedAt);
+    renderOutlastedWindow = lastRenderDurationMs > windowBeforeRender;
     renderCount += 1;
-    windowMs = nextWindowMs();
+    windowMs = computeWindowMs();
   }
 
   function schedule(reason) {
@@ -86,7 +97,7 @@ export function createTranscriptFlushScheduler({
       // resetting its window, which is what turns N deltas into one render.
       return;
     }
-    windowMs = nextWindowMs();
+    windowMs = computeWindowMs();
     const scheduledGeneration = generation;
     timerHandle = setTimer(() => {
       if (timerHandle == null || scheduledGeneration !== generation) {

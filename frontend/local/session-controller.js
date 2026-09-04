@@ -19,6 +19,7 @@ import { createStreamController } from "./session/stream.js";
 import { createTranscriptController } from "./session/transcript.js";
 import { createPairingController } from "./session/pairing.js";
 import { createLifecycleController } from "./session/lifecycle.js";
+import { createTranscriptFlushScheduler } from "../shared/transcript-flush-scheduler.js";
 
 export function createSessionController({
   state,
@@ -128,6 +129,32 @@ export function createSessionController({
     }
   }
 
+  // One pending-render slot shared by the delta stream (session/stream.js) and
+  // the snapshot path (session/lifecycle.js) — two instances would leave the
+  // double-render bug (a snapshot landing between a delta's state write and
+  // its pending frame) exactly in place. See .sealwire/PLAN.md.
+  const transcriptFlushScheduler = createTranscriptFlushScheduler({
+    // Late-bound through `ctx`, not a captured `renderSession` value: app.js
+    // monkey-patches `renderer.renderSession`, and `ctx.renderSession` below is
+    // itself a wrapper that clears the pending slot — a flush must go through
+    // that same wrapper, not around it.
+    render: () => {
+      if (state.session) {
+        ctx.renderSession(state.session);
+      }
+    },
+  });
+
+  // Invariant: renderSession means "render now, and nothing pending after."
+  // This is what makes the many direct renderSession(...) call sites in
+  // lifecycle.js / transcript.js / app.js safe to leave alone — any of them
+  // can paint at any time and the pending flush is satisfied rather than
+  // duplicated.
+  function renderSessionAndClearPendingFlush(session) {
+    transcriptFlushScheduler.cancel();
+    return renderSession(session);
+  }
+
   const ctx = {
     state,
     apiFetch,
@@ -138,7 +165,8 @@ export function createSessionController({
     setSelectedCwd,
     setThreadRoute,
     canCurrentDeviceWrite,
-    renderSession,
+    renderSession: renderSessionAndClearPendingFlush,
+    transcriptFlushScheduler,
     renderOverviewState,
     renderSessionUnavailable,
     renderThreadListMessage,
@@ -178,6 +206,11 @@ export function createSessionController({
     cancelSessionPoll: controller.cancelSessionPoll,
     cancelStreamReconnect: controller.cancelStreamReconnect,
     cancelThreadsPoll: controller.cancelThreadsPoll,
+    // Narrow escape hatch for app.js's `renderer.renderSession` wrap
+    // (frontend/app.js:1184), which every direct renderSession(...) call site
+    // there goes through instead of ctx.renderSession — without this, those
+    // calls paint once immediately and again when a queued delta timer fires.
+    cancelPendingTranscriptFlush: () => transcriptFlushScheduler.cancel(),
     connectSessionStream: controller.connectSessionStream,
     copyPairingLink: controller.copyPairingLink,
     decidePairingRequest: controller.decidePairingRequest,

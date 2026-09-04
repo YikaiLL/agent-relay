@@ -1,0 +1,413 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+// lifecycle.js transitively imports dom.js, which queries the document at
+// import time — stub it the same way send-snapshot-clobber.test.mjs does.
+const nodes = new Map();
+function fakeNode(selector) {
+  if (!nodes.has(selector)) {
+    nodes.set(selector, {
+      selector,
+      value: "",
+      disabled: false,
+      hidden: true,
+      textContent: "",
+      dataset: {},
+      style: {},
+      classList: { add() {}, contains: () => false, remove() {}, toggle() {} },
+      addEventListener() {},
+      removeEventListener() {},
+      setAttribute() {},
+      removeAttribute() {},
+      appendChild() {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    });
+  }
+  return nodes.get(selector);
+}
+
+globalThis.document = {
+  querySelector: fakeNode,
+  querySelectorAll: () => [],
+  addEventListener() {},
+  removeEventListener() {},
+  createElement: () => fakeNode("created"),
+  get body() {
+    return fakeNode("body");
+  },
+};
+globalThis.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+globalThis.window = {
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent() {},
+  localStorage: globalThis.localStorage,
+  matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+  navigator: { userAgent: "node" },
+};
+
+const { createLifecycleController, snapshotIsInteractive } = await import("./lifecycle.js");
+const { createStreamController } = await import("./stream.js");
+const {
+  createTranscriptFlushScheduler,
+  TRANSCRIPT_FLUSH_MIN_WINDOW_MS,
+} = await import("../../shared/transcript-flush-scheduler.js");
+
+/**
+ * A minimal fake clock: `tick` advances time and fires due timers (in due
+ * order). Mirrors the harness in shared/transcript-flush-scheduler.test.mjs.
+ */
+function createManualClock(startTime = 0) {
+  let currentTime = startTime;
+  const timers = new Map();
+  let nextId = 0;
+  return {
+    now: () => currentTime,
+    setTimer(callback, delayMs) {
+      const id = ++nextId;
+      timers.set(id, { callback, dueAt: currentTime + delayMs });
+      return id;
+    },
+    clearTimer(id) {
+      timers.delete(id);
+    },
+    tick(ms) {
+      currentTime += ms;
+      for (;;) {
+        const due = [...timers.entries()]
+          .filter(([, timer]) => timer.dueAt <= currentTime)
+          .sort((a, b) => a[1].dueAt - b[1].dueAt)[0];
+        if (!due) {
+          break;
+        }
+        const [id, timer] = due;
+        timers.delete(id);
+        timer.callback();
+      }
+    },
+  };
+}
+
+const THREAD = "thread-1";
+
+function entry(itemId, text, overrides = {}) {
+  return {
+    item_id: itemId,
+    kind: "agent_text",
+    text,
+    status: "completed",
+    turn_id: "turn-1",
+    tool: null,
+    content_state: "full",
+    ...overrides,
+  };
+}
+
+function baseSnapshot(overrides = {}) {
+  return {
+    active_thread_id: THREAD,
+    active_turn_id: null,
+    current_status: "idle",
+    transcript: [],
+    transcript_revision: 1,
+    transcript_truncated: false,
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    pending_pairing_requests: [],
+    thread_activity: [],
+    logs: [],
+    ...overrides,
+  };
+}
+
+/// Builds the stream + lifecycle controllers sharing ONE real scheduler
+/// instance, the same way session-controller.js wires ctx in production —
+/// this is the seam sub-task 2 exists to fix (a snapshot landing between a
+/// delta's state write and its pending frame used to paint twice).
+function buildHarness() {
+  const clock = createManualClock();
+  const rendered = [];
+  const state = {
+    deviceId: "device-1",
+    session: null,
+    viewThreadId: null,
+    viewOnlyThread: null,
+    transcriptHydrationThreadId: THREAD,
+    transcriptHydrationOrder: [],
+    transcriptHydrationEntries: new Map(),
+    transcriptHydrationOlderCursor: null,
+    transcriptHydrationSignature: null,
+    transcriptHydrationStatus: "idle",
+    transcriptHydrationFetchedRevision: null,
+    localUiStore: { getState: () => ({ clearTranscriptDetailLoading() {} }) },
+  };
+
+  function renderSession(session) {
+    rendered.push(session);
+  }
+
+  const transcriptFlushScheduler = createTranscriptFlushScheduler({
+    // Late-bound through ctx in production; here the wrapper below is the
+    // only render path, so closing over it directly is equivalent.
+    render: () => {
+      if (state.session) {
+        renderSessionAndClearPendingFlush(state.session);
+      }
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    isHidden: () => false,
+  });
+
+  function renderSessionAndClearPendingFlush(session) {
+    transcriptFlushScheduler.cancel();
+    return renderSession(session);
+  }
+
+  const ctx = {
+    state,
+    apiFetch: async () => ({ ok: true, json: async () => ({ ok: true, data: {} }) }),
+    logLine: () => {},
+    renderSession: renderSessionAndClearPendingFlush,
+    canCurrentDeviceWrite: () => true,
+    seedDefaults: () => {},
+    setSelectedCwd: () => {},
+    setThreadRoute: () => {},
+    renderOverviewState: () => {},
+    renderSessionUnavailable: () => {},
+    renderThreadListMessage: () => {},
+    renderThreads: () => {},
+    renderAuthRequiredState: () => {},
+    runViewTransition: (fn) => fn(),
+    setStartControlsBusy: () => {},
+    liveElement: () => null,
+    isViewingConversation: () => true,
+    queryClient: null,
+    transcriptFlushScheduler,
+    ensureConversationTranscript: () => {},
+    handleUnauthorized: () => {},
+    applySessionSnapshot: () => {},
+    cancelSessionPoll: () => {},
+    cancelStreamReconnect: () => {},
+    scheduleSessionPoll: () => {},
+    scheduleStreamReconnect: () => {},
+  };
+
+  const lifecycle = createLifecycleController(ctx);
+  const stream = createStreamController(ctx);
+
+  return { clock, lifecycle, rendered, state, stream, transcriptFlushScheduler };
+}
+
+test("a snapshot interleaved with a pending delta flush renders exactly once, keeping the longer delta text over the truncated preview", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot({ transcript: [entry("agent-1", "Hello", { status: "running" })] });
+  h.state.transcriptHydrationOrder = ["agent-1"];
+  h.state.transcriptHydrationEntries = new Map([
+    ["agent-1", entry("agent-1", "Hello", { status: "running" })],
+  ]);
+
+  // The live delta stream extends the window's cached body to "Hello world"
+  // and queues a coalesced render.
+  h.stream.applyLocalTranscriptEntryDelta({
+    item_id: "agent-1",
+    thread_id: THREAD,
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  assert.equal(h.rendered.length, 0, "the delta must still be coalescing");
+
+  // An ordinary mid-stream snapshot arrives with the server's compacted
+  // (truncated) preview for the same entry — turn state, approvals and
+  // thread id are unchanged, so this is NOT an interactive snapshot.
+  h.lifecycle.applySessionSnapshot(
+    baseSnapshot({
+      active_turn_id: null,
+      transcript: [entry("agent-1", "Hel", { status: "running", content_state: "preview" })],
+    })
+  );
+  assert.equal(h.rendered.length, 0, "an ordinary snapshot must coalesce with the pending delta");
+
+  h.clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+
+  assert.equal(h.rendered.length, 1, "the delta and the snapshot must produce exactly one render");
+  assert.equal(
+    h.rendered[0].transcript.find((candidate) => candidate.item_id === "agent-1").text,
+    "Hello world",
+    "the longer delta text must survive over the snapshot's truncated preview"
+  );
+});
+
+test("an ordinary streaming snapshot coalesces rather than painting immediately", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot();
+
+  h.lifecycle.applySessionSnapshot(baseSnapshot({ transcript: [entry("agent-1", "hi")] }));
+
+  assert.equal(h.rendered.length, 0);
+  h.clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+  assert.equal(h.rendered.length, 1);
+});
+
+test("a snapshot adding a pending approval flushes on the same tick", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot();
+
+  h.lifecycle.applySessionSnapshot(
+    baseSnapshot({ pending_approvals: [{ request_id: "approval-1", summary: "Run" }] })
+  );
+
+  assert.equal(h.rendered.length, 1, "an approval must paint immediately, not wait out the window");
+});
+
+test("a snapshot resolving a pending approval flushes on the same tick", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot({
+    pending_approvals: [{ request_id: "approval-1", summary: "Run" }],
+  });
+
+  h.lifecycle.applySessionSnapshot(baseSnapshot({ pending_approvals: [] }));
+
+  assert.equal(h.rendered.length, 1);
+});
+
+test("a snapshot adding a pending AskUserQuestion flushes on the same tick", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot();
+
+  h.lifecycle.applySessionSnapshot(
+    baseSnapshot({ pending_ask_user_questions: [{ request_id: "question-1" }] })
+  );
+
+  assert.equal(h.rendered.length, 1);
+});
+
+test("a snapshot whose turn completes (goes idle) flushes on the same tick", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot({ active_turn_id: "turn-1", current_status: "active" });
+
+  h.lifecycle.applySessionSnapshot(baseSnapshot({ active_turn_id: null, current_status: "idle" }));
+
+  assert.equal(
+    h.rendered.length,
+    1,
+    "turn completion must paint at once — it is the only way local sees completion at all"
+  );
+});
+
+test("a snapshot adding a failed transcript entry flushes on the same tick, even while the turn stays idle", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot({ active_turn_id: null, current_status: "idle" });
+
+  h.lifecycle.applySessionSnapshot(
+    baseSnapshot({
+      active_turn_id: null,
+      current_status: "idle",
+      transcript: [entry("agent-1", "boom", { kind: "error", status: "failed" })],
+    })
+  );
+
+  assert.equal(
+    h.rendered.length,
+    1,
+    "an error entry must paint at once even though turn state alone would coalesce"
+  );
+});
+
+test("a snapshot reporting the workspace missing flushes on the same tick", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot();
+
+  h.lifecycle.applySessionSnapshot(
+    baseSnapshot({ workspace_missing: { recorded_cwd: "/tmp/gone" } })
+  );
+
+  assert.equal(h.rendered.length, 1);
+});
+
+test("a snapshot switching the active thread flushes on the same tick", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot({ active_thread_id: "thread-1" });
+
+  h.lifecycle.applySessionSnapshot(baseSnapshot({ active_thread_id: "thread-2" }));
+
+  assert.equal(h.rendered.length, 1);
+});
+
+test("the very first snapshot (no previous session) flushes immediately", () => {
+  const h = buildHarness();
+  assert.equal(h.state.session, null);
+
+  h.lifecycle.applySessionSnapshot(baseSnapshot());
+
+  assert.equal(h.rendered.length, 1);
+});
+
+test("snapshotIsInteractive", async (t) => {
+  await t.test("is interactive with no previous snapshot", () => {
+    assert.equal(snapshotIsInteractive(null, baseSnapshot()), true);
+  });
+
+  await t.test("is not interactive when nothing turn-relevant changed", () => {
+    const prev = baseSnapshot();
+    const next = baseSnapshot({ transcript: [entry("agent-1", "hi")] });
+    assert.equal(snapshotIsInteractive(prev, next), false);
+  });
+
+  await t.test("is interactive when the approval id set changes", () => {
+    const prev = baseSnapshot();
+    const next = baseSnapshot({ pending_approvals: [{ request_id: "a" }] });
+    assert.equal(snapshotIsInteractive(prev, next), true);
+  });
+
+  await t.test("is interactive when the AskUserQuestion id set changes", () => {
+    const prev = baseSnapshot({ pending_ask_user_questions: [{ request_id: "q" }] });
+    const next = baseSnapshot({ pending_ask_user_questions: [] });
+    assert.equal(snapshotIsInteractive(prev, next), true);
+  });
+
+  await t.test("is interactive when active_turn_id changes", () => {
+    const prev = baseSnapshot({ active_turn_id: "turn-1" });
+    const next = baseSnapshot({ active_turn_id: null });
+    assert.equal(snapshotIsInteractive(prev, next), true);
+  });
+
+  await t.test("is interactive when current_status changes", () => {
+    const prev = baseSnapshot({ current_status: "active" });
+    const next = baseSnapshot({ current_status: "idle" });
+    assert.equal(snapshotIsInteractive(prev, next), true);
+  });
+
+  await t.test("is interactive when workspace_missing appears", () => {
+    const prev = baseSnapshot();
+    const next = baseSnapshot({ workspace_missing: { recorded_cwd: "/tmp/gone" } });
+    assert.equal(snapshotIsInteractive(prev, next), true);
+  });
+
+  await t.test("is interactive when a transcript entry fails, even while turn state is unchanged", () => {
+    const prev = baseSnapshot({ active_turn_id: null, current_status: "idle" });
+    const next = baseSnapshot({
+      active_turn_id: null,
+      current_status: "idle",
+      transcript: [entry("agent-1", "boom", { kind: "error", status: "failed" })],
+    });
+    assert.equal(snapshotIsInteractive(prev, next), true);
+  });
+
+  await t.test("is not interactive when a previously-reported failure persists unchanged", () => {
+    const failedEntry = entry("agent-1", "boom", { kind: "error", status: "failed" });
+    const prev = baseSnapshot({ transcript: [failedEntry] });
+    const next = baseSnapshot({ transcript: [failedEntry] });
+    assert.equal(snapshotIsInteractive(prev, next), false);
+  });
+
+  await t.test("is interactive when active_thread_id changes", () => {
+    const prev = baseSnapshot({ active_thread_id: "thread-1" });
+    const next = baseSnapshot({ active_thread_id: "thread-2" });
+    assert.equal(snapshotIsInteractive(prev, next), true);
+  });
+});

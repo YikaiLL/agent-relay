@@ -215,6 +215,34 @@ test("a render that outlasts the window stretches the next window toward 300ms",
   assert.equal(scheduler.stats().windowMs, TRANSCRIPT_FLUSH_MAX_WINDOW_MS);
 });
 
+test("a stretched window survives the very next queue() instead of immediately re-decaying", () => {
+  // Regression: a 150ms render is slower than the 100ms window it ran under
+  // (so it reports 300), but 150ms is also LESS than 300. A stretch decision
+  // re-derived by comparing lastRenderDurationMs against the already-updated
+  // (300ms) windowMs would read 150 > 300 as false and decay back to 100 on
+  // the very next queue() — before any render had actually proven itself
+  // fast enough at the wider window.
+  const clock = createManualClock();
+  const scheduler = createTranscriptFlushScheduler({
+    render: () => clock.advance(150),
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    isHidden: () => false,
+  });
+
+  scheduler.queue("transcript_entry_delta");
+  clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+  assert.equal(scheduler.stats().windowMs, TRANSCRIPT_FLUSH_MAX_WINDOW_MS);
+
+  scheduler.queue("transcript_entry_delta");
+  assert.equal(
+    scheduler.stats().windowMs,
+    TRANSCRIPT_FLUSH_MAX_WINDOW_MS,
+    "the next queue() must not decay before a render proves itself fast enough at 300ms"
+  );
+});
+
 test("a hidden tab stretches the window even when renders are fast", () => {
   const clock = createManualClock();
   const scheduler = createTranscriptFlushScheduler({

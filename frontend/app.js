@@ -1182,6 +1182,14 @@ const renderer = createSessionRenderer({
 // through the wrapper.
 const _baseRenderSession = renderer.renderSession;
 renderer.renderSession = function wrappedRenderSession(session) {
+  // Late-bound: `controller` is assigned after this wrap runs (see
+  // createSessionController below), but nothing calls renderSession before
+  // boot finishes assigning it. Every render through this ONE function —
+  // whether reached via ctx.renderSession or one of the many direct
+  // renderer.renderSession(...) calls elsewhere in this file — must satisfy
+  // the flush scheduler's pending slot, or a coalesced delta timer left over
+  // from before this render fires later and paints a second time.
+  controller?.cancelPendingTranscriptFlush?.();
   if (devicesCache.hasData()) {
     session = { ...session, ...devicesCache.current() };
   }

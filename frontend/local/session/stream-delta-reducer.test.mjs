@@ -19,6 +19,20 @@ import {
 //
 // These tests drive the REAL controller through its real event entry point.
 
+// This file is exercising the delta REDUCER, not the shared flush scheduler
+// (transcript-flush-scheduler.test.mjs and session-stream.test.mjs own that),
+// so renders fire synchronously and every assertion reads state right after
+// delivering an event rather than stepping a fake clock.
+function createSyncTranscriptFlushScheduler(render) {
+  return {
+    queue: render,
+    note() {},
+    flushNow: render,
+    cancel() {},
+    stats: () => ({ renderCount: 0, windowMs: 100, pending: false, pendingChars: 0 }),
+  };
+}
+
 function harness({ threadId = "thread-1", itemId = "item-1", text = "Hello world" } = {}) {
   const entry = {
     item_id: itemId,
@@ -44,6 +58,7 @@ function harness({ threadId = "thread-1", itemId = "item-1", text = "Hello world
   };
   const rendered = [];
   const hydrationCalls = [];
+  const renderSession = (session) => rendered.push(session);
   const controller = createStreamController({
     state,
     ensureConversationTranscript: (session) => {
@@ -51,15 +66,19 @@ function harness({ threadId = "thread-1", itemId = "item-1", text = "Hello world
     },
     logLine: () => {},
     seedDefaults: () => {},
-    renderSession: (session) => rendered.push(session),
+    renderSession,
     handleUnauthorized: () => {},
     applySessionSnapshot: () => {},
     cancelSessionPoll: () => {},
     cancelStreamReconnect: () => {},
     scheduleSessionPoll: () => {},
     scheduleStreamReconnect: () => {},
-    // Render synchronously so assertions do not race an animation frame.
-    scheduleRenderFrame: (callback) => callback(),
+    // Render synchronously so assertions do not race the scheduler's window.
+    transcriptFlushScheduler: createSyncTranscriptFlushScheduler(() => {
+      if (state.session) {
+        renderSession(state.session);
+      }
+    }),
   });
   const deliver = (event) =>
     controller.applySessionStreamEvent("transcript_entry_delta", {
@@ -315,19 +334,24 @@ function orchHarness({ orchThreadId = "orch-1", entries = null } = {}) {
     ],
   };
   const rendered = [];
+  const renderSession = (session) => rendered.push(session);
   const controller = createStreamController({
     state,
     ensureConversationTranscript: () => {},
     logLine: () => {},
     seedDefaults: () => {},
-    renderSession: (session) => rendered.push(session),
+    renderSession,
     handleUnauthorized: () => {},
     applySessionSnapshot: () => {},
     cancelSessionPoll: () => {},
     cancelStreamReconnect: () => {},
     scheduleSessionPoll: () => {},
     scheduleStreamReconnect: () => {},
-    scheduleRenderFrame: (callback) => callback(),
+    transcriptFlushScheduler: createSyncTranscriptFlushScheduler(() => {
+      if (state.session) {
+        renderSession(state.session);
+      }
+    }),
   });
   const deliver = (event) =>
     controller.applySessionStreamEvent("transcript_entry_delta", {

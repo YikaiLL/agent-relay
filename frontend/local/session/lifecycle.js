@@ -59,6 +59,94 @@ import { threadAttention } from "../../shared/thread-attention.js";
 import { isDocumentForeground, notifyThreadEvents } from "../../shared/thread-notify.js";
 import { imageFileToDataUrl } from "../image-attachments.js";
 
+function requestIdSet(list) {
+  return new Set(
+    (Array.isArray(list) ? list : [])
+      .map((entry) => entry?.request_id)
+      .filter(Boolean)
+  );
+}
+
+function idSetsDiffer(a, b) {
+  if (a.size !== b.size) {
+    return true;
+  }
+  for (const value of a) {
+    if (!b.has(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The only session-level error-shaped field (a vanished cwd). There is no
+// other session-level "last error" — a turn FAILING is signaled per-entry
+// (below), the same way a turn completing is signaled by active_turn_id /
+// current_status going idle.
+function workspaceMissingSignature(session) {
+  const missing = session?.workspace_missing;
+  return missing ? missing.recorded_cwd || "missing" : null;
+}
+
+// Mirrors the terminal-but-not-successful statuses transcript-hydration-store.js
+// treats as terminal (its TERMINAL_ENTRY_STATUSES also includes "completed" /
+// "complete", which are not error signals and are covered by the turn-state
+// comparison instead). An error entry rides an ordinary snapshot with no
+// dedicated event of its own, so this is the only way one is ever seen here.
+const ERROR_ENTRY_STATUSES = new Set(["failed", "error", "cancelled"]);
+
+function errorEntryIdSet(session) {
+  const transcript = Array.isArray(session?.transcript) ? session.transcript : [];
+  const ids = new Set();
+  for (const entry of transcript) {
+    if (entry?.item_id && ERROR_ENTRY_STATUSES.has(entry.status)) {
+      ids.add(entry.item_id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Whether a just-applied snapshot needs to paint immediately rather than
+ * coalesce with pending delta text: an approval/AskUserQuestion added or
+ * resolved, a turn starting/ending (locally the only way a turn's completion
+ * reaches this surface at all), a transcript entry failing, the workspace
+ * going missing, or a thread switch. `prev` null (first paint) is always
+ * interactive.
+ */
+export function snapshotIsInteractive(prev, next) {
+  if (!prev) {
+    return true;
+  }
+  if (prev.active_thread_id !== next?.active_thread_id) {
+    return true;
+  }
+  if ((prev.active_turn_id || null) !== (next?.active_turn_id || null)) {
+    return true;
+  }
+  if ((prev.current_status || null) !== (next?.current_status || null)) {
+    return true;
+  }
+  if (workspaceMissingSignature(prev) !== workspaceMissingSignature(next)) {
+    return true;
+  }
+  if (idSetsDiffer(requestIdSet(prev.pending_approvals), requestIdSet(next?.pending_approvals))) {
+    return true;
+  }
+  if (
+    idSetsDiffer(
+      requestIdSet(prev.pending_ask_user_questions),
+      requestIdSet(next?.pending_ask_user_questions)
+    )
+  ) {
+    return true;
+  }
+  if (idSetsDiffer(errorEntryIdSet(prev), errorEntryIdSet(next))) {
+    return true;
+  }
+  return false;
+}
+
 export function createLifecycleController(ctx) {
   const {
     state,
@@ -79,6 +167,7 @@ export function createLifecycleController(ctx) {
     setStartControlsBusy,
     liveElement,
     isViewingConversation,
+    transcriptFlushScheduler,
   } = ctx;
   // A ctx seam, not a store import, so the controller stays testable.
   const readSessionDraft = () => ctx.readSessionDraft?.() || {};
@@ -898,7 +987,20 @@ export function createLifecycleController(ctx) {
     // Stashed raw (pre-merge) for hydration to read — see selectHydrationSnapshot.
     state.rawSessionSnapshot = snapshot;
     const merged = restoreHydratedTranscript(state, snapshot);
-    renderSession(merged);
+    // Approval/AskUserQuestion/turn-state changes paint at once — locally a
+    // snapshot is the only way a turn's completion reaches this surface at
+    // all. An ordinary mid-stream snapshot coalesces with pending delta text
+    // through the same scheduler slot stream.js queues onto, which is what
+    // stops the double render a synchronous renderSession(merged) used to
+    // cause when it landed between a delta's state write and its pending
+    // frame.
+    const interactive = snapshotIsInteractive(state.session, merged);
+    state.session = merged;
+    if (interactive) {
+      transcriptFlushScheduler.flushNow("snapshot");
+    } else {
+      transcriptFlushScheduler.queue("snapshot");
+    }
   }
 
   /// `snapshot` with the rendered tail it does not carry appended back onto it.

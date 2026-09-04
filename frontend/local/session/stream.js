@@ -23,31 +23,20 @@ export function createStreamController(ctx) {
   const cancelStreamReconnect = (...args) => ctx.cancelStreamReconnect(...args);
   const scheduleSessionPoll = (...args) => ctx.scheduleSessionPoll(...args);
   const scheduleStreamReconnect = (...args) => ctx.scheduleStreamReconnect(...args);
-  const scheduleRenderFrame =
-    ctx.scheduleRenderFrame
-    || ((callback) => {
-      if (typeof requestAnimationFrame === "function") {
-        return requestAnimationFrame(callback);
-      }
-      return setTimeout(callback, 16);
-    });
-  let transcriptRenderPending = false;
+  const transcriptFlushScheduler = ctx.transcriptFlushScheduler;
 
-  function queueTranscriptRender(nextSession) {
+  function queueTranscriptRender(nextSession, chars = 0) {
     // State advances synchronously so another delta arriving in this same frame
     // appends to the latest text instead of the last painted snapshot. Only the
-    // expensive flushSync React render is coalesced.
+    // expensive render is coalesced, by the scheduler shared with the snapshot
+    // path (session-controller.js builds it; see applySessionSnapshot).
     state.session = nextSession;
-    if (transcriptRenderPending) {
-      return;
+    // queue() first: note()'s early-flush check only fires while a render is
+    // already pending, so it must never be the thing that starts one.
+    transcriptFlushScheduler.queue("transcript_entry_delta");
+    if (chars > 0) {
+      transcriptFlushScheduler.note(chars);
     }
-    transcriptRenderPending = true;
-    scheduleRenderFrame(() => {
-      transcriptRenderPending = false;
-      if (state.session) {
-        renderSession(state.session);
-      }
-    });
   }
 
   function connectSessionStream() {
@@ -153,6 +142,11 @@ export function createStreamController(ctx) {
       // Drive the fetch directly instead.
       invalidateTranscriptWindowForRepair(state);
       void ensureConversationTranscript?.(state.session);
+      // Whatever text is already pending must not sit out the coalescing
+      // window behind a signal that says the current view may already be
+      // stale — bring it forward now, same as the plan's other immediate
+      // classes.
+      transcriptFlushScheduler.flushNow("transcript_stream_lagged");
       return;
     }
     if (kind === "session_meta_updated") {
@@ -304,7 +298,7 @@ export function createStreamController(ctx) {
         changed = true;
       }
       if (changed) {
-        queueTranscriptRender(state.session);
+        queueTranscriptRender(state.session, (event.delta ?? "").length);
       }
       return;
     }
@@ -331,20 +325,24 @@ export function createStreamController(ctx) {
     if (transcriptWindowIsLoaded(state, currentThreadId)) {
       const textLengthBefore = (state.transcriptHydrationEntries.get(event.item_id)?.text ?? "").length;
       const applied = appendTranscriptDelta(state, event);
+      const textLengthAfter = (state.transcriptHydrationEntries.get(event.item_id)?.text ?? "").length;
       if (applied) {
         observeAppliedActiveThreadDelta({
           itemId: event.item_id,
           threadId: currentThreadId,
           turnId: event.turn_id || null,
           textLengthBefore,
-          textLengthAfter: (state.transcriptHydrationEntries.get(event.item_id)?.text ?? "").length,
+          textLengthAfter,
         });
       }
-      queueTranscriptRender({
-        ...state.session,
-        transcript: renderedTranscriptFromWindow(state, state.session),
-        transcript_revision: nextRevision,
-      });
+      queueTranscriptRender(
+        {
+          ...state.session,
+          transcript: renderedTranscriptFromWindow(state, state.session),
+          transcript_revision: nextRevision,
+        },
+        Math.max(0, textLengthAfter - textLengthBefore)
+      );
       return;
     }
 
@@ -408,11 +406,14 @@ export function createStreamController(ctx) {
       textLengthBefore,
       textLengthAfter: textLengthBefore + appendText.length,
     });
-    queueTranscriptRender({
-      ...state.session,
-      transcript: nextTranscript,
-      transcript_revision: nextRevision,
-    });
+    queueTranscriptRender(
+      {
+        ...state.session,
+        transcript: nextTranscript,
+        transcript_revision: nextRevision,
+      },
+      appendText.length
+    );
   }
 
   /// Project the hydration window onto the rendered transcript.

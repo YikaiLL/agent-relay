@@ -55,6 +55,19 @@ globalThis.window = {
 
 const { createLifecycleController } = await import("./lifecycle.js");
 
+// This file is exercising composer-error routing, not the shared flush
+// scheduler, so renders (none of these tests inspect them) fire synchronously
+// rather than stepping a fake clock.
+function createSyncTranscriptFlushScheduler(render) {
+  return {
+    queue: render,
+    note() {},
+    flushNow: render,
+    cancel() {},
+    stats: () => ({ renderCount: 0, windowMs: 100, pending: false, pendingChars: 0 }),
+  };
+}
+
 function buildController({ respond }) {
   const logged = [];
   const state = {
@@ -72,6 +85,7 @@ function buildController({ respond }) {
     apiFetch: async (url, options) => respond(url, options),
     logLine: (line) => logged.push(line),
     renderSession: () => {},
+    transcriptFlushScheduler: createSyncTranscriptFlushScheduler(() => {}),
     canCurrentDeviceWrite: () => true,
     seedDefaults: () => {},
     setSelectedCwd: () => {},
