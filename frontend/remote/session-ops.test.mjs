@@ -5848,3 +5848,125 @@ test("pinning a background thread mid-stream still lands live-thread deltas corr
   flushRemoteTranscriptRenderForTest();
   assert.equal(state.realSession.transcript.find((entry) => entry.item_id === "a-1")?.text, "Live stream");
 });
+
+// REVIEW P1: viewRemoteThread's fetch path switches the hydration window to
+// the newly-pinned thread BEFORE settling whatever was still pending for the
+// thread the window is LEAVING. A pre-pin live delta's window write then
+// becomes unreachable — settleTranscriptProjection can only ever rebuild
+// whichever session matches the window's CURRENT thread, and that is now the
+// pinned one, not the live thread the delta was actually for. The live
+// array is left stale, so the very next live delta's text_offset reads as a
+// gap against it and gets dropped pending repair instead of applied.
+test("viewRemoteThread settles the outgoing live window before switching hydration threads, so live deltas both before and after the pin still land", async () => {
+  activeBrowser = installBrowserStubs();
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+  const { applyTranscriptDelta, clearSessionRuntime, viewRemoteThread } =
+    await import("./session-ops.js");
+  const { remoteQueryClient } = await import("./query-client.js");
+
+  clearSessionRuntime();
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-pin-settle",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+
+  state.realSession = state.session = {
+    active_thread_id: "thread-a",
+    transcript_revision: 1,
+    transcript: [
+      { item_id: "a-1", kind: "agent_text", status: "running", text: "Hello", turn_id: "turn-a", tool: null },
+    ],
+  };
+  // The window is loaded for the LIVE thread (thread-a) before any pin —
+  // e.g. from an earlier hydration of the thread the user is currently on.
+  state.transcriptHydrationThreadId = "thread-a";
+  state.transcriptHydrationEntries = new Map([["a-1", { ...state.session.transcript[0] }]]);
+  state.transcriptHydrationOrder = ["a-1"];
+
+  // A live delta lands BEFORE the pin — window-loaded, deferred (the array
+  // still says "Hello").
+  applyTranscriptDelta({
+    thread_id: "thread-a",
+    item_id: "a-1",
+    turn_id: "turn-a",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  assert.equal(state.realSession.transcript[0].text, "Hello", "still deferred before the pin");
+
+  state.socket = {
+    readyState: 1,
+    send(frameText) {
+      const frame = JSON.parse(frameText);
+      setImmediate(async () => {
+        await handleRemoteBrokerPayload({
+          kind: "remote_action_result",
+          action_id: frame.payload.action_id,
+          action: "fetch_thread_transcript",
+          ok: true,
+          snapshot: {},
+          thread_transcript: {
+            thread_id: "thread-b",
+            revision: 1,
+            entries: [
+              { item_id: "b-1", kind: "agent_text", text: "B", status: "completed", turn_id: "turn-b", tool: null },
+            ],
+            prev_cursor: null,
+          },
+        });
+      });
+    },
+  };
+
+  // Pin a DIFFERENT thread (thread-b) — this switches the hydration window
+  // away from thread-a's, via the fetch path (thread-a is not yet live at
+  // the fetch-free check, since we are pinning thread-b, not re-viewing
+  // thread-a).
+  assert.equal(await viewRemoteThread("thread-b"), true);
+
+  assert.equal(
+    state.realSession.transcript.find((entry) => entry.item_id === "a-1")?.text,
+    "Hello world",
+    "the pre-pin live delta must be settled into state.realSession before the window moves on"
+  );
+
+  // A SECOND live delta arrives AFTER the pin completes — the window now
+  // tracks thread-b, so this takes the array fallback. It must read the
+  // FRESH (already-settled) array, not the stale pre-settle one, or its
+  // text_offset reads as a gap and the delta is dropped pending repair.
+  applyTranscriptDelta({
+    thread_id: "thread-a",
+    item_id: "a-1",
+    turn_id: "turn-a",
+    delta: "!",
+    delta_kind: "agent_text",
+    text_offset: 11,
+  });
+  assert.equal(
+    state.realSession.transcript.find((entry) => entry.item_id === "a-1")?.text,
+    "Hello world!",
+    "a live delta after the pin must still land via the array fallback, not be dropped as a false gap"
+  );
+
+  clearSessionRuntime();
+  state.socket = null;
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+});

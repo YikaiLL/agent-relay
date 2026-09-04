@@ -870,6 +870,11 @@ export function applyTranscriptDeltaToWindow(state, delta) {
       status: "running",
       text: `${haveText}${appendText}`,
       turn_id: existing.turn_id || delta.turn_id || null,
+      // First valid entry_seq wins and is never overwritten by a later one —
+      // mirrors the array-fallback merge (session/stream.js, session-ops.js).
+      entry_seq: Number.isSafeInteger(delta.entry_seq) && !Number.isSafeInteger(existing.entry_seq)
+        ? delta.entry_seq
+        : existing.entry_seq,
       content_state: CONTENT_STATE_FULL,
     });
     return true;
@@ -890,6 +895,7 @@ export function applyTranscriptDeltaToWindow(state, delta) {
     status: "running",
     turn_id: delta.turn_id || null,
     tool: null,
+    entry_seq: Number.isSafeInteger(delta.entry_seq) ? delta.entry_seq : null,
     content_state: startsAtZero ? CONTENT_STATE_FULL : CONTENT_STATE_PREVIEW,
   });
   if (!order.includes(itemId)) {

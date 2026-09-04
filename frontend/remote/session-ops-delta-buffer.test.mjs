@@ -799,3 +799,89 @@ test("local and remote surfaces produce the same transcript text for the same de
   assert.equal(remoteText, expectedText);
   assert.equal(localText, remoteText, "local and remote must render identical text for the same delta sequence");
 });
+
+// REVIEW P2: a loaded-window delta writes through applyTranscriptDeltaToWindow,
+// which (unlike the retired buffers and the no-window array fallback) never
+// read or wrote entry_seq — so a delta carrying it was silently dropping that
+// metadata once the window projected back onto the array.
+test("with a loaded hydration window, a delta's entry_seq survives into the projected array entry", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSessionWithWindow();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    entry_seq: 7,
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+
+  flushRemoteTranscriptRenderForTest();
+
+  assert.equal(state.session.transcript[0].text, "Hello world");
+  assert.equal(
+    state.session.transcript[0].entry_seq,
+    7,
+    "entry_seq must survive the window write, the same way the array fallback already preserves it"
+  );
+});
+
+// The first VALID entry_seq wins and later deltas for the same item must not
+// clobber it — mirrors the array fallback's own
+// `Number.isSafeInteger(entry_seq) && !Number.isSafeInteger(entry.entry_seq)` rule.
+test("with a loaded hydration window, the first valid entry_seq for an item is retained across later deltas", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSessionWithWindow();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    entry_seq: 3,
+    delta: " wor",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    entry_seq: 99,
+    delta: "ld",
+    delta_kind: "agent_text",
+    text_offset: 9,
+  });
+
+  flushRemoteTranscriptRenderForTest();
+
+  assert.equal(state.session.transcript[0].text, "Hello world");
+  assert.equal(state.session.transcript[0].entry_seq, 3, "the first valid entry_seq must not be overwritten by a later one");
+});
+
+// A brand-new item (not yet in the window) must also record its entry_seq —
+// mirrors the array fallback's new-entry branch.
+test("with a loaded hydration window, a brand-new item's entry_seq is recorded", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSessionWithWindow();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-new",
+    turn_id: "turn-new",
+    entry_seq: 42,
+    delta: "a brand new message",
+    delta_kind: "agent_text",
+    text_offset: 0,
+  });
+
+  flushRemoteTranscriptRenderForTest();
+
+  const created = state.session.transcript.find((entry) => entry.item_id === "item-new");
+  assert.equal(created?.text, "a brand new message");
+  assert.equal(created?.entry_seq, 42);
+});

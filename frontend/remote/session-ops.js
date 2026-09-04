@@ -543,6 +543,7 @@ function commitTranscriptDeltaAppend({
       delta: rawDeltaText,
       delta_kind: rawDeltaKind,
       turn_id,
+      entry_seq,
       text_offset: rawOffset,
     });
     transcriptWindowProjectionPending = true;
@@ -1978,6 +1979,14 @@ export async function viewRemoteThread(threadId) {
       throw new Error("remote transcript page response is incomplete");
     }
 
+    // Settle whatever is still pending for the OUTGOING window's thread
+    // first: settleTranscriptProjection can only rebuild a session that
+    // matches the window's CURRENT thread, so once switchTranscriptHydrationThread
+    // below repoints transcriptHydrationThreadId at the newly-pinned thread,
+    // a pending live delta would become permanently unreachable — left
+    // stale in state.realSession until something else happens to touch the
+    // OLD thread's window again, which pinning a different thread does not.
+    settleTranscriptProjection();
     // Retain the leaving thread's loaded window and restore the target thread's
     // retained window (if any) instead of clearing — so switching between remote
     // threads and back keeps the older history scrolled into view. The page fetch
