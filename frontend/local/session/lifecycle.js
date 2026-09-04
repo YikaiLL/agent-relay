@@ -930,6 +930,17 @@ export function createLifecycleController(ctx) {
       snapshot = withRenderedTranscriptEntriesKept(snapshot);
     }
     if (snapshot?.active_thread_id !== state.transcriptHydrationThreadId) {
+      // Settle BEFORE switching the window away: settleTranscriptProjection
+      // keys off state.session.active_thread_id (still the OUTGOING thread
+      // here) and the CURRENT window, so it must run while both still
+      // describe that thread. switchTranscriptHydrationThread below repoints
+      // the window at the incoming thread; settling after that would have
+      // the outgoing thread's pending delta fail transcriptWindowIsLoaded
+      // against the new thread's window, clear the pending flag as a side
+      // effect, and never rebuild the array — dropping the outgoing thread's
+      // latest streamed text from the very session the stash below freezes
+      // into a view-only pin.
+      settleTranscriptProjection(state);
       // Thread switch: retain the leaving thread's loaded window and restore the
       // target thread's retained window (if any) instead of clearing — so
       // switching away and back keeps the older history already scrolled into
@@ -1004,6 +1015,19 @@ export function createLifecycleController(ctx) {
     // cause when it landed between a delta's state write and its pending
     // frame.
     const interactive = snapshotIsInteractive(state.session, merged);
+    if (state.session && state.session.active_thread_id !== merged?.active_thread_id) {
+      // app.js's renderSession wrap freezes the thread the user is viewing
+      // into a view-only pin when the ACTIVE thread switches out from under
+      // it, using the live session as it was a moment ago — it used to
+      // recover that by reading state.session before ITS OWN write reached
+      // it. That stopped being possible once state.session had to advance
+      // synchronously here too (queue() below defers only the PAINT, never
+      // the write), so stash it explicitly. Always a thread switch when this
+      // differs, so snapshotIsInteractive above already chose flushNow — the
+      // render (this stash's only consumer) happens synchronously, before
+      // anything else can run.
+      state.previousLiveSessionForPin = state.session;
+    }
     state.session = merged;
     if (interactive) {
       transcriptFlushScheduler.flushNow("snapshot");

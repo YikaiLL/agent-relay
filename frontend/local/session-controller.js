@@ -20,7 +20,7 @@ import { createTranscriptController } from "./session/transcript.js";
 import { createPairingController } from "./session/pairing.js";
 import { createLifecycleController } from "./session/lifecycle.js";
 import { createTranscriptFlushScheduler } from "../shared/transcript-flush-scheduler.js";
-import { settleTranscriptProjection } from "./transcript/store.js";
+import { adoptSettledTranscript, settleTranscriptProjection } from "./transcript/store.js";
 
 export function createSessionController({
   state,
@@ -157,25 +157,7 @@ export function createSessionController({
   function renderSessionAndClearPendingFlush(session) {
     transcriptFlushScheduler.cancel();
     const settled = settleTranscriptProjection(state);
-    if (!settled) {
-      return renderSession(session);
-    }
-    // settleTranscriptProjection materialises into state.session, not
-    // necessarily into THIS `session` — most callers pass state.session
-    // itself, but some (session_meta_updated, approval_added/resolved) build
-    // a fresh `{...state.session, override}` copy captured before the settle
-    // above ran, so its `.transcript` is still the stale one. Recognise "the
-    // same live thread" by id, not by array identity (a rebuilt array is not
-    // a reliable "still pending" signal — see settleTranscriptProjection's
-    // doc) and adopt the freshly-settled transcript into it.
-    const isLiveThreadSession =
-      session
-      && state.session
-      && session.active_thread_id
-      && session.active_thread_id === state.session.active_thread_id;
-    return renderSession(
-      isLiveThreadSession ? { ...session, transcript: state.session.transcript } : session
-    );
+    return renderSession(adoptSettledTranscript(state, session, settled));
   }
 
   const ctx = {
@@ -230,17 +212,19 @@ export function createSessionController({
     cancelStreamReconnect: controller.cancelStreamReconnect,
     cancelThreadsPoll: controller.cancelThreadsPoll,
     // Narrow escape hatch for app.js's `renderer.renderSession` wrap
-    // (frontend/app.js:1184), which every direct renderSession(...) call site
-    // there goes through instead of ctx.renderSession — without this, those
-    // calls paint once immediately and again when a queued delta timer fires.
-    // Must settle as well as cancel: a BARE cancel destroys the only
-    // scheduled catch-up while leaving state.session.transcript on its stale
-    // pre-projection array, so the direct render that follows paints that
-    // stale array. app.js re-reads state.session after this call to pick up
-    // whatever settling just materialised.
+    // (frontend/app.js:1184) and for render-session.js's own `renderSession`
+    // (which calls this directly too, so its internal closures — teamsCache
+    // /reviewsCache/workflowsCache callbacks, the pairing-expiry timer — that
+    // never go through ctx.renderSession are covered as well). Must settle as
+    // well as cancel: a BARE cancel destroys the only scheduled catch-up
+    // while leaving state.session.transcript on its stale pre-projection
+    // array, so the direct render that follows paints that stale array.
+    // Returns whether it settled, so a caller holding a session-shaped copy
+    // (or an earlier read of state.session) knows whether to reconcile via
+    // adoptSettledTranscript before rendering it.
     cancelPendingTranscriptFlush: () => {
       transcriptFlushScheduler.cancel();
-      settleTranscriptProjection(state);
+      return settleTranscriptProjection(state);
     },
     connectSessionStream: controller.connectSessionStream,
     copyPairingLink: controller.copyPairingLink,

@@ -6,7 +6,7 @@ import {
   __readTranscriptFullRebuildCount,
   __resetTranscriptFullRebuildCount,
 } from "./session/stream.js";
-import { settleTranscriptProjection } from "./transcript/store.js";
+import { adoptSettledTranscript, settleTranscriptProjection } from "./transcript/store.js";
 import {
   createTranscriptFlushScheduler,
   TRANSCRIPT_FLUSH_CHAR_THRESHOLD,
@@ -50,7 +50,7 @@ function createManualClock(startTime = 0) {
   };
 }
 
-function makeController() {
+function makeController({ ensureConversationTranscript } = {}) {
   const renders = [];
   const clock = createManualClock();
   const state = {
@@ -85,22 +85,7 @@ function makeController() {
   function renderSessionAndClearPendingFlush(session) {
     transcriptFlushScheduler.cancel();
     const settled = settleTranscriptProjection(state);
-    if (!settled) {
-      return baseRenderSession(session);
-    }
-    // settleTranscriptProjection materialises into state.session, not
-    // necessarily into THIS `session` — a direct call (session_meta_updated
-    // below) builds its own `{...state.session, override}` copy captured
-    // before the settle above ran. Recognise "the same live thread" by id,
-    // not array identity, and adopt the freshly-settled transcript into it.
-    const isLiveThreadSession =
-      session
-      && state.session
-      && session.active_thread_id
-      && session.active_thread_id === state.session.active_thread_id;
-    return baseRenderSession(
-      isLiveThreadSession ? { ...session, transcript: state.session.transcript } : session
-    );
+    return baseRenderSession(adoptSettledTranscript(state, session, settled));
   }
   const transcriptFlushScheduler = createTranscriptFlushScheduler({
     render: () => {
@@ -117,6 +102,7 @@ function makeController() {
     applySessionSnapshot() {},
     cancelSessionPoll() {},
     cancelStreamReconnect() {},
+    ensureConversationTranscript,
     handleUnauthorized() {},
     logLine() {},
     renderSession: renderSessionAndClearPendingFlush,
@@ -135,10 +121,28 @@ function makeController() {
   // pre-projection array.
   function cancelPendingTranscriptFlush() {
     transcriptFlushScheduler.cancel();
-    settleTranscriptProjection(state);
+    return settleTranscriptProjection(state);
   }
 
-  return { clock, controller, renders, state, transcriptFlushScheduler, cancelPendingTranscriptFlush };
+  // Mirrors render-session.js's OWN renderSession after the P1 fix: it calls
+  // cancelPendingTranscriptFlush itself, so callbacks defined in the SAME
+  // closure that invoke it directly — never through renderSessionAndClearPendingFlush,
+  // never through app.js's wrap — still cancel a pending flush instead of
+  // leaving it to double-render later.
+  function renderSessionBase(session) {
+    const settled = cancelPendingTranscriptFlush();
+    return baseRenderSession(adoptSettledTranscript(state, session, settled));
+  }
+
+  return {
+    clock,
+    controller,
+    renders,
+    state,
+    transcriptFlushScheduler,
+    cancelPendingTranscriptFlush,
+    renderSessionBase,
+  };
 }
 
 test("live transcript deltas update state immediately but render once per window", () => {
@@ -386,6 +390,60 @@ test("cancelPendingTranscriptFlush settles the pending projection, so a direct r
   );
 });
 
+// P1: render-session.js's OWN internal callbacks — teamsCache.sync's resolve
+// (render-session.js:624), reviewsCache.sync's and workflowsCache.sync's
+// resolves, the pairing-expiry timer — call the closure-local `renderSession`
+// function DIRECTLY. None of them go through ctx.renderSession, and none of
+// them go through app.js's `renderer.renderSession` wrap either (that wrap
+// only intercepts the exported object property; these closures call the
+// function binding itself). Settling only in those two places therefore
+// leaves every one of these call sites able to paint the stale
+// pre-projection array immediately and then paint AGAIN when the scheduler's
+// own timer catches up. renderSessionBase below mirrors render-session.js's
+// fix: renderSession calls cancelPendingTranscriptFlush itself.
+test("an internal renderSession callback (mirroring render-session.js's teamsCache.sync resolve) settles the pending flush itself and is not double-rendered by the scheduler's own timer", () => {
+  const { clock, controller, renders, state, transcriptFlushScheduler, renderSessionBase } = makeController();
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([["agent-1", { ...state.session.transcript[0] }]]);
+  state.transcriptHydrationOrder = ["agent-1"];
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "one",
+    item_id: "agent-1",
+    revision: 1,
+    thread_id: "thread-1",
+  });
+  assert.equal(renders.length, 0, "the delta must still be coalescing");
+  assert.equal(transcriptFlushScheduler.stats().pending, true);
+
+  // Mirrors render-session.js:624 — `() => renderSession(state.session || session)`,
+  // a closure over the SAME `renderSession` this file's fix lives inside,
+  // never routed through any external wrapper.
+  function teamsCacheResolvedCallback() {
+    renderSessionBase(state.session);
+  }
+  teamsCacheResolvedCallback();
+
+  assert.equal(renders.length, 1, "the internal callback must have painted");
+  assert.equal(
+    renders[0].transcript[0].text,
+    "one",
+    "and painted the settled text, not the stale pre-projection array"
+  );
+  assert.equal(
+    transcriptFlushScheduler.stats().pending,
+    false,
+    "the internal callback must cancel the scheduler's pending timer too, not just settle the array"
+  );
+
+  clock.tick(TRANSCRIPT_FLUSH_MAX_WINDOW_MS);
+  assert.equal(
+    renders.length,
+    1,
+    "the scheduler's own (already-cancelled) timer must not fire a second render"
+  );
+});
+
 // P1: applyLocalTranscriptEntryPatch reads state.session.transcript and
 // rebuilds it (for a DIFFERENT item than any pending delta targets) without
 // ever touching the hydration window. Two ways that used to go wrong, both
@@ -557,4 +615,53 @@ test("a completion patch before hydration has loaded anything must not turn an e
     "agent-2 must not have been dropped by a window the patch alone should never have loaded"
   );
   assert.ok(rendered.some((entry) => entry.item_id === "agent-2"));
+});
+
+// P1: applyTranscriptPatchOverlay (transcript-hydration-store.js) deliberately
+// no-ops for an item absent from an otherwise-LOADED window — a patch carries
+// no authoritative body, so it must never be what teaches the window about a
+// new item (see .sealwire/PLAN.md, "Invalidate; do not write"). But
+// applyLocalTranscriptEntryPatch still appends the item to
+// state.session.transcript so it is visible right away, and that array-only
+// write is not itself durable: a LATER delta for some other item re-arms the
+// pending projection, and settling it rebuilds the WHOLE array from the
+// window (settleTranscriptProjection) — which has never heard of this item —
+// silently dropping it with no path back. The fix invalidates the window for
+// repair AND drives a fetch directly (mirroring transcript_stream_lagged
+// above), so hydration re-establishes the truth instead of leaving the array
+// write to vanish for good.
+test("a completion patch for an item a LOADED window has never seen invalidates the window for repair, not just the array", () => {
+  const ensureConversationTranscriptCalls = [];
+  const { state, controller } = makeController({
+    ensureConversationTranscript: (session) => {
+      ensureConversationTranscriptCalls.push(session);
+    },
+  });
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationOrder = ["agent-1"];
+  state.transcriptHydrationEntries = new Map([
+    ["agent-1", { ...state.session.transcript[0], content_state: "full" }],
+  ]);
+
+  controller.applyLocalTranscriptEntryPatch(
+    { item_id: "agent-2", status: "completed", text: "brand new", thread_id: "thread-1" },
+    { defaultStatus: "completed" }
+  );
+
+  assert.ok(
+    state.session.transcript.some((entry) => entry.item_id === "agent-2"),
+    "the new entry must still be visible right away"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1")?.content_state,
+    "preview",
+    "the window must be invalidated for repair — agent-2 has no body of its own to seed it with, " +
+      "so the window can no longer be trusted as loaded-and-complete"
+  );
+  assert.equal(
+    ensureConversationTranscriptCalls.length,
+    1,
+    "a repair fetch must be driven directly — marking the window dirty alone is not enough " +
+      "(same reasoning as transcript_stream_lagged above)"
+  );
 });

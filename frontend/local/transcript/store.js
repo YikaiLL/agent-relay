@@ -209,3 +209,20 @@ export function settleTranscriptProjection(state) {
   };
   return true;
 }
+
+/// Reconcile a `session` a caller is about to render against a settle that
+/// may have just reassigned state.session out from under it — a spread copy
+/// (`{...state.session, override}`) or an earlier read both hold the
+/// pre-settle `.transcript`. Matched by active_thread_id, not identity, for
+/// the same reason settleTranscriptProjection itself does not trust identity.
+export function adoptSettledTranscript(state, session, settled) {
+  if (!settled) {
+    return session;
+  }
+  const isLiveThreadSession =
+    session
+    && state.session
+    && session.active_thread_id
+    && session.active_thread_id === state.session.active_thread_id;
+  return isLiveThreadSession ? { ...session, transcript: state.session.transcript } : session;
+}

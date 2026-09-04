@@ -406,6 +406,68 @@ test("a snapshot switching the active thread flushes on the same tick", () => {
   assert.equal(h.rendered.length, 1);
 });
 
+// P1 (two review findings, closely coupled): app.js's renderSession wrap
+// freezes the thread the user is viewing into a view-only pin when the ACTIVE
+// thread switches out from under it, using "the live session a moment ago" —
+// which it used to recover by reading state.session before its OWN write
+// reached it. That stopped working once applySessionSnapshot had to advance
+// state.session synchronously here too (queue() only defers the PAINT, never
+// the write), so applySessionSnapshot must stash the outgoing session
+// explicitly for app.js to read (lifecycle.js:1007 / app.js:1213).
+//
+// Second, closely coupled finding: switchTranscriptHydrationThread (which
+// repoints the hydration window at the incoming thread) used to run BEFORE
+// settleTranscriptProjection. A pending delta for the OUTGOING thread then
+// fails settleTranscriptProjection's transcriptWindowIsLoaded check against
+// the just-switched-to window, has its pending flag cleared anyway, and is
+// never rebuilt into state.session.transcript — so the stash above would
+// freeze a pin missing the last thing the user watched stream in
+// (lifecycle.js:938 running before the settle at :997).
+test("a snapshot switching threads stashes the outgoing session for the view-only pin, with its pending delta already settled into it", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot({
+    active_thread_id: THREAD,
+    transcript: [entry("agent-1", "Hello", { status: "running" })],
+  });
+  h.state.transcriptHydrationThreadId = THREAD;
+  h.state.transcriptHydrationOrder = ["agent-1"];
+  h.state.transcriptHydrationEntries = new Map([
+    ["agent-1", entry("agent-1", "Hello", { status: "running" })],
+  ]);
+
+  // A live delta extends the OUTGOING thread's window but is still
+  // coalescing — state.session.transcript itself still reads the pre-delta
+  // text until something settles it.
+  h.stream.applyLocalTranscriptEntryDelta({
+    item_id: "agent-1",
+    thread_id: THREAD,
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  assert.equal(
+    h.state.session.transcript[0].text,
+    "Hello",
+    "sanity: the delta is still deferred before the switch below"
+  );
+
+  // A snapshot for a DIFFERENT thread arrives — e.g. the user started a new
+  // session while thread-1 was still streaming.
+  h.lifecycle.applySessionSnapshot(baseSnapshot({ active_thread_id: "thread-2" }));
+
+  assert.equal(
+    h.state.previousLiveSessionForPin?.active_thread_id,
+    THREAD,
+    "the outgoing thread's session must be stashed for app.js's view-only pin to read"
+  );
+  assert.equal(
+    h.state.previousLiveSessionForPin?.transcript.find((candidate) => candidate.item_id === "agent-1")?.text,
+    "Hello world",
+    "and it must carry the SETTLED text — the pending delta must not be lost when the window switches threads"
+  );
+});
+
 test("the very first snapshot (no previous session) flushes immediately", () => {
   const h = buildHarness();
   assert.equal(h.state.session, null);

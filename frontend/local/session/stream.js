@@ -484,6 +484,20 @@ export function createStreamController(ctx) {
     const entryIndex = state.session.transcript.findIndex(
       (candidate) => candidate?.item_id === patchedEntry.item_id
     );
+    if (entryIndex < 0 && transcriptWindowIsLoaded(state, currentThreadId)) {
+      // applyEntryPatchToWindow just no-op'd: the window is loaded but has
+      // never tracked this item, so the array append below is the ONLY place
+      // it will exist. That is not durable — a later delta for some other
+      // item re-arms the pending projection, and settling it rebuilds the
+      // whole array from the window (settleTranscriptProjection), which has
+      // never heard of this item, silently dropping it. Invalidate so
+      // hydration re-establishes the truth instead of leaving no way back —
+      // see .sealwire/PLAN.md, "Invalidate; do not write" — and drive the
+      // fetch directly, same reasoning as transcript_stream_lagged above:
+      // marking the window dirty alone does not itself trigger a refetch.
+      invalidateTranscriptWindowForRepair(state);
+      void ensureConversationTranscript(state.session);
+    }
     const nextTranscript = entryIndex >= 0
       ? state.session.transcript.map((candidate, index) =>
           index === entryIndex

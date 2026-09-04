@@ -111,6 +111,7 @@ import {
   collectFileChangeDetailItemIds,
 } from "./transcript/details.js";
 import { shouldShowTranscriptLoading } from "./transcript-loading.js";
+import { adoptSettledTranscript } from "./transcript/store.js";
 import {
   ConversationEmptyState,
 } from "../shared/conversation.js";
@@ -291,6 +292,14 @@ export function createSessionRenderer({
   scheduleControllerLeaseRefresh,
   cancelControllerHeartbeat,
   cancelControllerLeaseRefresh,
+  // Late-bound like the two above: the flush scheduler is owned by
+  // session-controller.js, built from a `controller` app.js assigns after
+  // this renderer. renderSession calls this itself (not just app.js's wrap
+  // around the exported property) so internal closures below — teamsCache
+  // /reviewsCache/workflowsCache callbacks, the pairing-expiry timer — that
+  // call renderSession directly still clear a pending scheduler flush
+  // instead of leaving it to double-render. See .sealwire/PLAN.md.
+  cancelPendingTranscriptFlush = () => false,
   logLine,
   ingestRelayLogs,
   escapeHtml,
@@ -437,6 +446,12 @@ export function createSessionRenderer({
   }
 
   function renderSession(session) {
+    // Must run before anything else: some call sites below (teamsCache.sync's
+    // resolve, the pairing-expiry timer, …) read state.session as their
+    // argument BEFORE settling ran, so it can still be the pre-projection
+    // object — adoptSettledTranscript grafts the freshly-settled transcript
+    // back in when that's the case.
+    session = adoptSettledTranscript(state, session, cancelPendingTranscriptFlush());
     state.session = session;
     if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
       window.dispatchEvent(new CustomEvent("agent-relay:session-updated"));

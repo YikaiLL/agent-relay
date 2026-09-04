@@ -977,6 +977,12 @@ const renderer = createSessionRenderer({
   cancelControllerLeaseRefresh() {
     return controller?.cancelControllerLeaseRefresh();
   },
+  // See render-session.js's own doc on this option: renderSession calls it
+  // directly so its internal closures (not just this file's `renderer.renderSession`
+  // wrap below) clear a pending transcript flush too.
+  cancelPendingTranscriptFlush() {
+    return controller?.cancelPendingTranscriptFlush?.();
+  },
   logLine,
   renderClientLogLines,
   ingestRelayLogs,
@@ -1204,7 +1210,17 @@ renderer.renderSession = function wrappedRenderSession(session) {
   if (devicesCache.hasData()) {
     session = { ...session, ...devicesCache.current() };
   }
-  const previousLiveSession = state.session;
+  // lifecycle.js's applySessionSnapshot now advances state.session
+  // synchronously before every render it triggers (queue() defers only the
+  // paint, never the write — see .sealwire/PLAN.md), so state.session can no
+  // longer be trusted to still hold "the live session a moment ago" by the
+  // time this wrap runs. It stashes that value here itself when the active
+  // thread just switched; fall back to state.session for every other render
+  // path (deltas/patches), which do not pre-write it and so still satisfy
+  // the old assumption. Consumed once — clear it so a later, unrelated
+  // render can't read a stale switch that already happened.
+  const previousLiveSession = state.previousLiveSessionForPin || state.session;
+  state.previousLiveSessionForPin = null;
   const viewedThreadWasLive = Boolean(
     state.viewThreadId
     && previousLiveSession?.active_thread_id === state.viewThreadId
