@@ -945,6 +945,39 @@ export function applyTranscriptPatchToWindow(state, patchedEntry) {
   return true;
 }
 
+/// Is the hydration window loaded for this thread? Shared by local and
+/// remote — both track the SAME window shape (transcriptHydrationEntries /
+/// Order / ThreadId) on their own `state` object, and both must agree on
+/// this check: writing a delta or patch into a window loaded for the WRONG
+/// thread would splice one conversation into another.
+export function transcriptWindowIsLoaded(state, threadId) {
+  return Boolean(
+    threadId
+    && state.transcriptHydrationThreadId === threadId
+    && state.transcriptHydrationEntries instanceof Map
+    && Array.isArray(state.transcriptHydrationOrder)
+    && state.transcriptHydrationOrder.length
+  );
+}
+
+/// Project the hydration window onto a rendered transcript array. Falls back
+/// to the session's own transcript when the window is not loaded for this
+/// thread (a delta can arrive before the first hydration), so the live tail
+/// still shows rather than blanking.
+export function renderedTranscriptFromWindow(state, session) {
+  const entries = state.transcriptHydrationEntries;
+  const order = state.transcriptHydrationOrder;
+  if (
+    state.transcriptHydrationThreadId !== session?.active_thread_id
+    || !(entries instanceof Map)
+    || !Array.isArray(order)
+    || !order.length
+  ) {
+    return session?.transcript || [];
+  }
+  return order.map((itemId) => entries.get(itemId)).filter(Boolean);
+}
+
 function createMergedSnapshotTailPatch(state, snapshot, signature) {
   // Mutate the live window IN PLACE — do not clone the whole map/array every
   // snapshot (the O(n) copy that froze long sessions; see

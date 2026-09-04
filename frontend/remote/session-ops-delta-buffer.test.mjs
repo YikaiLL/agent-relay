@@ -1,14 +1,13 @@
-// Reducer + perf coverage for the remote delta hot path's pending-append
-// buffer (frontend/remote/session-ops.js). The delta path used to do a
-// transcript.findIndex(...) and a full transcript.map(...)/spread rebuild
-// PER TOKEN. Both are now O(1) per delta: findIndex only runs once per item
-// per flush window (getPendingAppendEntry's cache-miss path), and the array
-// rebuild happens once per flush (applyPendingAppendsToSession), not once
-// per delta. These tests exercise the four offset outcomes AGAINST THE
-// BUFFERED VIEW — including the two cases the buffering itself makes
-// possible: a gap detected while an earlier append for the same item is
-// still sitting unflushed, and a re-delivered chunk that spans a flush
-// boundary (part of it already applied to the array, part never buffered).
+// Reducer coverage for the remote delta hot path (frontend/remote/session-ops.js),
+// which now adopts LOCAL's structure instead of the bespoke pending-append
+// buffers this file used to cover: when the hydration window is loaded for a
+// delta's own thread, the delta writes into it in O(1) (applyTranscriptDeltaToWindow)
+// and projecting that back onto the rendered array is deferred to settle, once
+// per flush, not once per token. When the window is NOT loaded, the array is
+// rebuilt directly, synchronously, per delta — no buffering, matching local's
+// own unhydrated fallback. These tests exercise the four offset outcomes
+// (gap -> repair, byte mismatch -> repair, full overlap -> no-op, partial ->
+// append only the missing suffix) against both paths.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -194,9 +193,22 @@ async function freshRemoteSession(extra = {}) {
   return state;
 }
 
-test("a partial offset append is buffered and not applied to the array until flush", async () => {
+// Same as freshRemoteSession, but with the hydration window loaded for
+// thread-1 (mirroring every entry already in the transcript) — the
+// precondition for the delta path's O(1) window-write branch.
+async function freshRemoteSessionWithWindow(extra = {}) {
+  const state = await freshRemoteSession(extra);
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map(
+    state.session.transcript.map((entry) => [entry.item_id, { ...entry }])
+  );
+  state.transcriptHydrationOrder = state.session.transcript.map((entry) => entry.item_id);
+  return state;
+}
+
+test("with a loaded hydration window, a partial offset append lands in the window immediately but the array lags until settle", async () => {
   activeBrowser || installBrowserStubs();
-  const state = await freshRemoteSession();
+  const state = await freshRemoteSessionWithWindow();
   const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
 
   applyTranscriptDelta({
@@ -210,11 +222,32 @@ test("a partial offset append is buffered and not applied to the array until flu
     text_offset: 5,
   });
 
-  // RED-FIRST invariant: the array itself must not change before a flush —
-  // only the buffer does. This is the whole point of deferring the rebuild.
+  // The O(1) Map write lands immediately...
+  assert.equal(state.transcriptHydrationEntries.get("item-1").text, "Hello world");
+  // ...but projecting it back onto the array is deferred to settle, once per
+  // flush — this is the whole point of deferring the rebuild.
   assert.equal(state.session.transcript[0].text, "Hello", "array must lag until flush");
 
   flushRemoteTranscriptRenderForTest();
+  assert.equal(state.session.transcript[0].text, "Hello world");
+});
+
+test("without a loaded hydration window, a partial offset append lands in the array immediately — no buffering, matching local's unhydrated fallback", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSession();
+  const { applyTranscriptDelta } = await import("./session-ops.js");
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+
   assert.equal(state.session.transcript[0].text, "Hello world");
 });
 
@@ -252,22 +285,21 @@ test("a duplicate re-delivery against the buffered view is a no-op", async () =>
   );
 });
 
-// REVIEW P1: the base-entry lookup was only cached on buffer.set — which
-// commitTranscriptDeltaAppend only reaches for an actual append. A duplicate,
-// gap, or mismatch returns before that, so a run of rejected deltas for the
-// same item each paid for their own transcript.find. The lookup must be
-// cached independently of whether a delta turns out to append anything.
-test("repeated non-appending deltas for the same item reuse the cached lookup instead of rescanning per delta", async () => {
+// A run of rejected deltas for the same item (duplicates, then a genuine
+// gap) must neither corrupt the array nor let a later, unrelated flush count
+// them as a rebuild — each is read-and-decided fresh against the CURRENT
+// array, synchronously, with no cross-delta caching to go stale.
+test("repeated non-appending deltas for the same item leave the array untouched and do not count as a rebuild", async () => {
   activeBrowser || installBrowserStubs();
   const state = await freshRemoteSession();
   const {
     applyTranscriptDelta,
     flushRemoteTranscriptRenderForTest,
-    __readTranscriptDeltaBaseLookupCount,
-    __resetTranscriptDeltaBaseLookupCount,
+    __readTranscriptDeltaRebuildCount,
+    __resetTranscriptDeltaRebuildCount,
   } = await import("./session-ops.js");
   window.__transcriptGapRepairCount = 0;
-  __resetTranscriptDeltaBaseLookupCount();
+  __resetTranscriptDeltaRebuildCount();
 
   // Duplicate re-delivery of the full baseText, three times in a row — none
   // of these append anything.
@@ -283,14 +315,9 @@ test("repeated non-appending deltas for the same item reuse the cached lookup in
       text_offset: 0,
     });
   }
-  assert.equal(
-    __readTranscriptDeltaBaseLookupCount(),
-    1,
-    "three duplicate deltas for the same item must scan the array once, not three times"
-  );
 
-  // A genuine gap, repeated — also rejected before commitTranscriptDeltaAppend
-  // ever runs.
+  // A genuine gap, repeated — each rejected on its own, against the
+  // (unchanged) array.
   for (let i = 0; i < 2; i += 1) {
     applyTranscriptDelta({
       thread_id: "thread-1",
@@ -303,20 +330,11 @@ test("repeated non-appending deltas for the same item reuse the cached lookup in
       text_offset: 20,
     });
   }
-  assert.equal(
-    __readTranscriptDeltaBaseLookupCount(),
-    1,
-    "a repeated gap for the same item must still reuse the cached lookup, not rescan"
-  );
   assert.equal(window.__transcriptGapRepairCount, 2, "each gap delta still schedules its own repair");
+  assert.equal(state.session.transcript[0].text, "Hello", "no rejected delta may have touched the array");
 
-  // Every delta above was rejected — the array itself was never touched, and
-  // the cache-only entries must not force a rebuild at flush either.
-  const { __readTranscriptDeltaRebuildCount, __resetTranscriptDeltaRebuildCount } =
-    await import("./session-ops.js");
-  __resetTranscriptDeltaRebuildCount();
   flushRemoteTranscriptRenderForTest();
-  assert.equal(__readTranscriptDeltaRebuildCount(), 0, "a buffer with only cached, non-dirty lookups must not rebuild");
+  assert.equal(__readTranscriptDeltaRebuildCount(), 0, "nothing appended, so a flush must not count as a rebuild");
   assert.equal(state.session.transcript[0].text, "Hello");
   delete window.__transcriptGapRepairCount;
 });
@@ -626,7 +644,7 @@ function buildLargeSession(n) {
   };
 }
 
-test("the delta path never rebuilds before a flush, and rebuilds exactly once per flush, independent of transcript size", async () => {
+test("with a loaded hydration window, the delta path never rebuilds the array before a flush, and rebuilds exactly once per flush, independent of transcript size", async () => {
   activeBrowser || installBrowserStubs();
   const { state } = await import("./state.js");
   const {
@@ -646,6 +664,11 @@ test("the delta path never rebuilds before a flush, and rebuilds exactly once pe
     state.session = buildLargeSession(n);
     state.realSession = state.session;
     state.socket = null;
+    state.transcriptHydrationThreadId = "thread-1";
+    state.transcriptHydrationEntries = new Map(
+      state.session.transcript.map((entry) => [entry.item_id, { ...entry }])
+    );
+    state.transcriptHydrationOrder = state.session.transcript.map((entry) => entry.item_id);
 
     let offset = 0;
     for (let f = 0; f < FLUSHES; f += 1) {

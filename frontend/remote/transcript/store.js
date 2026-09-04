@@ -13,6 +13,12 @@ import {
   restoreTranscriptHydrationForThread,
   stashTranscriptHydrationForThread,
   clearTranscriptHydrationThreadCache,
+  applyTranscriptDeltaToWindow,
+  applyTranscriptPatchToWindow,
+  markTranscriptWindowNeedsRepair,
+  renderedTranscriptFromWindow,
+  resolveDeltaAppend,
+  transcriptWindowIsLoaded,
 } from "../../shared/transcript-hydration-store.js";
 import { prepareTranscriptEntryForSurface } from "./details.js";
 import { applyRemoteSurfacePatch } from "../surface-state.js";
@@ -38,6 +44,29 @@ export function switchTranscriptHydrationThread(state, nextThreadId) {
 export function restoreHydratedTranscript(state, snapshot) {
   return restoreHydratedTranscriptSnapshot(state, snapshot);
 }
+
+/// Append a live transcript delta to the loaded window. Mirrors
+/// local/transcript/store.js's appendTranscriptDelta — the rendered
+/// transcript is rebuilt from this window at settle time, so a delta must
+/// land here to survive.
+export function appendTranscriptDelta(state, delta) {
+  return applyTranscriptDeltaToWindow(state, delta);
+}
+
+/// Apply a non-delta entry patch (started/completed/patched) to the loaded
+/// window. The array-only twin of appendTranscriptDelta above.
+export function applyEntryPatchToWindow(state, patchedEntry) {
+  return applyTranscriptPatchToWindow(state, patchedEntry);
+}
+
+/// Mark every loaded entry non-authoritative after a delta gap, so the
+/// re-hydration gate refetches instead of trusting a body that may now be
+/// missing an interior chunk.
+export function invalidateTranscriptWindowForRepair(state) {
+  return markTranscriptWindowNeedsRepair(state);
+}
+
+export { renderedTranscriptFromWindow, resolveDeltaAppend, transcriptWindowIsLoaded };
 
 export function prepareTranscriptHydration(state, snapshot) {
   const prepared = prepareTranscriptHydrationState(state, snapshot);

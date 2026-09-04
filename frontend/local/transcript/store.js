@@ -16,7 +16,9 @@ import {
   applyTranscriptDeltaToWindow,
   applyTranscriptPatchToWindow,
   markTranscriptWindowNeedsRepair,
+  renderedTranscriptFromWindow,
   resolveDeltaAppend,
+  transcriptWindowIsLoaded,
 } from "../../shared/transcript-hydration-store.js";
 
 function applyLocalTranscriptPatch(state, patch) {
@@ -71,16 +73,9 @@ export function invalidateTranscriptWindowForRepair(state) {
 /// pre-hydration path reconciles identically to the loaded window.
 export { resolveDeltaAppend };
 
-/// Is the hydration window loaded for this thread?
-export function transcriptWindowIsLoaded(state, threadId) {
-  return Boolean(
-    threadId
-    && state.transcriptHydrationThreadId === threadId
-    && state.transcriptHydrationEntries instanceof Map
-    && Array.isArray(state.transcriptHydrationOrder)
-    && state.transcriptHydrationOrder.length
-  );
-}
+/// Is the hydration window loaded for this thread? Shared with remote — see
+/// transcript-hydration-store.js.
+export { transcriptWindowIsLoaded };
 
 export function restoreHydratedTranscript(state, snapshot) {
   return restoreHydratedTranscriptSnapshot(state, snapshot);
@@ -169,23 +164,9 @@ export function __recordTranscriptFullRebuild() {
   transcriptFullRebuildCount += 1;
 }
 
-/// Project the hydration window onto a rendered transcript array. Falls back
-/// to the session's own transcript when the window is not loaded for this
-/// thread (a delta can arrive before the first hydration), so the live tail
-/// still shows rather than blanking.
-export function renderedTranscriptFromWindow(state, session) {
-  const entries = state.transcriptHydrationEntries;
-  const order = state.transcriptHydrationOrder;
-  if (
-    state.transcriptHydrationThreadId !== session?.active_thread_id
-    || !(entries instanceof Map)
-    || !Array.isArray(order)
-    || !order.length
-  ) {
-    return session?.transcript || [];
-  }
-  return order.map((itemId) => entries.get(itemId)).filter(Boolean);
-}
+/// Project the hydration window onto a rendered transcript array. Shared
+/// with remote — see transcript-hydration-store.js.
+export { renderedTranscriptFromWindow };
 
 /// Marks that a live delta appended to the loaded window without yet being
 /// reflected in state.session.transcript. The O(n) rebuild that would reflect

@@ -2653,6 +2653,12 @@ test("applyTranscriptDelta updates existing transcript entries using text and st
     flushRemoteTranscriptRenderForTest,
   } = await import("./session-ops.js");
 
+  // No hydration window for this test — it exercises the array fallback.
+  // Reset explicitly: an earlier test in this file may have left the window
+  // loaded for "thread-1" (hydration is a module-level singleton), which
+  // would otherwise make applyTranscriptDelta take the window path against
+  // an unrelated item-1 the array below never carries.
+  state.transcriptHydrationThreadId = null;
   state.session = {
     active_thread_id: "thread-1",
     transcript: [
@@ -2675,8 +2681,8 @@ test("applyTranscriptDelta updates existing transcript entries using text and st
     delta_kind: "agent_text",
   });
 
-  // The array rebuild is deferred to flush — the delta itself only writes
-  // the pending-append buffer in O(1).
+  // No window loaded — the array fallback updates synchronously. The flush
+  // below is a no-op here; it only matters for the render, not the state.
   flushRemoteTranscriptRenderForTest();
   assert.equal(state.session.transcript[0].text, "Hello world");
   assert.equal(state.session.transcript[0].status, "running");
@@ -5279,4 +5285,566 @@ test("verbose broker logging restores the snapshot scroll trace", async () => {
     1,
     "with the flag on the trace must come back — otherwise the gate is a delete"
   );
+});
+
+// -- Sub-task: remote deltas write the hydration window ----------------------
+//
+// applyTranscriptDelta now adopts local's structure: when the hydration
+// window is loaded for a delta's OWN thread, the delta writes into it in
+// O(1) and the array projection is deferred to settle (once per flush).
+// Every OTHER place that reads or rewrites either state.realSession.transcript
+// or state.session.transcript must settle first, or a pending append is
+// either dropped (an interleaved read/rewrite reads the stale array and its
+// own rebuild — a patch, a snapshot merge — has no idea the window moved on)
+// or wrongly reverted (a later settle rebuilds purely from the window, which
+// never learned about that interleaved write). One test per boundary below.
+
+// Shared setup for the pin-related boundary tests: thread-b starts live and
+// gets pinned view-only, then the relay moves the live thread on to
+// thread-a — the shape every one of those tests needs (a background pin with
+// its own loaded window, distinct from the live thread's).
+async function pinBackgroundThreadWithWindow() {
+  const { state } = await import("./state.js");
+  const { applySessionSnapshot, clearSessionRuntime, viewRemoteThread } =
+    await import("./session-ops.js");
+
+  clearSessionRuntime();
+  state.realSession = state.session = {
+    active_thread_id: "thread-b",
+    transcript_revision: 1,
+    transcript: [
+      { item_id: "b-1", kind: "agent_text", status: "running", text: "Hello", turn_id: "turn-b", tool: null },
+    ],
+  };
+  state.socket = null;
+
+  assert.equal(await viewRemoteThread("thread-b"), true, "precondition: pin thread-b while it is live");
+
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: null,
+    current_status: "idle",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript_truncated: false,
+    transcript_revision: 1,
+    transcript: [
+      { item_id: "a-1", kind: "agent_text", status: "running", text: "Live", turn_id: "turn-a", tool: null },
+    ],
+  });
+
+  assert.equal(state.realSession.active_thread_id, "thread-a", "precondition: the live thread moved on");
+  assert.equal(state.session.active_thread_id, "thread-b", "precondition: thread-b stays pinned");
+  assert.equal(state.session.view_only, true, "precondition: thread-b renders as a view-only projection");
+
+  // The hydration window follows the PIN (the pinned-thread trade-off —
+  // .sealwire/PLAN.md) — set up directly here rather than depending on a
+  // real fetch to populate it.
+  state.transcriptHydrationThreadId = "thread-b";
+  state.transcriptHydrationEntries = new Map([["b-1", { ...state.session.transcript[0] }]]);
+  state.transcriptHydrationOrder = ["b-1"];
+
+  return { state };
+}
+
+test("applySessionSnapshot settles before merging — a pending delta and a snapshot-introduced entry both survive", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await import("./state.js");
+  const {
+    applySessionSnapshot,
+    applyTranscriptDelta,
+    clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
+  } = await import("./session-ops.js");
+
+  clearSessionRuntime();
+  state.realSession = state.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 1,
+    transcript: [
+      { item_id: "item-1", kind: "agent_text", status: "running", text: "Hello", turn_id: "turn-1", tool: null },
+    ],
+  };
+  state.socket = null;
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([["item-1", { ...state.session.transcript[0] }]]);
+  state.transcriptHydrationOrder = ["item-1"];
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  // Still deferred — nothing has settled yet.
+  assert.equal(state.realSession.transcript[0].text, "Hello");
+
+  // An ordinary snapshot arrives: a compacted preview for item-1 (shorter
+  // than what the pending delta is about to grow it to) plus a BRAND NEW
+  // entry the window has never seen. Settling must happen BEFORE this merge
+  // runs, or a later settle (which rebuilds the array purely from the
+  // window) would discard item-2 entirely once the pending delta above is
+  // materialised.
+  applySessionSnapshot({
+    active_thread_id: "thread-1",
+    active_turn_id: null,
+    current_status: "idle",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript_truncated: false,
+    transcript_revision: 2,
+    transcript: [
+      {
+        item_id: "item-1",
+        kind: "agent_text",
+        status: "running",
+        text: "Hel",
+        content_state: "preview",
+        turn_id: "turn-1",
+        tool: null,
+      },
+      {
+        item_id: "item-2",
+        kind: "agent_text",
+        status: "completed",
+        text: "a brand new entry",
+        turn_id: "turn-1",
+        tool: null,
+      },
+    ],
+  });
+
+  flushRemoteTranscriptRenderForTest();
+
+  const ids = state.session.transcript.map((entry) => entry.item_id);
+  assert.ok(ids.includes("item-2"), "the snapshot's brand-new entry must not disappear when the pending delta settles");
+  assert.equal(
+    state.session.transcript.find((entry) => entry.item_id === "item-1")?.text,
+    "Hello world",
+    "the pending delta's text must survive the snapshot's compacted preview"
+  );
+});
+
+test("repairActiveTranscriptTail invalidates the loaded window so re-hydration does not trust a copy the repair just overwrote", async () => {
+  activeBrowser = installBrowserStubs();
+  const sentPayloads = [];
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+  const { applySessionSnapshot, applyTranscriptDelta, clearSessionRuntime } =
+    await import("./session-ops.js");
+  const { remoteQueryClient } = await import("./query-client.js");
+
+  clearSessionRuntime();
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-repair-window",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+
+  applySessionSnapshot({
+    active_thread_id: "thread-1",
+    active_turn_id: "turn-1",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript_truncated: false,
+    transcript_revision: 5,
+    transcript: [
+      { item_id: "item-1", kind: "agent_text", status: "running", text: "Hello", turn_id: "turn-1", tool: null },
+    ],
+  });
+  // A small (non-truncated) snapshot does not itself load the hydration
+  // window — hydration is gated on transcript_truncated (see
+  // .sealwire/PLAN.md). Load it directly so this test exercises the "window
+  // loaded for this thread" precondition repairActiveTranscriptTail must
+  // invalidate.
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([
+    ["item-1", { ...state.session.transcript[0], content_state: "full" }],
+  ]);
+  state.transcriptHydrationOrder = ["item-1"];
+
+  state.socket = {
+    readyState: 1,
+    send(frameText) {
+      const frame = JSON.parse(frameText);
+      sentPayloads.push(frame.payload);
+      setImmediate(async () => {
+        await handleRemoteBrokerPayload({
+          kind: "remote_action_result",
+          action_id: frame.payload.action_id,
+          action: "fetch_thread_transcript",
+          ok: true,
+          snapshot: {},
+          thread_transcript: {
+            thread_id: "thread-1",
+            revision: 8,
+            entries: [
+              { item_id: "item-1", kind: "agent_text", text: "Hello world", status: "completed", turn_id: "turn-1", tool: null },
+            ],
+            prev_cursor: null,
+          },
+        });
+      });
+    },
+  };
+
+  // A genuine offset gap — beyond what either the array or the window holds
+  // — forces repairActiveTranscriptTail.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "!!",
+    delta_kind: "agent_text",
+    text_offset: 99,
+  });
+
+  await waitFor(() => state.realSession?.transcript?.[0]?.text === "Hello world");
+  assert.equal(sentPayloads.length, 1);
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-1")?.content_state,
+    "preview",
+    "the window's cached copy must be downgraded — repair rewrote the array directly and the window is now stale relative to it"
+  );
+
+  clearSessionRuntime();
+  state.socket = null;
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+});
+
+test("applyTranscriptEntryPatch writes the window, not just the array — the patch survives a later delta re-arming the pending projection", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    applyTranscriptEvent,
+    clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
+  } = await import("./session-ops.js");
+
+  clearSessionRuntime();
+  state.realSession = state.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 1,
+    transcript: [
+      { item_id: "item-1", kind: "agent_text", status: "running", text: "Hello", turn_id: "turn-1", tool: null },
+      { item_id: "item-2", kind: "agent_text", status: "running", text: "", turn_id: "turn-2", tool: null },
+    ],
+  };
+  state.socket = null;
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([
+    ["item-1", { ...state.session.transcript[0] }],
+    ["item-2", { ...state.session.transcript[1] }],
+  ]);
+  state.transcriptHydrationOrder = ["item-1", "item-2"];
+
+  // A delta arrives for item-1 (window-loaded, deferred).
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+
+  // A completion patch lands for item-2, BEFORE the delta above ever
+  // flushes.
+  applyTranscriptEvent({
+    kind: "transcript_entry_completed",
+    thread_id: "thread-1",
+    item_id: "item-2",
+    entry_kind: "agent_text",
+    text: "done",
+    turn_id: "turn-2",
+    revision: 2,
+  });
+
+  // A SECOND delta for item-1 re-arms the pending projection the patch's own
+  // settle-before-read already cleared once — if the patch never reached the
+  // window, the eventual settle (rebuilding the array purely from the
+  // window) would revert it here.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "!",
+    delta_kind: "agent_text",
+    text_offset: 11,
+  });
+
+  flushRemoteTranscriptRenderForTest();
+
+  assert.equal(state.session.transcript.find((entry) => entry.item_id === "item-1")?.text, "Hello world!");
+  assert.equal(
+    state.session.transcript.find((entry) => entry.item_id === "item-2")?.text,
+    "done",
+    "the patch must survive the later delta re-arming the window projection — it must have reached the window itself"
+  );
+  assert.equal(state.session.transcript.find((entry) => entry.item_id === "item-2")?.status, "completed");
+});
+
+test("commitLiveSession settles before publishing a re-projection for a pinned background thread", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await pinBackgroundThreadWithWindow();
+  const { applyTranscriptDelta, applyTranscriptEvent } = await import("./session-ops.js");
+
+  // A delta lands for the PINNED (viewed) thread — window-loaded, deferred.
+  applyTranscriptDelta({
+    thread_id: "thread-b",
+    item_id: "b-1",
+    turn_id: "turn-b",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  assert.equal(state.session.transcript[0].text, "Hello", "still deferred");
+
+  // An approval event for the LIVE thread (thread-a) commits via
+  // commitLiveSession, which re-derives state.session (the pinned
+  // projection) via projectRemoteViewedSession — reading state.session's own
+  // transcript. It must settle first, or that read is the stale one above.
+  applyTranscriptEvent({
+    kind: "approval_added",
+    approval: { request_id: "approval-1", summary: "Run a thing" },
+  });
+
+  assert.equal(
+    state.session.transcript[0].text,
+    "Hello world",
+    "the pinned thread's pending delta must be visible once the live thread's own event re-publishes the projection"
+  );
+  assert.equal(state.session.active_thread_id, "thread-b", "the projection is still for the pinned thread");
+});
+
+test("applyRenderedSession settles before rendering — reached here via viewRemoteThread's fetch-free (already-live) branch", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await import("./state.js");
+  const { applyTranscriptDelta, clearSessionRuntime, viewRemoteThread } =
+    await import("./session-ops.js");
+
+  clearSessionRuntime();
+  state.realSession = state.session = {
+    active_thread_id: "thread-b",
+    transcript_revision: 1,
+    transcript: [
+      { item_id: "b-1", kind: "agent_text", status: "running", text: "Hello", turn_id: "turn-b", tool: null },
+    ],
+  };
+  state.socket = null;
+  state.transcriptHydrationThreadId = "thread-b";
+  state.transcriptHydrationEntries = new Map([["b-1", { ...state.session.transcript[0] }]]);
+  state.transcriptHydrationOrder = ["b-1"];
+
+  applyTranscriptDelta({
+    thread_id: "thread-b",
+    item_id: "b-1",
+    turn_id: "turn-b",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  assert.equal(state.session.transcript[0].text, "Hello", "still deferred");
+
+  // Pinning the thread that is ALREADY live takes viewRemoteThread's
+  // fetch-free branch, which renders via applyRenderedSession(state.realSession)
+  // directly and synchronously — no scheduler flush runs first.
+  assert.equal(await viewRemoteThread("thread-b"), true);
+
+  assert.equal(
+    state.session.transcript.find((entry) => entry.item_id === "b-1")?.text,
+    "Hello world",
+    "the render must show the settled text, not the pre-projection array"
+  );
+});
+
+test("invalidateViewOnlyNavigation discards a pending projection for the abandoned pin instead of stranding it", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await pinBackgroundThreadWithWindow();
+  const { applyTranscriptDelta, resumeRemoteSession, applyTranscriptEvent } =
+    await import("./session-ops.js");
+
+  // A delta lands for the pinned thread-b — window-loaded, deferred.
+  applyTranscriptDelta({
+    thread_id: "thread-b",
+    item_id: "b-1",
+    turn_id: "turn-b",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  assert.equal(state.session.transcript[0].text, "Hello", "still deferred");
+
+  // Resuming a (different) session is an explicit live action: it abandons
+  // the view-only pin via invalidateViewOnlyNavigation. dispatchOrRecover has
+  // no real transport here and will fail — that is fine, the invalidation
+  // itself runs synchronously before the dispatch.
+  await resumeRemoteSession("thread-c").catch(() => {});
+
+  // The live thread (thread-a) gets an unrelated event next. If the
+  // abandoned pin's pending projection had been left stranded rather than
+  // discarded, thread-b's window content could still leak onto whatever
+  // session is current the next time something settles.
+  applyTranscriptEvent({
+    kind: "approval_added",
+    approval: { request_id: "approval-1", summary: "Run a thing" },
+  });
+
+  assert.equal(state.realSession.active_thread_id, "thread-a", "the live thread is unaffected by the abandoned pin");
+  assert.equal(
+    state.realSession.transcript.find((entry) => entry.item_id === "b-1"),
+    undefined,
+    "the abandoned pin's thread-b content must never leak onto the live thread's transcript"
+  );
+});
+
+test("clearSessionRuntime discards a pending projection explicitly", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await pinBackgroundThreadWithWindow();
+  const { applyTranscriptDelta, clearSessionRuntime, applySessionSnapshot } =
+    await import("./session-ops.js");
+
+  applyTranscriptDelta({
+    thread_id: "thread-b",
+    item_id: "b-1",
+    turn_id: "turn-b",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  assert.equal(state.session.transcript[0].text, "Hello", "still deferred");
+
+  clearSessionRuntime();
+  state.socket = null;
+
+  assert.equal(state.realSession, null, "a genuine reset clears the live session");
+
+  // A brand-new session for a thread that happens to reuse the same id must
+  // not be corrupted by whatever was pending before the reset.
+  applySessionSnapshot({
+    active_thread_id: "thread-b",
+    active_turn_id: null,
+    current_status: "idle",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript_truncated: false,
+    transcript_revision: 1,
+    transcript: [
+      { item_id: "b-1", kind: "agent_text", status: "completed", text: "brand new session", turn_id: "turn-new", tool: null },
+    ],
+  });
+
+  assert.equal(
+    state.session.transcript.find((entry) => entry.item_id === "b-1")?.text,
+    "brand new session",
+    "the reset must leave nothing pending that could clobber the next session for the same thread id"
+  );
+});
+
+test("mergeTranscriptHydrationPage does not double-apply a delta that is already pending settlement", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
+  } = await import("./session-ops.js");
+  const { mergeTranscriptHydrationPage } = await import("./transcript/store.js");
+
+  clearSessionRuntime();
+  state.realSession = state.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 1,
+    transcript: [
+      { item_id: "item-1", kind: "agent_text", status: "running", text: "Hello", turn_id: "turn-1", tool: null },
+    ],
+  };
+  state.socket = null;
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([["item-1", { ...state.session.transcript[0] }]]);
+  state.transcriptHydrationOrder = ["item-1"];
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  // Window already has the fresh text; the array is still deferred.
+  assert.equal(state.transcriptHydrationEntries.get("item-1").text, "Hello world");
+
+  // An older-history page merges into the SAME window while the delta above
+  // is still pending settlement. It must not see the delta's text twice, and
+  // it must not disturb what the delta already wrote.
+  mergeTranscriptHydrationPage(state, {
+    thread_id: "thread-1",
+    entries: [
+      { item_id: "item-0", kind: "user_text", status: "completed", text: "an older message", turn_id: "turn-0", tool: null },
+    ],
+    prev_cursor: null,
+  }, { prepend: true });
+
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-1").text,
+    "Hello world",
+    "merging an older page must not touch or duplicate an unrelated item's pending text"
+  );
+  assert.deepEqual(state.transcriptHydrationOrder, ["item-0", "item-1"]);
+
+  flushRemoteTranscriptRenderForTest();
+
+  assert.deepEqual(
+    state.session.transcript.map((entry) => ({ id: entry.item_id, text: entry.text })),
+    [
+      { id: "item-0", text: "an older message" },
+      { id: "item-1", text: "Hello world" },
+    ]
+  );
+});
+
+test("pinning a background thread mid-stream still lands live-thread deltas correctly via the array fallback", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await pinBackgroundThreadWithWindow();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+
+  // The window follows the pin (thread-b), so the LIVE thread (thread-a) is
+  // NOT window-loaded — "the rule": write the window only when it matches
+  // the delta's own thread, otherwise the array fallback.
+  applyTranscriptDelta({
+    thread_id: "thread-a",
+    item_id: "a-1",
+    turn_id: "turn-a",
+    delta: " stream",
+    delta_kind: "agent_text",
+    text_offset: 4,
+  });
+
+  // The array fallback is synchronous — no flush needed for the live
+  // session, and thread-b's pinned projection must be completely unaffected.
+  assert.equal(state.realSession.transcript.find((entry) => entry.item_id === "a-1")?.text, "Live stream");
+  assert.equal(state.session.transcript.find((entry) => entry.item_id === "b-1")?.text, "Hello");
+
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(state.realSession.transcript.find((entry) => entry.item_id === "a-1")?.text, "Live stream");
 });
