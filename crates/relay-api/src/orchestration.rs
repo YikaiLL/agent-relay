@@ -511,6 +511,11 @@ bounded_token!(ThreadHandle, "thread_handle", MAX_OPAQUE_ID_LEN);
 bounded_token!(TemplateId, "template_id", MAX_OPAQUE_ID_LEN);
 bounded_token!(ArtifactId, "artifact_id", MAX_OPAQUE_ID_LEN);
 bounded_token!(DriverVersion, "driver_version", MAX_DRIVER_VERSION_LEN);
+bounded_token!(
+    UnknownBackendKind,
+    "unknown_backend_kind",
+    MAX_OPAQUE_ID_LEN
+);
 
 /// A vector whose deserializer rejects oversized protocol payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,8 +638,15 @@ pub enum OrchestrationBackendRef {
         driver_version: DriverVersion,
     },
     /// A backend written by a newer build. The run record survives, but this
-    /// build must not execute it.
-    UnknownNonExecuting,
+    /// build must not execute it. Only closed identity slots are retained; any
+    /// future payload fields are intentionally dropped instead of being stored as
+    /// arbitrary JSON.
+    UnknownNonExecuting {
+        original_kind: Option<UnknownBackendKind>,
+        protocol_version: Option<u32>,
+        driver_version: Option<DriverVersion>,
+        cloud_run_id: Option<DriverRunId>,
+    },
 }
 
 impl Default for OrchestrationBackendRef {
@@ -649,12 +661,45 @@ impl OrchestrationBackendRef {
             Self::LegacyEmbedded => OrchestrationBackendKind::LegacyEmbedded,
             Self::Cloud { .. } => OrchestrationBackendKind::Cloud,
             Self::LocalSidecar { .. } => OrchestrationBackendKind::LocalSidecar,
-            Self::UnknownNonExecuting => OrchestrationBackendKind::UnknownNonExecuting,
+            Self::UnknownNonExecuting { .. } => OrchestrationBackendKind::UnknownNonExecuting,
         }
     }
 
     pub fn is_legacy_embedded(&self) -> bool {
         matches!(self, Self::LegacyEmbedded)
+    }
+
+    pub fn unknown_non_executing() -> Self {
+        Self::UnknownNonExecuting {
+            original_kind: None,
+            protocol_version: None,
+            driver_version: None,
+            cloud_run_id: None,
+        }
+    }
+
+    fn unknown_non_executing_from_parts(
+        original_kind: Option<String>,
+        protocol_version: Option<u32>,
+        driver_version: Option<String>,
+        cloud_run_id: Option<String>,
+    ) -> Self {
+        Self::UnknownNonExecuting {
+            original_kind: original_kind.and_then(|raw| UnknownBackendKind::new(raw).ok()),
+            protocol_version,
+            driver_version: driver_version.and_then(|raw| DriverVersion::new(raw).ok()),
+            cloud_run_id: cloud_run_id.and_then(|raw| DriverRunId::new(raw).ok()),
+        }
+    }
+
+    pub fn original_unknown_kind(&self) -> Option<&str> {
+        match self {
+            Self::UnknownNonExecuting {
+                original_kind: Some(kind),
+                ..
+            } => Some(kind.as_str()),
+            _ => None,
+        }
     }
 
     pub fn non_executing_reason(&self) -> Option<&'static str> {
@@ -666,7 +711,7 @@ impl OrchestrationBackendRef {
             Self::LocalSidecar { .. } => Some(
                 "this task is pinned to a local sidecar, but this relay build has no sidecar transport",
             ),
-            Self::UnknownNonExecuting => Some(
+            Self::UnknownNonExecuting { .. } => Some(
                 "this task is pinned to an orchestration backend this relay build does not understand",
             ),
         }
@@ -685,6 +730,18 @@ impl Serialize for OrchestrationBackendRef {
             len = 4;
         } else if matches!(self, Self::LocalSidecar { .. }) {
             len = 3;
+        } else if let Self::UnknownNonExecuting {
+            original_kind,
+            protocol_version,
+            driver_version,
+            cloud_run_id,
+        } = self
+        {
+            len = 1
+                + usize::from(original_kind.is_some())
+                + usize::from(protocol_version.is_some())
+                + usize::from(driver_version.is_some())
+                + usize::from(cloud_run_id.is_some());
         }
         let mut map = serializer.serialize_map(Some(len))?;
         match self {
@@ -709,8 +766,25 @@ impl Serialize for OrchestrationBackendRef {
                 map.serialize_entry("protocol_version", protocol_version)?;
                 map.serialize_entry("driver_version", driver_version)?;
             }
-            Self::UnknownNonExecuting => {
+            Self::UnknownNonExecuting {
+                original_kind,
+                protocol_version,
+                driver_version,
+                cloud_run_id,
+            } => {
                 map.serialize_entry("kind", "unknown_non_executing")?;
+                if let Some(original_kind) = original_kind {
+                    map.serialize_entry("original_kind", original_kind)?;
+                }
+                if let Some(protocol_version) = protocol_version {
+                    map.serialize_entry("protocol_version", protocol_version)?;
+                }
+                if let Some(driver_version) = driver_version {
+                    map.serialize_entry("driver_version", driver_version)?;
+                }
+                if let Some(cloud_run_id) = cloud_run_id {
+                    map.serialize_entry("cloud_run_id", cloud_run_id)?;
+                }
             }
         }
         map.end()
@@ -724,6 +798,7 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
     {
         enum Field {
             Kind,
+            OriginalKind,
             ProtocolVersion,
             DriverVersion,
             CloudRunId,
@@ -738,6 +813,7 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                 let raw = String::deserialize(deserializer)?;
                 Ok(match raw.as_str() {
                     "kind" => Self::Kind,
+                    "original_kind" => Self::OriginalKind,
                     "protocol_version" => Self::ProtocolVersion,
                     "driver_version" => Self::DriverVersion,
                     "cloud_run_id" => Self::CloudRunId,
@@ -759,56 +835,66 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
             where
                 E: de::Error,
             {
-                Ok(OrchestrationBackendRef::UnknownNonExecuting)
+                Ok(OrchestrationBackendRef::unknown_non_executing())
             }
 
             fn visit_none<E>(self) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(OrchestrationBackendRef::UnknownNonExecuting)
+                Ok(OrchestrationBackendRef::unknown_non_executing())
             }
 
             fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(OrchestrationBackendRef::UnknownNonExecuting)
+                Ok(OrchestrationBackendRef::unknown_non_executing())
             }
 
             fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(OrchestrationBackendRef::UnknownNonExecuting)
+                Ok(OrchestrationBackendRef::unknown_non_executing())
             }
 
             fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(OrchestrationBackendRef::UnknownNonExecuting)
+                Ok(OrchestrationBackendRef::unknown_non_executing())
             }
 
             fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(OrchestrationBackendRef::UnknownNonExecuting)
+                Ok(OrchestrationBackendRef::unknown_non_executing())
             }
 
-            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(OrchestrationBackendRef::UnknownNonExecuting)
+                Ok(OrchestrationBackendRef::unknown_non_executing_from_parts(
+                    Some(value.to_string()),
+                    None,
+                    None,
+                    None,
+                ))
             }
 
-            fn visit_string<E>(self, _value: String) -> Result<Self::Value, E>
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(OrchestrationBackendRef::UnknownNonExecuting)
+                Ok(OrchestrationBackendRef::unknown_non_executing_from_parts(
+                    Some(value),
+                    None,
+                    None,
+                    None,
+                ))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -816,7 +902,7 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                 A: SeqAccess<'de>,
             {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(OrchestrationBackendRef::UnknownNonExecuting)
+                Ok(OrchestrationBackendRef::unknown_non_executing())
             }
 
             fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
@@ -824,11 +910,14 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                 M: MapAccess<'de>,
             {
                 let mut kind: Option<String> = None;
+                let mut original_kind: Option<String> = None;
                 let mut protocol_version: Option<u32> = None;
                 let mut driver_version: Option<String> = None;
                 let mut cloud_run_id: Option<String> = None;
-                let mut unsupported_shape = false;
+                let mut future_shape = false;
+                let mut malformed_shape = false;
                 let mut kind_seen = false;
+                let mut original_kind_seen = false;
                 let mut protocol_version_seen = false;
                 let mut driver_version_seen = false;
                 let mut cloud_run_id_seen = false;
@@ -837,87 +926,110 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                     match field {
                         Field::Kind => {
                             if kind_seen {
-                                unsupported_shape = true;
+                                malformed_shape = true;
                                 let _: IgnoredAny = map.next_value()?;
                                 continue;
                             }
                             kind_seen = true;
                             kind = map.next_value::<LenientString>()?.0;
                             if kind.is_none() {
-                                unsupported_shape = true;
+                                malformed_shape = true;
+                            }
+                        }
+                        Field::OriginalKind => {
+                            if original_kind_seen {
+                                malformed_shape = true;
+                                let _: IgnoredAny = map.next_value()?;
+                                continue;
+                            }
+                            original_kind_seen = true;
+                            original_kind = map.next_value::<LenientString>()?.0;
+                            if original_kind.is_none() {
+                                malformed_shape = true;
                             }
                         }
                         Field::ProtocolVersion => {
                             if protocol_version_seen {
-                                unsupported_shape = true;
+                                malformed_shape = true;
                                 let _: IgnoredAny = map.next_value()?;
                                 continue;
                             }
                             protocol_version_seen = true;
                             protocol_version = map.next_value::<LenientU32>()?.0;
                             if protocol_version.is_none() {
-                                unsupported_shape = true;
+                                malformed_shape = true;
                             }
                         }
                         Field::DriverVersion => {
                             if driver_version_seen {
-                                unsupported_shape = true;
+                                malformed_shape = true;
                                 let _: IgnoredAny = map.next_value()?;
                                 continue;
                             }
                             driver_version_seen = true;
                             driver_version = map.next_value::<LenientString>()?.0;
                             if driver_version.is_none() {
-                                unsupported_shape = true;
+                                malformed_shape = true;
                             }
                         }
                         Field::CloudRunId => {
                             if cloud_run_id_seen {
-                                unsupported_shape = true;
+                                malformed_shape = true;
                                 let _: IgnoredAny = map.next_value()?;
                                 continue;
                             }
                             cloud_run_id_seen = true;
                             cloud_run_id = map.next_value::<LenientString>()?.0;
                             if cloud_run_id.is_none() {
-                                unsupported_shape = true;
+                                malformed_shape = true;
                             }
                         }
                         Field::Unknown => {
-                            unsupported_shape = true;
+                            future_shape = true;
                             let _: IgnoredAny = map.next_value()?;
                         }
                     }
                 }
 
+                let unknown = OrchestrationBackendRef::unknown_non_executing_from_parts(
+                    original_kind.clone().or_else(|| kind.clone()),
+                    protocol_version,
+                    driver_version.clone(),
+                    cloud_run_id.clone(),
+                );
+
                 match kind.as_deref() {
-                    None => Ok(OrchestrationBackendRef::UnknownNonExecuting),
+                    None => Ok(unknown),
                     Some("legacy_embedded") => {
-                        if unsupported_shape
+                        if malformed_shape
+                            || future_shape
+                            || original_kind.is_some()
                             || protocol_version.is_some()
                             || driver_version.is_some()
                             || cloud_run_id.is_some()
                         {
-                            return Ok(OrchestrationBackendRef::UnknownNonExecuting);
+                            return Ok(unknown);
                         }
                         Ok(OrchestrationBackendRef::LegacyEmbedded)
                     }
                     Some("cloud") => {
-                        if unsupported_shape {
-                            return Ok(OrchestrationBackendRef::UnknownNonExecuting);
+                        if malformed_shape || future_shape || original_kind.is_some() {
+                            return Ok(unknown);
                         }
                         let Some(protocol_version) = protocol_version else {
-                            return Ok(OrchestrationBackendRef::UnknownNonExecuting);
+                            return Ok(unknown);
                         };
-                        let Some(driver_version) =
-                            driver_version.and_then(|raw| DriverVersion::new(raw).ok())
+                        let Some(driver_version) = driver_version
+                            .clone()
+                            .and_then(|raw| DriverVersion::new(raw).ok())
                         else {
-                            return Ok(OrchestrationBackendRef::UnknownNonExecuting);
+                            return Ok(unknown);
                         };
-                        let Some(cloud_run_id) =
-                            cloud_run_id.and_then(|raw| DriverRunId::new(raw).ok())
+                        let Some(cloud_run_id) = cloud_run_id
+                            .clone()
+                            .and_then(|raw| DriverRunId::new(raw).ok())
                         else {
-                            return Ok(OrchestrationBackendRef::UnknownNonExecuting);
+                            return Ok(unknown);
                         };
                         Ok(OrchestrationBackendRef::Cloud {
                             protocol_version,
@@ -926,16 +1038,21 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                         })
                     }
                     Some("local_sidecar") => {
-                        if unsupported_shape || cloud_run_id.is_some() {
-                            return Ok(OrchestrationBackendRef::UnknownNonExecuting);
+                        if malformed_shape
+                            || future_shape
+                            || original_kind.is_some()
+                            || cloud_run_id.is_some()
+                        {
+                            return Ok(unknown);
                         }
                         let Some(protocol_version) = protocol_version else {
-                            return Ok(OrchestrationBackendRef::UnknownNonExecuting);
+                            return Ok(unknown);
                         };
-                        let Some(driver_version) =
-                            driver_version.and_then(|raw| DriverVersion::new(raw).ok())
+                        let Some(driver_version) = driver_version
+                            .clone()
+                            .and_then(|raw| DriverVersion::new(raw).ok())
                         else {
-                            return Ok(OrchestrationBackendRef::UnknownNonExecuting);
+                            return Ok(unknown);
                         };
                         Ok(OrchestrationBackendRef::LocalSidecar {
                             protocol_version,
@@ -943,9 +1060,14 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                         })
                     }
                     Some("unknown_non_executing") => {
-                        Ok(OrchestrationBackendRef::UnknownNonExecuting)
+                        Ok(OrchestrationBackendRef::unknown_non_executing_from_parts(
+                            original_kind,
+                            protocol_version,
+                            driver_version,
+                            cloud_run_id,
+                        ))
                     }
-                    Some(_) => Ok(OrchestrationBackendRef::UnknownNonExecuting),
+                    Some(_) => Ok(unknown),
                 }
             }
         }
@@ -2549,6 +2671,7 @@ mod tests {
             "min",
             "mr_rounds_used",
             "observed_revision",
+            "original_kind",
             "outcome",
             "pause_requested",
             "phase",
@@ -3125,7 +3248,13 @@ mod tests {
                 driver_version: DriverVersion::new("driver.1").unwrap(),
             })
             .unwrap(),
-            serde_json::to_value(OrchestrationBackendRef::UnknownNonExecuting).unwrap(),
+            serde_json::to_value(OrchestrationBackendRef::UnknownNonExecuting {
+                original_kind: Some(UnknownBackendKind::new("cloud_v99").unwrap()),
+                protocol_version: Some(99),
+                driver_version: Some(DriverVersion::new("driver.1").unwrap()),
+                cloud_run_id: Some(DriverRunId::new("cloud-run-1").unwrap()),
+            })
+            .unwrap(),
             serde_json::to_value(ProtocolHello {
                 supported: ProtocolRange::current(),
                 driver_version: DriverVersion::new("driver.1").unwrap(),
@@ -3235,7 +3364,23 @@ mod tests {
             }"#,
         )
         .expect("future cloud shape must not invalidate persisted state");
-        assert_eq!(extra_cloud, OrchestrationBackendRef::UnknownNonExecuting);
+        assert_eq!(
+            extra_cloud.kind(),
+            OrchestrationBackendKind::UnknownNonExecuting
+        );
+        assert_eq!(extra_cloud.original_unknown_kind(), Some("cloud"));
+        match &extra_cloud {
+            OrchestrationBackendRef::UnknownNonExecuting {
+                protocol_version: Some(1),
+                driver_version: Some(driver_version),
+                cloud_run_id: Some(cloud_run_id),
+                ..
+            } => {
+                assert_eq!(driver_version.as_str(), "driver.1");
+                assert_eq!(cloud_run_id.as_str(), "cloud-run-1");
+            }
+            other => panic!("known Cloud identity slots should survive: {other:?}"),
+        }
 
         let bad_cloud_id: OrchestrationBackendRef = serde_json::from_str(
             r#"{
@@ -3246,7 +3391,11 @@ mod tests {
             }"#,
         )
         .expect("malformed cloud id must degrade without invalidating state");
-        assert_eq!(bad_cloud_id, OrchestrationBackendRef::UnknownNonExecuting);
+        assert_eq!(
+            bad_cloud_id.kind(),
+            OrchestrationBackendKind::UnknownNonExecuting
+        );
+        assert_eq!(bad_cloud_id.original_unknown_kind(), Some("cloud"));
 
         let duplicate_cloud_field: OrchestrationBackendRef = serde_json::from_str(
             r#"{
@@ -3259,29 +3408,79 @@ mod tests {
         )
         .expect("duplicate backend fields must degrade without invalidating state");
         assert_eq!(
-            duplicate_cloud_field,
-            OrchestrationBackendRef::UnknownNonExecuting
+            duplicate_cloud_field.kind(),
+            OrchestrationBackendKind::UnknownNonExecuting
         );
+        assert_eq!(duplicate_cloud_field.original_unknown_kind(), Some("cloud"));
 
         let extra_legacy: OrchestrationBackendRef =
             serde_json::from_str(r#"{"kind":"legacy_embedded","driver_version":"future"}"#)
                 .expect("future legacy shape must not invalidate persisted state");
-        assert_eq!(extra_legacy, OrchestrationBackendRef::UnknownNonExecuting);
+        assert_eq!(
+            extra_legacy.kind(),
+            OrchestrationBackendKind::UnknownNonExecuting
+        );
+        assert_eq!(
+            extra_legacy.original_unknown_kind(),
+            Some("legacy_embedded")
+        );
 
         let missing_kind_backend: OrchestrationBackendRef =
             serde_json::from_str(r#"{}"#).expect("empty backend object must decode");
         assert_eq!(
             missing_kind_backend,
-            OrchestrationBackendRef::UnknownNonExecuting
+            OrchestrationBackendRef::unknown_non_executing()
         );
 
         let null_backend: OrchestrationBackendRef =
             serde_json::from_str(r#"null"#).expect("null backend must decode");
-        assert_eq!(null_backend, OrchestrationBackendRef::UnknownNonExecuting);
+        assert_eq!(
+            null_backend,
+            OrchestrationBackendRef::unknown_non_executing()
+        );
 
         let scalar_backend: OrchestrationBackendRef =
             serde_json::from_str(r#""cloud_v99""#).expect("scalar future backend must decode");
-        assert_eq!(scalar_backend, OrchestrationBackendRef::UnknownNonExecuting);
+        assert_eq!(
+            scalar_backend.kind(),
+            OrchestrationBackendKind::UnknownNonExecuting
+        );
+        assert_eq!(scalar_backend.original_unknown_kind(), Some("cloud_v99"));
+
+        let encoded = serde_json::to_string(&scalar_backend).expect("serialize unknown backend");
+        assert!(
+            encoded.contains(r#""original_kind":"cloud_v99""#),
+            "unknown backend kind must survive one relay rewrite: {encoded}"
+        );
+        assert!(
+            !encoded.contains("future_backend_id"),
+            "unsupported future payload fields are intentionally not retained"
+        );
+
+        let future_object_backend: OrchestrationBackendRef = serde_json::from_str(
+            r#"{
+                "kind":"cloud_v99",
+                "future_backend_id":"opaque-future-id",
+                "future_protocol_version":99
+            }"#,
+        )
+        .expect("future object backend must decode");
+        assert_eq!(
+            future_object_backend.kind(),
+            OrchestrationBackendKind::UnknownNonExecuting
+        );
+        assert_eq!(
+            future_object_backend.original_unknown_kind(),
+            Some("cloud_v99")
+        );
+        let encoded =
+            serde_json::to_string(&future_object_backend).expect("serialize future object backend");
+        assert!(encoded.contains(r#""original_kind":"cloud_v99""#));
+        assert!(
+            !encoded.contains("future_backend_id")
+                && !encoded.contains("future_protocol_version"),
+            "unknown future backend payload fields must not become a generic persistence blob: {encoded}"
+        );
     }
 
     #[test]

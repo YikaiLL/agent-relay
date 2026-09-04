@@ -60,9 +60,20 @@ fn team_input(cwd: &str) -> crate::state::app::team::TeamStartRequest {
     }
 }
 
+fn cloud_backend() -> relay_api::orchestration::OrchestrationBackendRef {
+    relay_api::orchestration::OrchestrationBackendRef::Cloud {
+        protocol_version: relay_api::orchestration::CURRENT_PROTOCOL_VERSION,
+        driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
+        cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+    }
+}
+
 struct ReturningTeamDriver;
 struct PanickingTeamDriver;
 struct BlockingTeamDriver;
+struct RecordingTeamDriver {
+    drove: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
 #[async_trait::async_trait]
 impl relay_api::TeamDriver for ReturningTeamDriver {
@@ -96,6 +107,17 @@ impl relay_api::TeamDriver for BlockingTeamDriver {
     }
 }
 
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for RecordingTeamDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, _port: std::sync::Arc<dyn relay_api::TeamPort>, _run_id: String) {
+        self.drove.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 async fn wait_for_team_status(
     app: &AppState,
     run_id: &str,
@@ -110,6 +132,178 @@ async fn wait_for_team_status(
         sleep(Duration::from_millis(5)).await;
     }
     panic!("task {run_id} never reached {expected:?}");
+}
+
+#[tokio::test]
+async fn start_team_run_records_legacy_backend_before_driver_spawn() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let drove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = app.with_team_driver(std::sync::Arc::new(RecordingTeamDriver {
+        drove: drove.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Interrupted).await;
+
+    assert!(
+        drove.load(std::sync::atomic::Ordering::Relaxed),
+        "the embedded backend gate must allow the freshly-created legacy run to reach the driver"
+    );
+    assert_eq!(
+        run.orchestration_backend,
+        relay_api::orchestration::OrchestrationBackendRef::LegacyEmbedded
+    );
+}
+
+#[tokio::test]
+async fn resume_team_run_refuses_non_embedded_backend_before_status_flip() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-resume".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    let error = app
+        .resume_team_run(
+            Some("team-cloud-resume".to_string()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect_err("resume must refuse a Cloud-pinned run in this build");
+
+    assert!(error.contains("Cloud orchestration"), "{error}");
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-resume")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Paused);
+    assert_eq!(run.orchestration_backend, cloud_backend());
+}
+
+#[tokio::test]
+async fn reopen_team_run_refuses_non_embedded_backend_before_mutating() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-reopen".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Failed;
+    run.phase = relay_api::team::TeamPhase::MrGate;
+    run.error = Some("older failure".to_string());
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    let error = app
+        .reopen_team_run(
+            Some("team-cloud-reopen".to_string()),
+            "try again",
+            &relay_api::team::TaskSpecUpdates::default(),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect_err("reopen must refuse a Cloud-pinned run in this build");
+
+    assert!(error.contains("Cloud orchestration"), "{error}");
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-reopen")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Failed);
+    assert_eq!(run.phase, relay_api::team::TeamPhase::MrGate);
+    assert_eq!(run.error.as_deref(), Some("older failure"));
+    assert!(run.pending_user_notes.is_empty());
+    assert_eq!(run.orchestration_backend, cloud_backend());
+}
+
+#[tokio::test]
+async fn paused_restore_validation_preserves_non_embedded_backend_reason() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let backend = cloud_backend();
+    let reason = backend.non_executing_reason().unwrap().to_string();
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-restore".to_string(),
+        crate::state::TaskSpec::default(),
+        std::path::Path::new(&root)
+            .join("missing-worktree")
+            .to_string_lossy()
+            .into_owned(),
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.orchestration_backend = backend;
+    run.error = Some(reason.clone());
+    app.relay.write().await.insert_team_run(run);
+
+    app.validate_paused_team_runs().await;
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-restore")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Paused);
+    assert_eq!(run.error.as_deref(), Some(reason.as_str()));
+}
+
+#[tokio::test]
+async fn spawned_team_driver_refuses_non_embedded_backend_without_driving() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let drove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = app.with_team_driver(std::sync::Arc::new(RecordingTeamDriver {
+        drove: drove.clone(),
+    }));
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-drive".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    let ticket = app
+        .claim_team_drive("team-cloud-drive")
+        .expect("test run is not already driving");
+    app.spawn_team_driver_for_test("team-cloud-drive".to_string(), ticket);
+    let run = wait_for_team_status(
+        &app,
+        "team-cloud-drive",
+        crate::state::TeamRunStatus::Failed,
+    )
+    .await;
+
+    assert!(
+        !drove.load(std::sync::atomic::Ordering::Relaxed),
+        "the driver body must not run once the backend gate refuses it"
+    );
+    assert!(
+        run.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Cloud orchestration"),
+        "the failure should surface the backend-pin reason: {:?}",
+        run.error
+    );
 }
 
 #[tokio::test]
@@ -181,11 +375,7 @@ async fn team_port_update_run_reports_and_silences_rejected_backend_retargets() 
     }
 
     let before_revision = app.snapshot().await.revision;
-    let cloud = relay_api::orchestration::OrchestrationBackendRef::Cloud {
-        protocol_version: relay_api::orchestration::CURRENT_PROTOCOL_VERSION,
-        driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
-        cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
-    };
+    let cloud = cloud_backend();
 
     let updated = relay_api::TeamPort::update_run(
         &app,

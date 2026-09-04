@@ -2642,8 +2642,10 @@ impl RelayState {
     ///
     /// Four cases, and only the first two are unlike every other run map here:
     /// - Future or unknown orchestration backends are kept in the session but
-    ///   marked failed before any live-driver reconciliation. This relay build
-    ///   cannot safely resume them, even if their status was `Paused`.
+    ///   marked non-executing before any live-driver reconciliation. This relay
+    ///   build cannot safely drive them; `Paused`, `PausePending`, and
+    ///   `AwaitingUser` records keep the same recoverable pause semantics below
+    ///   with an appended backend-pin error.
     /// - `Paused` restores VERBATIM. It has no driver on purpose; resuming it is
     ///   the whole feature. `mark_interrupted_if_stranded` enforces the exemption.
     /// - `PausePending` / `AwaitingUser` settle to `Paused`. Both had a live
@@ -6166,8 +6168,12 @@ mod tests {
             .expect("fixture names a team run");
 
         assert_eq!(
-            run.orchestration_backend,
-            relay_api::orchestration::OrchestrationBackendRef::UnknownNonExecuting
+            run.orchestration_backend.kind(),
+            relay_api::orchestration::OrchestrationBackendKind::UnknownNonExecuting
+        );
+        assert_eq!(
+            run.orchestration_backend.original_unknown_kind(),
+            Some("cloud_v99")
         );
         assert_eq!(run.driver_progress.state_revision, 42);
         assert_eq!(run.driver_progress.last_command_seq, 7);
@@ -6186,8 +6192,8 @@ mod tests {
         let restored_run = restored
             .team_run("team_future")
             .expect("unknown backend run must survive restore");
-        assert_eq!(restored_run.status, TeamRunStatus::Failed);
-        assert!(!restored_run.status.is_resumable());
+        assert_eq!(restored_run.status, TeamRunStatus::Paused);
+        assert!(restored_run.status.is_resumable());
         assert!(
             restored_run
                 .error
@@ -6197,8 +6203,12 @@ mod tests {
             "the restored run should explain why it cannot execute"
         );
         assert_eq!(
-            restored_run.orchestration_backend,
-            relay_api::orchestration::OrchestrationBackendRef::UnknownNonExecuting
+            restored_run.orchestration_backend.kind(),
+            relay_api::orchestration::OrchestrationBackendKind::UnknownNonExecuting
+        );
+        assert_eq!(
+            restored_run.orchestration_backend.original_unknown_kind(),
+            Some("cloud_v99")
         );
     }
 
@@ -6219,8 +6229,12 @@ mod tests {
             .get("team_future")
             .expect("fixture names a team run");
         assert_eq!(
-            run.orchestration_backend,
-            relay_api::orchestration::OrchestrationBackendRef::UnknownNonExecuting
+            run.orchestration_backend.kind(),
+            relay_api::orchestration::OrchestrationBackendKind::UnknownNonExecuting
+        );
+        assert_eq!(
+            run.orchestration_backend.original_unknown_kind(),
+            Some("cloud_v99")
         );
         assert_eq!(run.driver_progress.state_revision, 42);
         assert_eq!(run.driver_progress.last_command_seq, 7);
@@ -6230,8 +6244,16 @@ mod tests {
         let mut restored = test_relay();
         restored.apply_persisted(&persisted);
         let restored_run = restored.team_run("team_future").unwrap();
-        assert_eq!(restored_run.status, TeamRunStatus::Failed);
-        assert!(!restored_run.status.is_resumable());
+        assert_eq!(restored_run.status, TeamRunStatus::Paused);
+        assert!(restored_run.status.is_resumable());
+        assert!(
+            restored_run
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does not understand"),
+            "the restored run should explain why it cannot execute"
+        );
     }
 
     #[test]

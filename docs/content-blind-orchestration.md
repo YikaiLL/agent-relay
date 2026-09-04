@@ -43,7 +43,7 @@ Only these field classes may be visible to Cloud orchestration:
   sub-task counts and indexes, round counts, TL generation.
 - Booleans: pause requested, awaiting user, diff changed, merge base available.
 - Opaque ids: command id, event id, driver run id, thread handle, template id,
-  artifact id.
+  artifact id, unsupported backend kind.
 - Opaque artifact references and bindings: an artifact id plus closed kind,
   revision, and optional size; a binding maps a closed slot to such a reference.
 
@@ -82,6 +82,14 @@ Public repository:
 - Local restore behavior that keeps unknown backend records but makes them
   non-executing.
 - Local template/artifact/executor seams when T5 lands, including egress tests.
+
+Persisted backend decoding is intentionally asymmetric for compatibility:
+omitting `TeamRun.orchestration_backend` is the only legacy signal that defaults
+to `LegacyEmbedded`. Explicit `null`, empty objects, malformed records, and
+future backend kinds restore as non-executing. The relay retains only bounded
+identity fields it already knows how to validate (`original_kind`,
+`protocol_version`, `driver_version`, `cloud_run_id`); unsupported future
+payload fields are dropped rather than preserved as arbitrary JSON.
 
 `sealwire-private` and private deployments:
 

@@ -586,7 +586,10 @@ locally and trust it before starting a task team there"
             let relay = self.relay.read().await;
             relay
                 .team_runs_snapshot()
-                .filter(|run| run.status.is_resumable())
+                .filter(|run| {
+                    run.status.is_resumable()
+                        && run.orchestration_backend.non_executing_reason().is_none()
+                })
                 .map(|run| (run.id.clone(), run.cwd.clone(), run.tl_thread_id.clone()))
                 .collect()
         };
@@ -660,6 +663,11 @@ over on resume"
             app.interrupt_team_run_if_stranded(&run_id).await;
             guard.disarm();
         });
+    }
+
+    #[cfg(test)]
+    pub(super) fn spawn_team_driver_for_test(&self, run_id: String, ticket: TeamDriveTicket) {
+        self.spawn_team_driver(run_id, ticket);
     }
 
     /// Take the exclusive right to drive a run, or `None` if it is already taken.
