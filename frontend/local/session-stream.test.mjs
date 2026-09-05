@@ -332,12 +332,24 @@ test("transcript_stream_lagged settles the pending window delta before invalidat
 // P1 (review): transcript_stream_lagged is not the only local site that
 // downgrades a loaded window entry's content_state — applyTranscriptDeltaToWindow
 // (shared/transcript-hydration-store.js) does the same thing IN PLACE whenever
-// an ordinary per-item delta is refused as a gap or byte mismatch, with no
-// settle beforehand. The fix above only covered the bulk lagged-notice path;
-// this covers the equivalent per-item path reached through an everyday
-// streaming delta, never through transcript_stream_lagged at all.
-test("a gapped delta for an item with an earlier pending append settles before the window downgrades, so the coalesced render carries the newest text", () => {
-  const { clock, controller, renders, state } = makeController();
+// an ordinary per-item delta is refused as a gap or byte mismatch. The fix
+// above only covered the bulk lagged-notice path; this covers the equivalent
+// per-item path reached through an everyday streaming delta, never through
+// transcript_stream_lagged at all — it must get the SAME immediate
+// settle -> refetch -> flush tail, not fall through to the coalesced render
+// (a coalesced-only assertion reached by ticking the clock cannot tell a
+// path that renders immediately apart from one that merely waits out the
+// same window — this asserts the immediate render, fetch, and timer
+// cancellation BEFORE the clock ever moves).
+test("a gapped delta for an item with an earlier pending append settles and flushes immediately, instead of coalescing", () => {
+  let fetchCalls = 0;
+  const ensureConversationTranscript = () => {
+    fetchCalls += 1;
+    return Promise.resolve();
+  };
+  const { clock, controller, renders, state, transcriptFlushScheduler } = makeController({
+    ensureConversationTranscript,
+  });
 
   state.transcriptHydrationThreadId = "thread-1";
   state.transcriptHydrationOrder = ["agent-1"];
@@ -376,6 +388,7 @@ test("a gapped delta for an item with an earlier pending append settles before t
     "hello",
     "precondition: the array projection is still pending"
   );
+  assert.equal(renders.length, 0, "precondition: the delta is still coalescing");
 
   // A second, GAPPED delta for the SAME item arrives (offset far past the
   // window's current length) — applyTranscriptDeltaToWindow refuses it and
@@ -389,15 +402,81 @@ test("a gapped delta for an item with an earlier pending append settles before t
     thread_id: "thread-1",
   });
 
-  clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
-
-  assert.equal(renders.length, 1, "the coalesced window must still render once");
+  assert.equal(
+    renders.length,
+    1,
+    "the refusal must flush immediately, not sit out the coalescing window behind a copy already known stale"
+  );
   assert.equal(
     renders[0].transcript[0].text,
     "hello world",
-    "the render must carry the earlier valid append — downgrading the window before that append settles " +
-      "makes the projection fall back to the array's stale pre-append copy instead"
+    "the immediate render must carry the earlier valid append — downgrading the window before that append " +
+      "settles makes the projection fall back to the array's stale pre-append copy instead"
   );
+  assert.equal(fetchCalls, 1, "a true refusal must trigger exactly one refetch");
+  assert.equal(
+    transcriptFlushScheduler.stats().pending,
+    false,
+    "the coalesced timer armed by the first (valid) delta must be absorbed by the immediate flush"
+  );
+
+  clock.tick(TRANSCRIPT_FLUSH_MAX_WINDOW_MS);
+  assert.equal(renders.length, 1, "the absorbed window timer must not render a second time later");
+});
+
+// Sibling to the refusal test above: resolveDeltaAppend returns `""` — not
+// `null` — for a pure re-delivery of bytes we already hold. `""` is falsy,
+// so a naive `if (!resolveDeltaAppend(...))` refusal check would treat this
+// exactly like a gap and refetch on every re-delivered chunk. It must stay
+// the ordinary idempotent no-op: no refetch, no immediate render.
+test("a duplicate delta for an item already fully held triggers neither a refetch nor an immediate render", () => {
+  let fetchCalls = 0;
+  const ensureConversationTranscript = () => {
+    fetchCalls += 1;
+    return Promise.resolve();
+  };
+  const { clock, controller, renders, state, transcriptFlushScheduler } = makeController({
+    ensureConversationTranscript,
+  });
+
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationOrder = ["agent-1"];
+  state.transcriptHydrationEntries = new Map([
+    [
+      "agent-1",
+      {
+        item_id: "agent-1",
+        kind: "agent_text",
+        status: "running",
+        text: "hello world",
+        tool: null,
+        entry_seq: null,
+        content_state: "full",
+      },
+    ],
+  ]);
+  state.session.transcript[0].text = "hello world";
+
+  // Re-delivery of bytes already fully covered by what the window holds —
+  // resolveDeltaAppend returns "", not null.
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "hello",
+    item_id: "agent-1",
+    revision: 7,
+    text_offset: 0,
+    thread_id: "thread-1",
+  });
+
+  assert.equal(fetchCalls, 0, "a duplicate must never trigger a refetch");
+  assert.equal(renders.length, 0, "a duplicate must never flush immediately");
+  assert.equal(
+    transcriptFlushScheduler.stats().pending,
+    true,
+    "a duplicate still coalesces like any other non-refusal delta, it just has nothing new to paint"
+  );
+
+  clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+  assert.equal(renders.length, 1, "the coalesced window still renders once");
 });
 
 // P1 (review): a terminal entry patch used to end at the same coalescing

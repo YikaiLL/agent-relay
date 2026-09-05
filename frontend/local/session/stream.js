@@ -362,11 +362,17 @@ export function createStreamController(ctx) {
       // remote's applyTranscriptDelta, which pre-resolves via
       // resolveDeltaAppend and never lets a refused delta reach the window
       // write undetected.
+      //
+      // Computed once and reused below for the repair tail. `=== null` is the
+      // only refusal (a gap or byte mismatch); `""` is a duplicate we already
+      // hold — a falsy check would treat both alike and refetch on every
+      // re-delivered chunk.
       const existingWindowEntry = state.transcriptHydrationEntries.get(event.item_id);
-      if (
-        existingWindowEntry
-        && resolveDeltaAppend(existingWindowEntry.text ?? "", event.delta ?? "", event.text_offset) == null
-      ) {
+      const resolvedAppend = existingWindowEntry
+        ? resolveDeltaAppend(existingWindowEntry.text ?? "", event.delta ?? "", event.text_offset)
+        : undefined;
+      const isRefusal = resolvedAppend === null;
+      if (isRefusal) {
         settleTranscriptProjection(state);
       }
       const applied = appendTranscriptDelta(state, event);
@@ -384,6 +390,19 @@ export function createStreamController(ctx) {
         ...state.session,
         transcript_revision: nextRevision,
       };
+      if (isRefusal) {
+        // A true refusal, not a duplicate — this item's window entry was just
+        // downgraded to preview IN PLACE above, so there is nothing left to
+        // project for it here. Bring the repair forward instead of letting it
+        // sit out the coalescing window behind a copy we already know is
+        // stale, same immediate tail as transcript_stream_lagged (settle,
+        // above, already ran) — minus that path's window-wide invalidation,
+        // which would wrongly downgrade every OTHER entry over one bad chunk.
+        state.session = nextSession;
+        void ensureConversationTranscript?.(state.session);
+        transcriptFlushScheduler.flushNow("transcript_entry_delta_refused");
+        return;
+      }
       markTranscriptWindowProjectionPending(state);
       queueTranscriptRender(nextSession, Math.max(0, textLengthAfter - textLengthBefore));
       return;
