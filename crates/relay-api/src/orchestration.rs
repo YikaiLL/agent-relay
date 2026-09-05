@@ -2782,6 +2782,361 @@ mod tests {
         }
     }
 
+    macro_rules! assert_json_string_literals {
+        ($ty:ty, [$(($variant:path, $literal:literal)),+ $(,)?]) => {{
+            fn expected_literal(value: $ty) -> &'static str {
+                match value {
+                    $($variant => $literal,)+
+                }
+            }
+
+            for value in [$($variant),+] {
+                let literal = expected_literal(value);
+                let encoded = serde_json::to_string(&value).expect("serialize enum literal");
+                assert_eq!(encoded, literal);
+                let decoded: $ty = serde_json::from_str(literal).expect("decode enum literal");
+                assert_eq!(decoded, value);
+            }
+        }};
+    }
+
+    #[test]
+    fn protocol_v1_enum_literals_are_pinned() {
+        assert_json_string_literals!(
+            OrchestrationBackendKind,
+            [
+                (
+                    OrchestrationBackendKind::LegacyEmbedded,
+                    r#""legacy_embedded""#
+                ),
+                (OrchestrationBackendKind::Cloud, r#""cloud""#),
+                (OrchestrationBackendKind::LocalSidecar, r#""local_sidecar""#),
+                (
+                    OrchestrationBackendKind::UnknownNonExecuting,
+                    r#""unknown_non_executing""#
+                ),
+            ]
+        );
+        assert_json_string_literals!(
+            DriverRunStatus,
+            [
+                (DriverRunStatus::Queued, r#""queued""#),
+                (DriverRunStatus::Running, r#""running""#),
+                (DriverRunStatus::PausePending, r#""pause_pending""#),
+                (DriverRunStatus::Paused, r#""paused""#),
+                (DriverRunStatus::AwaitingUser, r#""awaiting_user""#),
+                (DriverRunStatus::Done, r#""done""#),
+                (DriverRunStatus::Escalated, r#""escalated""#),
+                (DriverRunStatus::Blocked, r#""blocked""#),
+                (DriverRunStatus::Resolving, r#""resolving""#),
+                (DriverRunStatus::Failed, r#""failed""#),
+                (DriverRunStatus::Interrupted, r#""interrupted""#),
+                (DriverRunStatus::Cancelled, r#""cancelled""#),
+            ]
+        );
+        assert_json_string_literals!(
+            DriverPhase,
+            [
+                (DriverPhase::Intake, r#""intake""#),
+                (DriverPhase::Design, r#""design""#),
+                (DriverPhase::DesignReview, r#""design_review""#),
+                (DriverPhase::Planning, r#""planning""#),
+                (DriverPhase::SubTasks, r#""sub_tasks""#),
+                (DriverPhase::MrGate, r#""mr_gate""#),
+                (DriverPhase::Wrapping, r#""wrapping""#),
+                (DriverPhase::Finished, r#""finished""#),
+            ]
+        );
+        assert_json_string_literals!(
+            DriverRole,
+            [
+                (DriverRole::Tl, r#""tl""#),
+                (DriverRole::Dev, r#""dev""#),
+                (DriverRole::Reviewer, r#""reviewer""#),
+            ]
+        );
+        assert_json_string_literals!(
+            ArtifactKind,
+            [
+                (ArtifactKind::TaskSpec, r#""task_spec""#),
+                (ArtifactKind::Plan, r#""plan""#),
+                (ArtifactKind::Design, r#""design""#),
+                (ArtifactKind::Report, r#""report""#),
+                (ArtifactKind::SubTaskBrief, r#""sub_task_brief""#),
+                (ArtifactKind::WorkspaceDiff, r#""workspace_diff""#),
+                (ArtifactKind::ReviewVerdict, r#""review_verdict""#),
+                (ArtifactKind::TranscriptDigest, r#""transcript_digest""#),
+            ]
+        );
+        assert_json_string_literals!(
+            ArtifactBindingSlot,
+            [
+                (ArtifactBindingSlot::TaskSpec, r#""task_spec""#),
+                (ArtifactBindingSlot::Plan, r#""plan""#),
+                (ArtifactBindingSlot::Design, r#""design""#),
+                (ArtifactBindingSlot::Report, r#""report""#),
+                (ArtifactBindingSlot::SubTaskBrief, r#""sub_task_brief""#),
+                (ArtifactBindingSlot::Diff, r#""diff""#),
+                (ArtifactBindingSlot::Verdict, r#""verdict""#),
+                (ArtifactBindingSlot::PriorSummary, r#""prior_summary""#),
+            ]
+        );
+        assert_json_string_literals!(
+            DiffScope,
+            [
+                (DiffScope::Head, r#""head""#),
+                (DiffScope::CurrentSubTask, r#""current_sub_task""#),
+                (DiffScope::MergeBaseTarget, r#""merge_base_target""#),
+            ]
+        );
+        assert_json_string_literals!(
+            MergeBaseTarget,
+            [(MergeBaseTarget::PinnedTarget, r#""pinned_target""#)]
+        );
+        assert_json_string_literals!(
+            CommandRejection,
+            [
+                (CommandRejection::UnknownRevision, r#""unknown_revision""#),
+                (CommandRejection::DuplicateCommand, r#""duplicate_command""#),
+                (CommandRejection::StaleCommand, r#""stale_command""#),
+                (CommandRejection::BackendMismatch, r#""backend_mismatch""#),
+                (CommandRejection::PermissionDenied, r#""permission_denied""#),
+                (
+                    CommandRejection::WorkspaceUnavailable,
+                    r#""workspace_unavailable""#
+                ),
+                (
+                    CommandRejection::TemplateUnavailable,
+                    r#""template_unavailable""#
+                ),
+                (
+                    CommandRejection::ArtifactUnavailable,
+                    r#""artifact_unavailable""#
+                ),
+                (CommandRejection::ExecutorBusy, r#""executor_busy""#),
+                (CommandRejection::InvalidState, r#""invalid_state""#),
+                (
+                    CommandRejection::UnsupportedProtocol,
+                    r#""unsupported_protocol""#
+                ),
+            ]
+        );
+        assert_json_string_literals!(
+            TurnOutcomeKind,
+            [
+                (TurnOutcomeKind::Replied, r#""replied""#),
+                (TurnOutcomeKind::Silent, r#""silent""#),
+                (TurnOutcomeKind::Failed, r#""failed""#),
+                (TurnOutcomeKind::Blocked, r#""blocked""#),
+            ]
+        );
+    }
+
+    #[test]
+    fn protocol_v1_driver_command_kind_literals_are_pinned() {
+        const EXPECTED_DRIVER_COMMAND_KINDS: &[&str] = &[
+            "require_workspace",
+            "start_thread",
+            "resume_or_start_thread",
+            "run_template",
+            "checkpoint_commit",
+            "collect_diff",
+            "merge_base",
+            "commit",
+            "pause_at_boundary",
+            "settle_run",
+        ];
+        assert_eq!(DRIVER_COMMAND_KINDS, EXPECTED_DRIVER_COMMAND_KINDS);
+
+        let empty_bindings =
+            BoundedVec::<ArtifactBinding, MAX_COMMAND_BINDINGS>::new("bindings", Vec::new())
+                .unwrap();
+        let commands = vec![
+            (
+                DriverCommand::RequireWorkspace {},
+                r#"{"kind":"require_workspace"}"#,
+            ),
+            (
+                DriverCommand::StartThread {
+                    role: DriverRole::Tl,
+                },
+                r#"{"kind":"start_thread","role":"tl"}"#,
+            ),
+            (
+                DriverCommand::ResumeOrStartThread {
+                    role: DriverRole::Dev,
+                    candidates: BoundedVec::new(
+                        "candidates",
+                        vec![ThreadHandle::new("thread-command-1").unwrap()],
+                    )
+                    .unwrap(),
+                },
+                r#"{"kind":"resume_or_start_thread","role":"dev","candidates":["thread-command-1"]}"#,
+            ),
+            (
+                DriverCommand::RunTemplate {
+                    thread: ThreadHandle::new("thread-command-2").unwrap(),
+                    role: DriverRole::Reviewer,
+                    template_id: token("review.template"),
+                    bindings: empty_bindings.clone(),
+                },
+                r#"{"kind":"run_template","thread":"thread-command-2","role":"reviewer","template_id":"review.template","bindings":[]}"#,
+            ),
+            (
+                DriverCommand::CheckpointCommit {},
+                r#"{"kind":"checkpoint_commit"}"#,
+            ),
+            (
+                DriverCommand::CollectDiff {
+                    scope: DiffScope::CurrentSubTask,
+                },
+                r#"{"kind":"collect_diff","scope":"current_sub_task"}"#,
+            ),
+            (
+                DriverCommand::MergeBase {
+                    target: MergeBaseTarget::PinnedTarget,
+                },
+                r#"{"kind":"merge_base","target":"pinned_target"}"#,
+            ),
+            (
+                DriverCommand::Commit {
+                    message_template_id: token("commit.message"),
+                    bindings: empty_bindings,
+                },
+                r#"{"kind":"commit","message_template_id":"commit.message","bindings":[]}"#,
+            ),
+            (
+                DriverCommand::PauseAtBoundary {},
+                r#"{"kind":"pause_at_boundary"}"#,
+            ),
+            (
+                DriverCommand::SettleRun {
+                    status: DriverRunStatus::Done,
+                },
+                r#"{"kind":"settle_run","status":"done"}"#,
+            ),
+        ];
+
+        for (command, fixture) in commands {
+            let encoded = serde_json::to_string(&command).expect("serialize command");
+            assert_eq!(encoded, fixture);
+            let decoded: DriverCommand =
+                serde_json::from_str(fixture).expect("decode command fixture");
+            assert_eq!(decoded, command);
+        }
+    }
+
+    #[test]
+    fn protocol_v1_driver_event_kind_literals_are_pinned() {
+        const EXPECTED_DRIVER_EVENT_KINDS: &[&str] = &[
+            "command_accepted",
+            "command_rejected",
+            "workspace_ready",
+            "thread_ready",
+            "turn_finished",
+            "diff_collected",
+            "merge_base_resolved",
+            "commit_recorded",
+            "cursor_advanced",
+            "run_settled",
+        ];
+        assert_eq!(DRIVER_EVENT_KINDS, EXPECTED_DRIVER_EVENT_KINDS);
+
+        let cursor = DriverCursor {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            backend: OrchestrationBackendKind::Cloud,
+            status: DriverRunStatus::Running,
+            phase: DriverPhase::SubTasks,
+            state_revision: 3,
+            last_command_seq: 2,
+            last_event_seq: 1,
+            in_flight_command_id: None,
+            current_sub_task_index: 0,
+            sub_task_count: 1,
+            current_rounds_used: 0,
+            max_review_rounds: 2,
+            design_review_rounds: 0,
+            mr_rounds_used: 0,
+            tl_generation: 1,
+            pause_requested: false,
+            awaiting_user: false,
+            artifacts: BoundedVec::new("artifacts", Vec::new()).unwrap(),
+        };
+        let transcript = artifact("artifact.transcript.event", ArtifactKind::TranscriptDigest);
+        let diff = artifact("artifact.diff.event", ArtifactKind::WorkspaceDiff);
+        let report = artifact("artifact.report.event", ArtifactKind::Report);
+        let events = vec![
+            (
+                DriverEvent::CommandAccepted {},
+                r#"{"kind":"command_accepted"}"#,
+            ),
+            (
+                DriverEvent::CommandRejected {
+                    reason: CommandRejection::StaleCommand,
+                },
+                r#"{"kind":"command_rejected","reason":"stale_command"}"#,
+            ),
+            (
+                DriverEvent::WorkspaceReady {},
+                r#"{"kind":"workspace_ready"}"#,
+            ),
+            (
+                DriverEvent::ThreadReady {
+                    thread: ThreadHandle::new("thread-event-1").unwrap(),
+                    role: DriverRole::Dev,
+                },
+                r#"{"kind":"thread_ready","thread":"thread-event-1","role":"dev"}"#,
+            ),
+            (
+                DriverEvent::TurnFinished {
+                    outcome: TurnOutcomeKind::Replied,
+                    artifact: Some(transcript),
+                },
+                r#"{"kind":"turn_finished","outcome":"replied","artifact":{"artifact_id":"artifact.transcript.event","kind":"transcript_digest","revision":7,"size_bytes":42}}"#,
+            ),
+            (
+                DriverEvent::DiffCollected {
+                    changed: true,
+                    artifact: diff,
+                },
+                r#"{"kind":"diff_collected","changed":true,"artifact":{"artifact_id":"artifact.diff.event","kind":"workspace_diff","revision":7,"size_bytes":42}}"#,
+            ),
+            (
+                DriverEvent::MergeBaseResolved {
+                    available: false,
+                    artifact: None,
+                },
+                r#"{"kind":"merge_base_resolved","available":false,"artifact":null}"#,
+            ),
+            (
+                DriverEvent::CommitRecorded {
+                    changed: true,
+                    artifact: Some(report),
+                },
+                r#"{"kind":"commit_recorded","changed":true,"artifact":{"artifact_id":"artifact.report.event","kind":"report","revision":7,"size_bytes":42}}"#,
+            ),
+            (
+                DriverEvent::CursorAdvanced {
+                    cursor: cursor.clone(),
+                },
+                r#"{"kind":"cursor_advanced","cursor":{"protocol_version":1,"backend":"cloud","status":"running","phase":"sub_tasks","state_revision":3,"last_command_seq":2,"last_event_seq":1,"current_sub_task_index":0,"sub_task_count":1,"current_rounds_used":0,"max_review_rounds":2,"design_review_rounds":0,"mr_rounds_used":0,"tl_generation":1,"pause_requested":false,"awaiting_user":false,"artifacts":[]}}"#,
+            ),
+            (
+                DriverEvent::RunSettled {
+                    status: DriverRunStatus::Cancelled,
+                },
+                r#"{"kind":"run_settled","status":"cancelled"}"#,
+            ),
+        ];
+
+        for (event, fixture) in events {
+            let encoded = serde_json::to_string(&event).expect("serialize event");
+            assert_eq!(encoded, fixture);
+            let decoded: DriverEvent = serde_json::from_str(fixture).expect("decode event fixture");
+            assert_eq!(decoded, event);
+        }
+    }
+
     #[test]
     fn command_and_event_round_trip() {
         let binding = binding(

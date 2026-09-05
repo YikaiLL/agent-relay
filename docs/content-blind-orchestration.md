@@ -110,6 +110,10 @@ The existing `TeamPort` is a legacy embedded capability trait. It remains
 local-only until T4/T5 replace closure mutation and raw prompt/diff/log flows
 with explicit events, artifacts, and allowlisted templates.
 
+For methods that return `TeamPortError`, `Blocked(String)` and `Failed(String)`
+carry free-form local diagnostic prose. Those strings are not protocol rejection
+codes and must not cross the Cloud content-blind boundary.
+
 | Method | Current inputs/outputs | Sensitive surface | Classification |
 |---|---|---|---|
 | `run_snapshot(run_id)` | Opaque-ish run id in, full `TeamRun` out | Full task spec, cwd/path, branch/ref/commits, provider thread ids, sub-task briefs, verdicts, findings, notes, errors, pause reasons | Local-only legacy read. Future Cloud gets `DriverCursor` plus artifact refs only. |
@@ -120,17 +124,17 @@ with explicit events, artifacts, and allowlisted templates.
 | `boundary_status(run_id)` | Run id in, closed status out | Run id only; status is closed | Future wire-safe cursor/status read candidate. |
 | `settle_run(run_id, status, reason)` | Run id, closed status, reason prose | Reason text | Local-only as-is. Future wire-safe status event with local reason template. |
 | `tl_reseed_reason(run_id)` | Run id in, reason prose out | Context-window/provider failure reason | Local-only. Future cursor may expose a boolean/counter, not prose. |
-| `reseed_tl(run_id, reason, handoff_prompt)` | Run id, reason prose, rendered handoff prompt | Prompt, plan/spec content, reason text, provider thread ids | Local-only. Future command is `RunTemplate` with closed template id and artifact bindings. |
+| `reseed_tl(run_id, reason, handover_prompt)` | Run id, reason prose, rendered handover prompt, or `TeamPortError::Blocked(String)`/`Failed(String)` local prose | Prompt, plan/spec content, reason text, provider thread ids, error diagnostics | Local-only. Future command is `RunTemplate` with closed template id and artifact bindings; failure wire uses closed rejection/outcome codes. |
 | `tl_turn(run_id, prompt)` | Run id, rendered prompt in, `TeamTurnOutcome` out | Prompt and reply text | Local-only. Future command is `RunTemplate`; output is a local artifact ref plus closed outcome. |
-| `require_workspace(run_id)` | Run id in, local result | Resolves cwd/worktree locally | Local-only executor preflight. Future event can report closed ready/unavailable code. |
-| `start_thread(run_id, role)` | Run id, closed role in, provider thread id out | Provider thread id and cwd binding | Local-only. Future event returns an opaque `ThreadHandle`, not provider id/path. |
-| `resume_or_start_thread(run_id, role, candidates)` | Run id, closed role, thread-id candidates in, thread id out | Provider thread ids/session liveness | Local-only as-is. Future wire uses opaque `ThreadHandle` candidates minted by local executor. |
+| `require_workspace(run_id)` | Run id in, local result, or `TeamPortError::Blocked(String)`/`Failed(String)` local prose | Resolves cwd/worktree locally; errors may include path and workspace diagnostics | Local-only executor preflight. Future event can report closed ready/unavailable code. |
+| `start_thread(run_id, role)` | Run id, closed role in, provider thread id out, or `TeamPortError::Blocked(String)`/`Failed(String)` local prose | Provider thread id, cwd binding, provider/workspace diagnostics | Local-only. Future event returns an opaque `ThreadHandle`, not provider id/path; failures use closed codes. |
+| `resume_or_start_thread(run_id, role, candidates)` | Run id, closed role, thread-id candidates in, thread id out, or `TeamPortError::Blocked(String)`/`Failed(String)` local prose | Provider thread ids/session liveness and provider diagnostics | Local-only as-is. Future wire uses opaque `ThreadHandle` candidates minted by local executor and closed failure codes. |
 | `record_run_thread(run_id, thread_id)` | Run id, provider thread id in, slot out | Provider thread id | Local-only state update. Future reducer stores opaque local handle bindings. |
 | `turn(run_id, slot, role, prompt)` | Run id, slot, closed role, rendered prompt in, `TeamTurnOutcome` out | Prompt, reply text, provider thread id through slot | Local-only. Future command is `RunTemplate`; output text stays in local artifact storage. |
-| `checkpoint_commit(run_id)` | Run id in, commit string out | Repository commit identity | Local-only. Future wire may expose changed/available booleans plus artifact ref. |
-| `collect_diff(run_id, base)` | Run id, base commit/ref in, rendered diff out | Diff text, file paths, repository content, base ref | Local-only. Future wire uses closed diff scope and returns an opaque diff artifact ref. |
-| `merge_base(run_id, target_ref)` | Run id, target ref in, commit string out | Branch/ref and commit identity | Local-only. Future wire uses closed `PinnedTarget` and returns availability plus artifact ref. |
-| `commit(run_id, message)` | Run id, commit message prose in, bool out | Commit message and repository mutation authority | Local-only. Future wire uses an allowlisted message template id and returns changed plus artifact ref. |
+| `checkpoint_commit(run_id)` | Run id in, commit string out, or `TeamPortError::Blocked(String)`/`Failed(String)` local prose | Repository commit identity and VCS diagnostics | Local-only. Future wire may expose changed/available booleans plus artifact ref and closed failure codes. |
+| `collect_diff(run_id, base)` | Run id, base commit/ref in, rendered diff out, or `TeamPortError::Blocked(String)`/`Failed(String)` local prose | Diff text, file paths, repository content, base ref, VCS diagnostics | Local-only. Future wire uses closed diff scope and returns an opaque diff artifact ref plus closed failure codes. |
+| `merge_base(run_id, target_ref)` | Run id, target ref in, commit string out, or `TeamPortError::Blocked(String)`/`Failed(String)` local prose | Branch/ref, commit identity, and VCS diagnostics | Local-only. Future wire uses closed `PinnedTarget` and returns availability plus artifact ref and closed failure codes. |
+| `commit(run_id, message)` | Run id, commit message prose in, bool out, or `TeamPortError::Blocked(String)`/`Failed(String)` local prose | Commit message, repository mutation authority, and VCS diagnostics | Local-only. Future wire uses an allowlisted message template id and returns changed plus artifact ref and closed failure codes. |
 | `push_log(level, message)` | Closed-ish level and message prose | Logs, command/provider details | Local-only. Cloud-visible errors use closed rejection codes only. |
 
 ## Follow-Up Scope
