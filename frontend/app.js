@@ -423,6 +423,10 @@ const state = {
   transcriptHydrationStatus: "idle",
   transcriptHydrationTailReady: false,
   transcriptHydrationThreadId: null,
+  // Bumped on every per-item delta refusal (session/stream.js), so a tail
+  // fetch already in flight when the refusal happens reads back stale on
+  // arrival — see shared/transcript-hydration.js's isStaleTranscriptPage.
+  transcriptRefusalEpoch: 0,
   transcriptLiveEntryDetails: new Map(),
   transcriptLiveEntryThreadId: null,
   transcriptPreserveScroll: false,

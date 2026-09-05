@@ -317,6 +317,7 @@ export function createTranscriptController(ctx) {
     requestTranscriptEntryDetail,
     fetchTranscriptEntryDetail,
     fetchTranscriptPage,
+    fetchRawTranscriptPage,
     ensureConversationTranscript,
     maybeLoadOlderTranscript,
     resetTranscriptHydrationState,

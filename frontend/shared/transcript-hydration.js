@@ -36,6 +36,11 @@ export async function hydrateTranscript(
 
   const hydrationPromise = (async () => {
     try {
+      // Captured BEFORE the fetch, not after: a same-thread per-item delta
+      // refusal (session/stream.js) bumps this while this fetch is in flight,
+      // and neither the thread id nor the signature checks below notice that —
+      // see isStaleTranscriptPage.
+      const capturedRefusalEpoch = state.transcriptRefusalEpoch;
       const page = await fetchPage({
         threadId: snapshot.active_thread_id,
         before: null,
@@ -47,7 +52,7 @@ export async function hydrateTranscript(
       if ((snapshot.transcript || []).length > 0 && (page.entries || []).length === 0) {
         throw new Error(missingTailError);
       }
-      if (isStaleTranscriptPage(state, page)) {
+      if (isStaleTranscriptPage(state, page, capturedRefusalEpoch)) {
         return;
       }
 
@@ -79,6 +84,7 @@ export async function hydrateTranscript(
         state.transcriptHydrationOlderCursor != null &&
         loadedPages < maxInitialPages
       ) {
+        const capturedOlderPageRefusalEpoch = state.transcriptRefusalEpoch;
         const olderPage = await fetchPage({
           threadId: snapshot.active_thread_id,
           before: state.transcriptHydrationOlderCursor,
@@ -86,7 +92,7 @@ export async function hydrateTranscript(
         if (!olderPage || olderPage.thread_id !== snapshot.active_thread_id) {
           throw new Error(incompletePageError);
         }
-        if (isStaleTranscriptPage(state, olderPage)) {
+        if (isStaleTranscriptPage(state, olderPage, capturedOlderPageRefusalEpoch)) {
           return;
         }
         store.mergeTranscriptHydrationPage(state, olderPage, { prepend: true });
@@ -156,11 +162,12 @@ export async function loadOlderTranscript(
   store.beginTranscriptHydration(state, "loading");
   const loadPromise = (async () => {
     try {
+      const capturedRefusalEpoch = state.transcriptRefusalEpoch;
       const page = await fetchPage({ threadId, before });
       if (!page || page.thread_id !== threadId) {
         throw new Error(incompletePageError);
       }
-      if (isStaleTranscriptPage(state, page)) {
+      if (isStaleTranscriptPage(state, page, capturedRefusalEpoch)) {
         return null;
       }
 
@@ -205,10 +212,25 @@ function applyTranscriptHydrationProgress(state, store, onProgress) {
   onProgress(snapshot);
 }
 
-function isStaleTranscriptPage(state, page) {
-  return Boolean(
+// `capturedRefusalEpoch` is read back from `state.transcriptRefusalEpoch`
+// immediately before the fetch this page answers (see each call site above),
+// and compared here against its CURRENT value. A same-thread per-item delta
+// refusal (local/session/stream.js) bumps that counter while a fetch is in
+// flight, and neither this thread-id check nor the caller's own signature
+// check notices that — the refusal changes neither. `undefined` on both sides
+// (remote never bumps this field) compares equal, so this is a no-op there;
+// do not fork the check per surface.
+//
+// Deliberately not a revision floor: `page.revision ?? null`
+// (shared/transcript-page.js) is nullable, and a null would force a coin flip
+// exactly when this guard matters.
+function isStaleTranscriptPage(state, page, capturedRefusalEpoch) {
+  if (
     page?.thread_id
-      && state.session?.active_thread_id
-      && page.thread_id !== state.session.active_thread_id
-  );
+    && state.session?.active_thread_id
+    && page.thread_id !== state.session.active_thread_id
+  ) {
+    return true;
+  }
+  return capturedRefusalEpoch !== state.transcriptRefusalEpoch;
 }

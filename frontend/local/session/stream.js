@@ -36,7 +36,7 @@ export function createStreamController(ctx) {
   // Resolved lazily: the controller is built before the transcript controller exists.
   const ensureConversationTranscript = (...args) =>
     ctx.ensureConversationTranscript?.(...args);
-  const fetchTranscriptPage = (...args) => ctx.fetchTranscriptPage?.(...args);
+  const fetchRawTranscriptPage = (...args) => ctx.fetchRawTranscriptPage?.(...args);
   const cancelSessionPoll = (...args) => ctx.cancelSessionPoll(...args);
   const cancelStreamReconnect = (...args) => ctx.cancelStreamReconnect(...args);
   const scheduleSessionPoll = (...args) => ctx.scheduleSessionPoll(...args);
@@ -73,13 +73,21 @@ export function createStreamController(ctx) {
   /// this signal. Mirrors remote's repairActiveTranscriptTail
   /// (session-ops.js:697), which documents and bypasses the identical gate
   /// for the identical reason.
+  ///
+  /// Uses fetchRawTranscriptPage, NOT fetchTranscriptPage (session/
+  /// transcript.js) — the latter wraps every call in queryClient.fetchQuery,
+  /// which deduplicates onto an in-flight request for the same key. A tail
+  /// fetch that began BEFORE the gap can then satisfy this repair and hand
+  /// back pre-gap data, with no post-gap request ever issued. The raw
+  /// primitive cannot be deduplicated. Losing the disk-cache write for the
+  /// tail is fine — remote's repair accepts the same trade for the same fix.
   async function repairActiveTranscriptTail(threadId) {
     if (!threadId || !isViewingConversation?.({ active_thread_id: threadId })) {
       return;
     }
     let page;
     try {
-      page = await fetchTranscriptPage(threadId, { before: null });
+      page = await fetchRawTranscriptPage({ threadId, before: null });
     } catch (error) {
       logLine(`Transcript repair failed: ${error.message}`);
       return;
@@ -433,6 +441,12 @@ export function createStreamController(ctx) {
       const isRefusal = existingWindowEntry ? resolvedAppend === null : !startsAtZero;
       if (isRefusal) {
         settleTranscriptProjection(state);
+        // Bumped BEFORE the repair fetch below starts, so a hydration fetch
+        // already in flight for this thread (captured its epoch earlier, in
+        // shared/transcript-hydration.js) reads back stale when it resolves —
+        // see isStaleTranscriptPage's epoch check for why a thread-id check
+        // alone lets that race repromote this exact item to `full`.
+        state.transcriptRefusalEpoch = (state.transcriptRefusalEpoch || 0) + 1;
       }
       const applied = appendTranscriptDelta(state, event);
       const textLengthAfter = (state.transcriptHydrationEntries.get(event.item_id)?.text ?? "").length;
