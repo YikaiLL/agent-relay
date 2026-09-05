@@ -117,11 +117,20 @@ export function createTranscriptFlushScheduler({
       if (!Number.isFinite(chars) || chars <= 0) {
         return;
       }
+      // Ignore idle notes: with nothing pending, these chars belong to no
+      // window. Counting them anyway would let them ride along into
+      // whichever window opens NEXT, crossing the threshold on far fewer
+      // chars than that window actually received. queue() is always called
+      // before note() for a real delta (see stream.js), so a genuine char
+      // burst is never missed by this.
+      if (!isPending()) {
+        return;
+      }
       pendingChars += chars;
       // Only brings forward a render that is already coming — note() must
       // never become a scheduler in its own right (see PLAN.md's char-
       // threshold trap: a fast provider should never actually hit this).
-      if (isPending() && pendingChars >= TRANSCRIPT_FLUSH_CHAR_THRESHOLD) {
+      if (pendingChars >= TRANSCRIPT_FLUSH_CHAR_THRESHOLD) {
         runFlush(lastFlushReason || "char-threshold");
       }
     },

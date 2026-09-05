@@ -479,31 +479,25 @@ export function createStreamController(ctx) {
       status: entry.status || defaultStatus || "completed",
       turn_id: entry.turn_id || event.turn_id || null,
     };
-    // Also overlay onto the window, not just the array below: settling
-    // before a read (above) only protects the ONE flush right after this
-    // patch — a later delta re-arms the pending projection, and settling
-    // THAT rebuilds the array purely from the window
-    // (settleTranscriptProjection), which never heard of this patch unless
-    // it is overlaid here too. A no-op when the window isn't loaded yet, or
-    // doesn't yet track this item — see applyTranscriptPatchOverlay.
+    // Also invalidate the window's own copy, not just rebuild the array
+    // below: it can never safely carry this patch's fields itself (see
+    // invalidateTranscriptWindowEntryForPatch), so a later delta re-arming
+    // the pending projection must not settle by trusting the window's stale
+    // copy over the array's fresher one — renderedTranscriptFromWindow reads
+    // this thread's array as the fallback source for exactly that reason. A
+    // no-op when the window isn't loaded yet, or doesn't yet track this item.
     applyEntryPatchToWindow(state, currentThreadId, patchedEntry);
     const entryIndex = state.session.transcript.findIndex(
       (candidate) => candidate?.item_id === patchedEntry.item_id
     );
-    if (entryIndex < 0 && transcriptWindowIsLoaded(state, currentThreadId)) {
-      // applyEntryPatchToWindow just no-op'd: the window is loaded but has
-      // never tracked this item, so the array append below is the ONLY place
-      // it will exist. That is not durable — a later delta for some other
-      // item re-arms the pending projection, and settling it rebuilds the
-      // whole array from the window (settleTranscriptProjection), which has
-      // never heard of this item, silently dropping it. Invalidate so
-      // hydration re-establishes the truth instead of leaving no way back —
-      // see .sealwire/PLAN.md, "Invalidate; do not write" — and drive the
-      // fetch directly, same reasoning as transcript_stream_lagged above:
-      // marking the window dirty alone does not itself trigger a refetch.
-      invalidateTranscriptWindowForRepair(state);
-      void ensureConversationTranscript(state.session);
-    }
+    // True when applyEntryPatchToWindow just no-op'd because the window has
+    // never tracked this item at all. renderedTranscriptFromWindow's own
+    // array-fallback means the array rebuild below is never silently dropped
+    // by a later settle — but the window still doesn't know this item
+    // exists, so drive a real hydration merge (mirrors remote's
+    // applyTranscriptEntryPatch / hydrateActiveTranscript) to fold it into
+    // the window properly instead of leaving it permanently array-only.
+    const patchIntroducesUntrackedItem = entryIndex < 0 && transcriptWindowIsLoaded(state, currentThreadId);
     const nextTranscript = entryIndex >= 0
       ? state.session.transcript.map((candidate, index) =>
           index === entryIndex
@@ -526,13 +520,20 @@ export function createStreamController(ctx) {
             kind: patchedEntry.kind || "agent_text",
           },
         ];
-    queueTranscriptRender({
+    const nextSession = {
       ...state.session,
       transcript: nextTranscript,
       transcript_revision: Number.isSafeInteger(event.revision)
         ? event.revision
         : state.session.transcript_revision,
-    });
+    };
+    if (patchIntroducesUntrackedItem) {
+      // Sync the window from nextSession, not state.session: hydration's own
+      // tail merge only picks up ids it does not already have, so it needs
+      // to see this item in the snapshot it merges against.
+      void ensureConversationTranscript(nextSession);
+    }
+    queueTranscriptRender(nextSession);
   }
 
   return {

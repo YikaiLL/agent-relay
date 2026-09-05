@@ -12,10 +12,6 @@ export function createClearedTranscriptHydrationPatch() {
     transcriptHydrationStatus: "idle",
     transcriptHydrationTailReady: false,
     transcriptHydrationThreadId: null,
-    // Same lifetime as the window itself — a clear/switch away from a thread
-    // must not leave that thread's pending patch overlays to bleed into
-    // whatever loads into this slot next.
-    transcriptPatchOverlay: new Map(),
   };
 }
 
@@ -62,10 +58,6 @@ export function stashTranscriptHydrationForThread(state, extra = null) {
     olderCursor: state.transcriptHydrationOlderCursor ?? null,
     signature: state.transcriptHydrationSignature ?? null,
     tailReady: Boolean(state.transcriptHydrationTailReady),
-    // A patch overlay pending for the LEAVING thread (e.g. a completion that
-    // landed just before a pin switch) must travel with its window, not be
-    // dropped on the floor or bleed into the thread switched to.
-    overlay: new Map(state.transcriptPatchOverlay instanceof Map ? state.transcriptPatchOverlay : []),
     ...(extra ? { extra } : {}),
   });
   while (cache.size > MAX_RETAINED_HYDRATION_THREADS) {
@@ -111,7 +103,6 @@ export function restoreTranscriptHydrationForThread(state, threadId) {
     // Leave status idle: the next snapshot's prepareTranscriptHydration recomputes
     // whether the tail still needs a fetch, merging onto the restored window.
     transcriptHydrationStatus: "idle",
-    transcriptPatchOverlay: new Map(stash.overlay instanceof Map ? stash.overlay : []),
   };
 }
 
@@ -133,6 +124,25 @@ export function __resetTranscriptFullWindowCopyCount() {
 
 function noteFullWindowCopy() {
   transcriptFullWindowCopyCount += 1;
+}
+
+// Test/perf instrumentation: counts array entries VISITED while
+// renderedTranscriptFromWindow builds its array-fallback lookup map (one
+// linear pass over the CURRENT array — see that function's own doc). Must
+// total exactly (calls * array length), proving the array is scanned once
+// per call, not once per WINDOW entry per call: a regression back to a
+// per-window-entry `.find()` against the array would instead total
+// (calls * array length * window length), which is exactly what the perf
+// test's assertion on this counter would catch — a `.find()` visits the
+// whole array too, so only the multiplier (window length) reveals it.
+let transcriptArrayFallbackLookupBuildCount = 0;
+
+export function __readTranscriptArrayFallbackLookupBuildCount() {
+  return transcriptArrayFallbackLookupBuildCount;
+}
+
+export function __resetTranscriptArrayFallbackLookupBuildCount() {
+  transcriptArrayFallbackLookupBuildCount = 0;
 }
 
 export function transcriptHydrationSignature(snapshot) {
@@ -670,24 +680,45 @@ function locateLaterTailId(order, tailIds, from, unorderedIds) {
   return -1;
 }
 
+/// Renders progress while a hydration fetch is in flight (onProgress). Uses
+/// renderedTranscriptFromWindow — not buildHydratedTranscriptSnapshot's own
+/// bespoke projection below — for the SAME array-fallback treatment settle
+/// gets: an entry a patch invalidated (or one the window has never tracked
+/// at all) must not republish the window's stale/absent copy over what the
+/// live session already shows for it. See invalidateTranscriptWindowEntryForPatch.
 export function buildHydratedTranscriptProgress(state) {
   const snapshot = state.transcriptHydrationBaseSnapshot;
   if (!snapshot || state.session?.active_thread_id !== snapshot.active_thread_id) {
     return null;
   }
 
-  const hydrated = buildHydratedTranscriptSnapshot(state, snapshot);
-  if (!hydrated) return null;
-
-  if (state.session) {
-    return {
-      ...state.session,
-      transcript: hydrated.transcript,
-      transcript_truncated: hydrated.transcript_truncated,
-    };
+  if (!state.transcriptHydrationOrder?.length) {
+    // Nothing has merged into the window yet (the fetch this progress call
+    // precedes hasn't landed). Trust the snapshot's own transcript_truncated
+    // rather than computeSnapshotTranscriptTruncated: that reads per-entry
+    // content_state, which a caller may not set explicitly on its OWN
+    // truncated preview (relying on the snapshot-level flag instead) — an
+    // empty window would then read as "not truncated" before hydration ever
+    // ran, the same trap buildHydratedTranscriptSnapshot's own early return
+    // (below) avoids for exactly this reason.
+    return { ...state.session, transcript: snapshot.transcript, transcript_truncated: snapshot.transcript_truncated };
   }
 
-  return hydrated;
+  return {
+    ...state.session,
+    transcript: renderedTranscriptFromWindow(state, state.session),
+    transcript_truncated: computeSnapshotTranscriptTruncated(state, snapshot),
+  };
+}
+
+// Shared by buildHydratedTranscriptSnapshot and buildHydratedTranscriptProgress
+// — both project the same window, and neither should compute this
+// independently and risk drifting.
+function computeSnapshotTranscriptTruncated(state, snapshot) {
+  return (
+    state.transcriptHydrationOlderCursor != null
+    || snapshotTailNeedsFullText(state, snapshot)
+  );
 }
 
 function buildHydratedTranscriptSnapshot(
@@ -735,13 +766,32 @@ function buildHydratedTranscriptSnapshot(
     return snapshot;
   }
 
-  return {
+  const result = {
     ...snapshot,
     transcript,
-    transcript_truncated:
-      state.transcriptHydrationOlderCursor != null
-      || snapshotTailNeedsFullText(state, snapshot),
+    transcript_truncated: computeSnapshotTranscriptTruncated(state, snapshot),
   };
+
+  // Also write the merge into the canonical window (not just `result`), or a
+  // delta landing on one of these items before the next flush reads the
+  // pre-merge cache and settle later clobbers this snapshot's text with it —
+  // see .sealwire/PLAN.md / lifecycle.js's applySessionSnapshot review.
+  //
+  // Reuses the SAME merge already computed above for `transcript`, so this
+  // can neither spin up a window from an unloaded one (`overlay` is only
+  // non-empty when the caller already found one loaded) nor force
+  // content_state to "full" (mergeTranscriptEntry's rank-based merge is what
+  // lands here) — the two ways a prior attempt at this regressed.
+  if (overlay) {
+    for (const [itemId, mergedEntry] of overlay) {
+      baseEntries.set(itemId, mergedEntry);
+    }
+    if (order !== baseOrder) {
+      state.transcriptHydrationOrder = order;
+    }
+  }
+
+  return result;
 }
 
 function defaultPrepareTranscriptEntry(_state, _threadId, entry) {
@@ -886,9 +936,6 @@ export function applyTranscriptDeltaToWindow(state, delta) {
         : existing.entry_seq,
       content_state: CONTENT_STATE_FULL,
     });
-    // The item is streaming again for real — a status like "completed" left
-    // by an earlier patch overlay is now stale.
-    clearTranscriptPatchOverlay(state, itemId);
     return true;
   }
   const appendText = deltaText;
@@ -910,69 +957,63 @@ export function applyTranscriptDeltaToWindow(state, delta) {
     entry_seq: Number.isSafeInteger(delta.entry_seq) ? delta.entry_seq : null,
     content_state: startsAtZero ? CONTENT_STATE_FULL : CONTENT_STATE_PREVIEW,
   });
-  clearTranscriptPatchOverlay(state, itemId);
   if (!order.includes(itemId)) {
     order.push(itemId);
   }
   return startsAtZero;
 }
 
-/// Non-delta entry patch (started/completed/patched: status, tool, or a text
-/// REPLACEMENT) overlaid onto the window's own cached entry AT PROJECTION
-/// TIME (renderedTranscriptFromWindow) — never written into `entries`/`order`
-/// itself. See .sealwire/PLAN.md, "Invalidate; do not write": a patch does
-/// not own a body the way a delta or a hydration/snapshot merge does. The
-/// function this replaces wrote directly into the window and always forced
-/// `content_state: "full"`, which (a) marked a status-only completion (no
-/// text) permanently authoritative, so hydration's re-fetch gate
-/// (snapshotTailNeedsFullText) never ran again for it, and (b) — for local,
-/// which called it with no loaded-window check — could turn a still-empty
-/// window "loaded" off one patched item, hijacking the next delta's
-/// projection into showing only that item.
+/// A non-delta entry patch (started/completed/patched: status, tool, or a
+/// text REPLACEMENT) can never safely land IN the window, in any form: a
+/// patch carries no `text_offset`, so writing its body there would silently
+/// break a LATER delta's offset math against it — see .sealwire/PLAN.md,
+/// "Invalidate; do not write". This replaced a `transcriptPatchOverlay` side
+/// store (a second write target the window's own cached entry was merged
+/// with at projection time), banned after it repeatedly reintroduced the
+/// exact P1s this rule exists to prevent: a text replacement silently
+/// discarded by the next delta for the same item (the delta reconciled
+/// against the window's untouched pre-patch body, then cleared the overlay
+/// as "stale now"), and a completed status republished as running by
+/// hydration progress rendering, which never applied the overlay at all.
 ///
-/// No-ops, touching neither `entries` nor `order`, unless the window is
-/// already loaded for `threadId` AND already tracks this item — an
-/// unhydrated window must never be created by a patch alone, and a patch for
-/// an item the window has never seen (no delta, no hydration page) has
-/// nothing to overlay onto. That item's patched fields still land directly
-/// in the caller's own array rebuild (session-ops.js / stream.js); the
-/// tradeoff accepted here is the same shape as the pinned-thread one in
-/// PLAN.md — a later, unrelated settle can revert that ONE array-only write,
-/// which is strictly narrower than the two P1s this replaces.
+/// Instead: downgrade the cached entry's content_state so hydration's
+/// re-fetch gate runs again, AND so it is no longer trusted as authoritative
+/// at projection time (renderedTranscriptFromWindow, below) — which is what
+/// lets that function fall back to whatever the caller's own transcript
+/// array already shows for this item instead. The caller (session-ops.js /
+/// stream.js) always writes a patch's fields into its array directly and
+/// synchronously, patch or no patch, so that fallback is never empty-handed.
 ///
-/// The overlay entry is cleared the moment a fresher, authoritative write
-/// lands for the item — see applyTranscriptDeltaToWindow and
-/// createMergedSnapshotTailPatch — so a stale patch can never outlive the
-/// real data superseding it.
-export function applyTranscriptPatchOverlay(state, threadId, patchedEntry) {
+/// Also clears the cached TEXT (not just content_state): a patch may have
+/// replaced the array's body with something the delta stream's own
+/// text_offset accounting knows nothing about, so the cached text can no
+/// longer be trusted as "how much of this item has actually streamed so
+/// far" either. A blank cache makes the next delta's own gap check
+/// (resolveDeltaAppend) do the enforcement: a non-zero offset against "" is
+/// a gap and is correctly refused instead of silently appended onto stale
+/// pre-patch text (the overlay this replaces got exactly this case wrong —
+/// its delta path reconciled against the untouched pre-patch body); a zero
+/// offset is a genuine fresh restart of the stream and correctly starts
+/// clean.
+///
+/// A no-op unless the window is already loaded for `threadId` AND already
+/// tracks this item as `full` — an unhydrated window must never be created
+/// by a patch alone, and there is nothing to invalidate for an item the
+/// window has never seen (or already knows is non-authoritative): that is
+/// exactly the case renderedTranscriptFromWindow's own array-fallback for a
+/// window-missing item covers, without any write here.
+export function invalidateTranscriptWindowEntryForPatch(state, threadId, patchedEntry) {
   const itemId = patchedEntry?.item_id;
-  if (
-    !itemId
-    || !transcriptWindowIsLoaded(state, threadId)
-    || !state.transcriptHydrationEntries.has(itemId)
-  ) {
+  if (!itemId || !transcriptWindowIsLoaded(state, threadId)) {
     return false;
   }
-  ensureTranscriptPatchOverlay(state).set(itemId, {
-    status: patchedEntry.status ?? null,
-    text: patchedEntry.text ?? null,
-    tool: patchedEntry.tool ?? null,
-    turn_id: patchedEntry.turn_id ?? null,
-  });
+  const entries = state.transcriptHydrationEntries;
+  const existing = entries.get(itemId);
+  if (!existing || contentStateOf(existing) !== CONTENT_STATE_FULL) {
+    return false;
+  }
+  entries.set(itemId, { ...existing, text: "", content_state: CONTENT_STATE_PREVIEW });
   return true;
-}
-
-function ensureTranscriptPatchOverlay(state) {
-  if (!(state.transcriptPatchOverlay instanceof Map)) {
-    state.transcriptPatchOverlay = new Map();
-  }
-  return state.transcriptPatchOverlay;
-}
-
-function clearTranscriptPatchOverlay(state, itemId) {
-  if (state.transcriptPatchOverlay instanceof Map) {
-    state.transcriptPatchOverlay.delete(itemId);
-  }
 }
 
 /// Is the hydration window loaded for this thread? Shared by local and
@@ -994,38 +1035,72 @@ export function transcriptWindowIsLoaded(state, threadId) {
 /// to the session's own transcript when the window is not loaded for this
 /// thread (a delta can arrive before the first hydration), so the live tail
 /// still shows rather than blanking.
+///
+/// Two narrower fallbacks to the SAME array, per window entry:
+///   - untrusted (content_state != full — never fully hydrated yet, or a
+///     patch invalidated it via invalidateTranscriptWindowEntryForPatch):
+///     the array's current entry is preferred, since a patch always writes
+///     its caller's array directly and synchronously.
+///   - absent (the window has never tracked this item at all — a patch
+///     introduced it with no delta/hydration page ever seeding the window):
+///     same fallback, folded into the projected order via a tail-merge
+///     rather than dropped.
+/// Both exist so a non-delta patch can never safely write the window (see
+/// invalidateTranscriptWindowEntryForPatch's own doc) without silently
+/// losing or stalling that patch's content the next time this runs.
 export function renderedTranscriptFromWindow(state, session) {
   const entries = state.transcriptHydrationEntries;
-  const order = state.transcriptHydrationOrder;
+  const windowOrder = state.transcriptHydrationOrder;
   if (
     state.transcriptHydrationThreadId !== session?.active_thread_id
     || !(entries instanceof Map)
-    || !Array.isArray(order)
-    || !order.length
+    || !Array.isArray(windowOrder)
+    || !windowOrder.length
   ) {
     return session?.transcript || [];
   }
-  const overlay = state.transcriptPatchOverlay;
+
+  // One O(n) pass over the CURRENT array, not a per-window-entry .find() —
+  // that would turn every settle into O(n^2) in a long transcript. The
+  // counter increments PER ENTRY VISITED here (not once per call), so a
+  // regression back to a per-window-entry .find() against the array — which
+  // would visit far fewer or far more entries depending on match position,
+  // never staying at (calls * array length) — changes the counter's value,
+  // not just whether this comment is still true.
+  const arrayEntries = Array.isArray(session?.transcript) ? session.transcript : [];
+  const arrayByItemId = new Map();
+  const arrayOnlyIds = [];
+  for (const entry of arrayEntries) {
+    transcriptArrayFallbackLookupBuildCount += 1;
+    const itemId = entry?.item_id;
+    if (!itemId) {
+      continue;
+    }
+    arrayByItemId.set(itemId, entry);
+    if (!entries.has(itemId)) {
+      arrayOnlyIds.push(itemId);
+    }
+  }
+
+  // Union the window's own order with any array-only ids — same tail-merge
+  // shape a snapshot's tail uses to join the window (placeOrderedTailIds),
+  // so a patch-introduced item lands in a sensible position instead of
+  // always at the very end. copyOnWrite: the common case (no array-only
+  // ids) returns `windowOrder` itself, untouched.
+  const order = arrayOnlyIds.length
+    ? placeOrderedTailIds(windowOrder, arrayOnlyIds, new Set(arrayOnlyIds), { copyOnWrite: true })
+    : windowOrder;
+
   return order
     .map((itemId) => {
-      const entry = entries.get(itemId);
-      if (!entry) {
-        return null;
+      const windowEntry = entries.get(itemId);
+      if (windowEntry && contentStateOf(windowEntry) === CONTENT_STATE_FULL) {
+        return windowEntry;
       }
-      const patch = overlay instanceof Map ? overlay.get(itemId) : null;
-      if (!patch) {
-        return entry;
-      }
-      // Overlaid onto a COPY — the cache's own text/content_state are left
-      // alone, so a still-preview/omitted body stays eligible for hydration's
-      // re-fetch gate no matter what a status-only patch says.
-      return {
-        ...entry,
-        status: patch.status ?? entry.status,
-        text: patch.text ?? entry.text,
-        tool: patch.tool ?? entry.tool,
-        turn_id: patch.turn_id ?? entry.turn_id,
-      };
+      // Untrusted or absent — prefer the array's current entry; the
+      // untrusted/absent window entry is the last resort (nothing to show
+      // for a genuinely new item neither side has ever seen).
+      return arrayByItemId.get(itemId) || windowEntry || null;
     })
     .filter(Boolean);
 }
@@ -1058,9 +1133,6 @@ function createMergedSnapshotTailPatch(state, snapshot, signature) {
       itemId,
       mergeTranscriptEntry(existing, prepareSnapshotOverlayEntry(existing, entry))
     );
-    // The snapshot's own view of this item is authoritative now, whatever it
-    // says — a patch overlay recorded before this merge is superseded.
-    clearTranscriptPatchOverlay(state, itemId);
     tailIds.push(itemId);
   }
   // In place: an id that is not ordered yet — genuinely new, or orphaned out of

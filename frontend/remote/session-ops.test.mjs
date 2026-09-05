@@ -5530,7 +5530,7 @@ test("repairActiveTranscriptTail invalidates the loaded window so re-hydration d
   remoteQueryClient.clear();
 });
 
-test("applyTranscriptEntryPatch writes the window, not just the array — the patch survives a later delta re-arming the pending projection", async () => {
+test("applyTranscriptEntryPatch invalidates the window entry, not just the array — the patch survives a later delta re-arming the pending projection", async () => {
   activeBrowser || installBrowserStubs();
   const { state } = await import("./state.js");
   const {
@@ -5580,9 +5580,10 @@ test("applyTranscriptEntryPatch writes the window, not just the array — the pa
   });
 
   // A SECOND delta for item-1 re-arms the pending projection the patch's own
-  // settle-before-read already cleared once — if the patch never reached the
-  // window, the eventual settle (rebuilding the array purely from the
-  // window) would revert it here.
+  // settle-before-read already cleared once — if the patch's item-2 entry
+  // were left "full" in the window, the eventual settle (rebuilding the
+  // array purely from the window, falling back to the array only for
+  // invalidated/absent entries) would revert it here.
   applyTranscriptDelta({
     thread_id: "thread-1",
     item_id: "item-1",
@@ -5598,7 +5599,7 @@ test("applyTranscriptEntryPatch writes the window, not just the array — the pa
   assert.equal(
     state.session.transcript.find((entry) => entry.item_id === "item-2")?.text,
     "done",
-    "the patch must survive the later delta re-arming the window projection — it must have reached the window itself"
+    "the patch must survive the later delta re-arming the window projection — the invalidated window entry must fall back to the array, not to its own stale copy"
   );
   assert.equal(state.session.transcript.find((entry) => entry.item_id === "item-2")?.status, "completed");
 });

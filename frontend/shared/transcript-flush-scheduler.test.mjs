@@ -423,6 +423,39 @@ test("note() alone never schedules a render — it only brings forward a render 
   assert.equal(scheduler.stats().pending, false);
 });
 
+// P1: note() accumulated pendingChars regardless of whether a flush was
+// actually pending, so an idle note(600) before the first queue() of a new
+// window silently rode along into it — a later note(500) for the window that
+// really only received 500 characters would cross the 1024 threshold and
+// flush early, even though nothing this window is actually that large.
+test("an idle note() before any queue() does not count toward the next window's char threshold", () => {
+  const clock = createManualClock();
+  let renderCount = 0;
+  const scheduler = createTranscriptFlushScheduler({
+    render: () => {
+      renderCount += 1;
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    isHidden: () => false,
+  });
+
+  // Nothing is scheduled yet — this note belongs to no window and must be
+  // ignored, not stashed for whichever window opens next.
+  scheduler.note(600);
+  assert.equal(scheduler.stats().pending, false);
+
+  scheduler.queue("transcript_entry_delta");
+  // Only 500 chars have actually arrived for THIS window — the idle 600 above
+  // must not have silently carried over and pushed it past the threshold.
+  scheduler.note(500);
+  assert.equal(renderCount, 0, "500 chars is below the threshold; the idle note() must not have counted");
+
+  clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+  assert.equal(renderCount, 1, "the window itself still flushes normally once its time elapses");
+});
+
 test("cancel() resets accumulated chars so they do not leak into the next window", () => {
   const clock = createManualClock();
   let renderCount = 0;

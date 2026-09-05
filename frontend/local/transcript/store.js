@@ -14,12 +14,17 @@ import {
   stashTranscriptHydrationForThread,
   clearTranscriptHydrationThreadCache,
   applyTranscriptDeltaToWindow,
-  applyTranscriptPatchOverlay,
+  invalidateTranscriptWindowEntryForPatch,
   markTranscriptWindowNeedsRepair,
   renderedTranscriptFromWindow,
   resolveDeltaAppend,
   transcriptWindowIsLoaded,
 } from "../../shared/transcript-hydration-store.js";
+import {
+  adoptSettledTranscript,
+  markTranscriptWindowProjectionPending,
+  settleTranscriptProjection as settlePendingTranscriptProjection,
+} from "../../shared/transcript-projection.js";
 
 function applyLocalTranscriptPatch(state, patch) {
   if (!patch) {
@@ -53,12 +58,11 @@ export function appendTranscriptDelta(state, delta) {
   return applyTranscriptDeltaToWindow(state, delta);
 }
 
-/// Overlay a non-delta entry patch (started/completed/patched) onto the
-/// loaded window at projection time — see applyTranscriptPatchOverlay. A
-/// no-op unless the window is already loaded for `threadId` and already
-/// tracks this item.
+/// A non-delta entry patch can never safely write the window — see
+/// invalidateTranscriptWindowEntryForPatch. A no-op unless the window is
+/// already loaded for `threadId` and already tracks this item as `full`.
 export function applyEntryPatchToWindow(state, threadId, patchedEntry) {
-  return applyTranscriptPatchOverlay(state, threadId, patchedEntry);
+  return invalidateTranscriptWindowEntryForPatch(state, threadId, patchedEntry);
 }
 
 /// Mark every loaded entry non-authoritative after a delta gap (a lagged stream).
@@ -165,64 +169,17 @@ export function __recordTranscriptFullRebuild() {
   transcriptFullRebuildCount += 1;
 }
 
-/// Project the hydration window onto a rendered transcript array. Shared
-/// with remote — see transcript-hydration-store.js.
-export { renderedTranscriptFromWindow };
+/// Shared with remote — see transcript-projection.js. Local has one session
+/// slot, so the default `sessionKeys` (`["session"]`) apply throughout.
+export { markTranscriptWindowProjectionPending, adoptSettledTranscript };
 
-/// Marks that a live delta appended to the loaded window without yet being
-/// reflected in state.session.transcript. The O(n) rebuild that would reflect
-/// it is deferred until settleTranscriptProjection actually runs, so a burst
-/// of deltas costs one rebuild instead of one per delta.
-export function markTranscriptWindowProjectionPending(state) {
-  state.transcriptWindowProjectionPending = true;
-}
-
-/// Idempotently materialise any pending window projection into
-/// state.session.transcript. Cheap when nothing is pending; safe to call
-/// re-entrantly or from many call sites (flush start, the renderSession
-/// chokepoint, or any path about to read/rewrite the transcript array) since
-/// it always re-derives from the CURRENT window rather than trusting a
-/// remembered array reference. That matters because array-identity
-/// detection (the bug this replaces) has a blind spot: a write that rebuilds
-/// the array — e.g. a transcript_entry_patch reducer — produces a new
-/// reference every time, so identity comparison misses on exactly the case
-/// it needs to catch. Settling before every read closes that gap: by the
-/// time a patch reads the array to rebuild it, the pending delta is already
-/// baked in and rides along in the patch's own rebuild.
-///
-/// Returns whether it materialised anything, so a caller holding a
-/// session-shaped copy (spread from state.session before this ran) knows
-/// whether it needs to fold the freshly-settled transcript back in.
+/// Settle onto state.session, recording the rebuild on THIS module's counter
+/// (transcriptFullRebuildCount) — see transcript-projection.js for the
+/// shared settle algorithm itself.
 export function settleTranscriptProjection(state) {
-  if (!state?.transcriptWindowProjectionPending || !state.session) {
-    return false;
+  const changed = settlePendingTranscriptProjection(state);
+  if (changed) {
+    __recordTranscriptFullRebuild();
   }
-  state.transcriptWindowProjectionPending = false;
-  const threadId = state.session.active_thread_id || null;
-  if (!transcriptWindowIsLoaded(state, threadId)) {
-    return false;
-  }
-  __recordTranscriptFullRebuild();
-  state.session = {
-    ...state.session,
-    transcript: renderedTranscriptFromWindow(state, state.session),
-  };
-  return true;
-}
-
-/// Reconcile a `session` a caller is about to render against a settle that
-/// may have just reassigned state.session out from under it — a spread copy
-/// (`{...state.session, override}`) or an earlier read both hold the
-/// pre-settle `.transcript`. Matched by active_thread_id, not identity, for
-/// the same reason settleTranscriptProjection itself does not trust identity.
-export function adoptSettledTranscript(state, session, settled) {
-  if (!settled) {
-    return session;
-  }
-  const isLiveThreadSession =
-    session
-    && state.session
-    && session.active_thread_id
-    && session.active_thread_id === state.session.active_thread_id;
-  return isLiveThreadSession ? { ...session, transcript: state.session.transcript } : session;
+  return changed;
 }

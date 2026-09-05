@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   buildHydratedTranscriptProgress,
   createMergedTranscriptHydrationPagePatch,
+  invalidateTranscriptWindowEntryForPatch,
   prepareTranscriptHydrationState,
   restoreHydratedTranscriptSnapshot,
 } from "./shared/transcript-hydration-store.js";
@@ -140,6 +141,99 @@ test("restoreHydratedTranscriptSnapshot hides an uncovered emergency shell until
   );
 });
 
+// P1 (review): restoreHydratedTranscriptSnapshot now synchronizes its tail
+// merge back into state.transcriptHydrationEntries/order (see the fix for the
+// settle-ordering P1 above it in transcript-hydration-store.js), so a delta
+// arriving right after a snapshot reads fresh, not stale, cached text. A
+// naive version of that fix wrote into the window whenever ANY overlay
+// existed, regardless of whether a window was actually loaded first — which
+// would let a bare snapshot spin up a "loaded" window from just its own tail,
+// even for a thread with no prior hydration at all. Guard against that: the
+// window must stay untouched (still unloaded) when it started out empty.
+test("restoreHydratedTranscriptSnapshot never turns an unloaded window into a loaded one", () => {
+  const state = hydratedState({
+    transcriptHydrationEntries: new Map(),
+    transcriptHydrationOrder: [],
+    transcriptHydrationThreadId: "thread-1",
+  });
+  const snapshot = {
+    active_thread_id: "thread-1",
+    active_turn_id: "turn-1",
+    transcript_revision: 2,
+    transcript_truncated: false,
+    transcript: [
+      { item_id: "item-1", kind: "agent_text", text: "hello", status: "completed", turn_id: "turn-1", tool: null },
+    ],
+  };
+
+  const restored = restoreHydratedTranscriptSnapshot(state, snapshot);
+
+  assert.equal(restored, snapshot, "an unloaded window must fall back to the snapshot unchanged");
+  assert.equal(
+    state.transcriptHydrationOrder.length,
+    0,
+    "a bare snapshot merge must never be the thing that makes an unhydrated window look loaded"
+  );
+  assert.equal(state.transcriptHydrationEntries.size, 0);
+});
+
+// P1 (review): the same write-back must never promote a cached entry's
+// content_state to "full" just because a snapshot tail happened to mention
+// it. A status-only-shaped update (still compacted/preview on the wire, no
+// newly authoritative body) against a cached preview would otherwise mark
+// truncated text authoritative and permanently suppress the re-hydration
+// gate (snapshotTailNeedsFullText). mergeTranscriptEntry's rank-based merge
+// (max of existing vs incoming) must be what lands in the window, not an
+// unconditional "full".
+test("restoreHydratedTranscriptSnapshot's write-back preserves content_state for a status-only tail update", () => {
+  const state = hydratedState({
+    transcriptHydrationEntries: new Map([
+      [
+        "item-3",
+        {
+          item_id: "item-3",
+          kind: "command",
+          text: "cargo test\npassed ...",
+          status: "running",
+          turn_id: "turn-3",
+          tool: null,
+          content_state: "preview",
+        },
+      ],
+    ]),
+    transcriptHydrationOrder: ["item-3"],
+  });
+  const snapshot = {
+    active_thread_id: "thread-1",
+    active_turn_id: null,
+    transcript_revision: 11,
+    transcript_truncated: true,
+    transcript: [
+      {
+        item_id: "item-3",
+        kind: "command",
+        // Same compacted preview text — no new authoritative body arrived,
+        // only the status changed.
+        text: "cargo test\npassed ...",
+        status: "completed",
+        turn_id: "turn-3",
+        tool: null,
+        content_state: "preview",
+      },
+    ],
+  };
+
+  restoreHydratedTranscriptSnapshot(state, snapshot);
+
+  const windowEntry = state.transcriptHydrationEntries.get("item-3");
+  assert.equal(windowEntry.status, "completed", "the status update must still land");
+  assert.equal(
+    windowEntry.content_state,
+    "preview",
+    "a status-only tail update must not promote the cached entry to authoritative"
+  );
+});
+
 test("prepareTranscriptHydrationState patches compact tail without clearing same-thread visible history", () => {
   const state = hydratedState();
   const snapshot = {
@@ -251,6 +345,52 @@ test("buildHydratedTranscriptProgress returns null when thread ids differ", () =
   const progress = buildHydratedTranscriptProgress(state);
 
   assert.equal(progress, null);
+});
+
+// P1 (review, transcriptPatchOverlay): buildHydratedTranscriptProgress (the
+// path a still-in-flight hydration fetch renders through) used to project
+// straight from the cached window entries via its own bespoke path, ignoring
+// invalidateTranscriptWindowEntryForPatch entirely — so a completion patch
+// landing while a fetch is in flight republished as "running" on every
+// progress frame that fetch fired, until the fetch itself settled. Now
+// routed through renderedTranscriptFromWindow, which falls back to the
+// array (the patch's own, always-synchronous write) for an invalidated
+// entry. See .sealwire/PLAN.md, "Invalidate; do not write".
+test("buildHydratedTranscriptProgress must not republish a status a patch already completed as still running", () => {
+  const state = hydratedState({
+    session: {
+      active_thread_id: "thread-1",
+      transcript_revision: 20,
+      transcript: [
+        { item_id: "item-1", kind: "agent_text", text: "hi", status: "completed", turn_id: "turn-1", tool: null },
+      ],
+    },
+    transcriptHydrationEntries: new Map([
+      [
+        "item-1",
+        {
+          item_id: "item-1",
+          kind: "agent_text",
+          text: "hi",
+          status: "running",
+          turn_id: "turn-1",
+          tool: null,
+          content_state: "full",
+        },
+      ],
+    ]),
+    transcriptHydrationOrder: ["item-1"],
+    transcriptHydrationBaseSnapshot: { active_thread_id: "thread-1", transcript_revision: 10 },
+  });
+  invalidateTranscriptWindowEntryForPatch(state, "thread-1", { item_id: "item-1" });
+
+  const progress = buildHydratedTranscriptProgress(state);
+
+  assert.equal(
+    progress.transcript.find((entry) => entry.item_id === "item-1")?.status,
+    "completed",
+    "hydration progress must fall back to the array's current status once the window entry is invalidated"
+  );
 });
 
 test("prepareTranscriptHydrationState re-arms hydration when a new oversized entry joins a hydrated thread", () => {

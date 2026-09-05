@@ -215,8 +215,11 @@ function toggleFence(openFence, line) {
   // CommonMark: a closing fence is the marker run plus optional trailing
   // whitespace ONLY — anything else after it (an info string, stray text) is
   // just code content, not a closer, e.g. "```not-a-closer" inside an open
-  // ```-fence stays inside it.
-  const isCloser = marker[0] === openFence.marker[0] && marker.length >= openFence.marker.length && rest.trim() === "";
+  // ```-fence stays inside it. CommonMark whitespace here means space/tab
+  // only, NOT trim()'s full Unicode set — trim() also strips NBSP, which
+  // would read a "``` " (NBSP) line as closed when it CommonMark-parses as
+  // still-open code content.
+  const isCloser = marker[0] === openFence.marker[0] && marker.length >= openFence.marker.length && /^[ \t]*\r?$/.test(rest);
   if (isCloser) {
     return null;
   }

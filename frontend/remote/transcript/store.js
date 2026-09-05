@@ -14,7 +14,7 @@ import {
   stashTranscriptHydrationForThread,
   clearTranscriptHydrationThreadCache,
   applyTranscriptDeltaToWindow,
-  applyTranscriptPatchOverlay,
+  invalidateTranscriptWindowEntryForPatch,
   markTranscriptWindowNeedsRepair,
   renderedTranscriptFromWindow,
   resolveDeltaAppend,
@@ -53,12 +53,11 @@ export function appendTranscriptDelta(state, delta) {
   return applyTranscriptDeltaToWindow(state, delta);
 }
 
-/// Overlay a non-delta entry patch (started/completed/patched) onto the
-/// loaded window at projection time — see applyTranscriptPatchOverlay. A
-/// no-op unless the window is already loaded for `threadId` and already
-/// tracks this item.
+/// A non-delta entry patch can never safely write the window — see
+/// invalidateTranscriptWindowEntryForPatch. A no-op unless the window is
+/// already loaded for `threadId` and already tracks this item as `full`.
 export function applyEntryPatchToWindow(state, threadId, patchedEntry) {
-  return applyTranscriptPatchOverlay(state, threadId, patchedEntry);
+  return invalidateTranscriptWindowEntryForPatch(state, threadId, patchedEntry);
 }
 
 /// Mark every loaded entry non-authoritative after a delta gap, so the

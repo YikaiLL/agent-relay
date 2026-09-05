@@ -18,12 +18,16 @@ import {
   applyEntryPatchToWindow,
   clearTranscriptHydration,
   invalidateTranscriptWindowForRepair,
-  renderedTranscriptFromWindow,
   resolveDeltaAppend,
   restoreHydratedTranscript,
   switchTranscriptHydrationThread,
   transcriptWindowIsLoaded,
 } from "./transcript/store.js";
+import {
+  adoptSettledTranscript,
+  markTranscriptWindowProjectionPending,
+  settleTranscriptProjection as settlePendingTranscriptProjection,
+} from "../shared/transcript-projection.js";
 import {
   hydrateRemoteTranscript,
   loadOlderRemoteTranscript,
@@ -157,19 +161,15 @@ export function flushRemoteTranscriptRenderForTest() {
   transcriptFlushScheduler.flushNow("test");
 }
 
-// Deferred window→array projection — adopts local's structure
-// (local/transcript/store.js's transcriptWindowProjectionPending /
-// settleTranscriptProjection) in place of the old per-token pending-append
-// buffers. Appending a delta to the loaded window (appendTranscriptDeltaToWindow)
-// is an O(1) Map write; projecting it back onto the rendered array
-// (renderedTranscriptFromWindow) is O(n) in the loaded window, so THAT step is
-// deferred: a windowed delta only raises this flag, and settleTranscriptProjection
-// does the actual rebuild, once, whenever it is next called.
-//
-// One flag, not two: the window tracks exactly one thread at a time
-// (transcriptHydrationThreadId), so at most one of state.realSession /
-// state.session ever needs rebuilding from it — see settleTranscriptProjection.
-let transcriptWindowProjectionPending = false;
+// Deferred window→array projection — see ../shared/transcript-projection.js
+// for the algorithm, shared with local (which has one session slot; remote
+// has two — see below). Appending a delta to the loaded window
+// (appendTranscriptDeltaToWindow) is an O(1) Map write; projecting it back
+// onto the rendered array (renderedTranscriptFromWindow) is O(n) in the
+// loaded window, so THAT step is deferred: a windowed delta only raises the
+// pending flag (markTranscriptWindowProjectionPending), and
+// settleTranscriptProjection below does the actual rebuild, once, whenever it
+// is next called.
 
 // Counts actual array rebuilds — mirrors local's transcriptFullRebuildCount
 // (frontend/local/transcript/store.js). Incremented by settleTranscriptProjection's
@@ -187,53 +187,16 @@ export function __resetTranscriptDeltaRebuildCount() {
   transcriptDeltaRebuildCount = 0;
 }
 
-/// Idempotently materialise any pending window projection into
-/// state.realSession.transcript and/or state.session.transcript. Cheap when
-/// nothing is pending; safe to call re-entrantly or from many call sites
-/// (flush start, the applyRenderedSession chokepoint, or any path about to
-/// read/rewrite either transcript array) — it always re-derives from the
-/// CURRENT window rather than trusting a remembered array reference, so an
-/// interleaved write that rebuilds an array (an entry patch, a snapshot
-/// merge) cannot cause it to miss a still-pending delta.
-///
-/// Remote has two session slots where local has one: state.realSession (the
-/// relay's live thread) and state.session (the rendered projection — the
-/// SAME object as realSession unless a background thread is pinned view-only,
-/// in which case it is a re-projection). The window tracks exactly one
-/// thread, so this settles whichever slot(s) currently show that thread —
-/// and when the two slots alias the same object (not pinned), it rebuilds
-/// once and keeps them aliased, rather than forking them into two separately
-/// rebuilt (but value-identical) objects.
-///
-/// Returns whether it materialised anything.
+// Remote has two session slots where local has one: state.realSession (the
+// relay's live thread) and state.session (the rendered projection — the SAME
+// object as realSession unless a background thread is pinned view-only, in
+// which case it is a re-projection). The shared settle already handles
+// aliasing (rebuilds once, keeps both slots pointing at the same object) and
+// checking each slot's own active_thread_id against the window's — this just
+// supplies which slots to check and records the rebuild on this module's own
+// counter.
 function settleTranscriptProjection() {
-  if (!transcriptWindowProjectionPending) {
-    return false;
-  }
-  transcriptWindowProjectionPending = false;
-  const windowThreadId = state.transcriptHydrationThreadId;
-  if (!transcriptWindowIsLoaded(state, windowThreadId)) {
-    return false;
-  }
-  const sessionAliasesRealSession = state.session === state.realSession;
-  let changed = false;
-  if (state.realSession?.active_thread_id === windowThreadId) {
-    state.realSession = {
-      ...state.realSession,
-      transcript: renderedTranscriptFromWindow(state, state.realSession),
-    };
-    changed = true;
-    if (sessionAliasesRealSession) {
-      state.session = state.realSession;
-    }
-  }
-  if (!sessionAliasesRealSession && state.session?.active_thread_id === windowThreadId) {
-    state.session = {
-      ...state.session,
-      transcript: renderedTranscriptFromWindow(state, state.session),
-    };
-    changed = true;
-  }
+  const changed = settlePendingTranscriptProjection(state, ["realSession", "session"]);
   if (changed) {
     transcriptDeltaRebuildCount += 1;
   }
@@ -258,7 +221,7 @@ function invalidateViewOnlyNavigation() {
   // leaving; materialising it into a session about to be superseded is wasted
   // work, and — unlike a bare cancel of the render scheduler — this flag has
   // nothing further to protect once the navigation actually lands.
-  transcriptWindowProjectionPending = false;
+  state.transcriptWindowProjectionPending = false;
 }
 
 function remoteQueryScope() {
@@ -552,7 +515,7 @@ function commitTranscriptDeltaAppend({
       entry_seq,
       text_offset: rawOffset,
     });
-    transcriptWindowProjectionPending = true;
+    markTranscriptWindowProjectionPending(state);
     nextSession = { ...currentSession };
   } else {
     nextSession = applyArrayTranscriptDeltaAppend(currentSession, {
@@ -1272,23 +1235,24 @@ function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null 
     status: incoming.status || defaultStatus || "completed",
     turn_id: incoming.turn_id || event.turn_id || null,
   };
-  // Also overlay onto the window for THIS thread — never assume the
+  // Also invalidate the window's own copy for THIS thread — never assume the
   // window's thread agrees with the live thread a patch always targets (a
   // background thread can be pinned view-only, in which case the window
-  // follows the PIN, not the live thread). Writing this patch's array
-  // rebuild alone would be invisible to settleTranscriptProjection, which
-  // rebuilds the array purely from the window whenever something else is
-  // still pending — reverting this patch the next time that happens. A
-  // no-op when the window isn't loaded for this thread, or doesn't yet
-  // track this item — see applyTranscriptPatchOverlay.
+  // follows the PIN, not the live thread). It can never safely carry this
+  // patch's fields itself (see invalidateTranscriptWindowEntryForPatch), so
+  // settleTranscriptProjection's later window-derived rebuild must not trust
+  // the window's stale copy over the array's fresher one —
+  // renderedTranscriptFromWindow reads this thread's array as the fallback
+  // source for exactly that reason. A no-op when the window isn't loaded for
+  // this thread, or doesn't yet track this item.
   applyEntryPatchToWindow(state, currentThreadId, entryPatch);
   const entryIndex = currentSession.transcript.findIndex((entry) => entry.item_id === itemId);
-  // applyEntryPatchToWindow just no-op'd when true: the window is loaded but
-  // has never tracked this item, so the array append below would otherwise be
-  // the ONLY place it exists — not durable, since a later delta for some
-  // OTHER item re-arms the pending projection, and settling it rebuilds the
-  // whole array from the window (settleTranscriptProjection), which never
-  // heard of this one. Resolved below, once nextSession exists.
+  // True when applyEntryPatchToWindow just no-op'd because the window has
+  // never tracked this item at all. renderedTranscriptFromWindow's own
+  // array-fallback means the array append below is never silently dropped by
+  // a later settle — but the window still doesn't know this item exists, so
+  // drive a real hydration merge below to fold it in properly instead of
+  // leaving it permanently array-only.
   const patchIntroducesUntrackedItem = entryIndex < 0 && transcriptWindowIsLoaded(state, currentThreadId);
   const nextTranscript = entryIndex >= 0
     ? currentSession.transcript.map((entry, index) => {
@@ -2569,19 +2533,13 @@ function applyRenderedSession(
   // not necessarily into THIS `session` — many callers build a fresh
   // `{...state.session, overrides}` copy (updateRemoteSessionSettings) captured
   // BEFORE the settle below runs, carrying its stale pre-projection array
-  // through the spread. Recognise "the same thread settle just rebuilt" by id,
-  // not by array identity (a rebuilt array is not a reliable "still pending"
-  // signal — see settleTranscriptProjection's own doc), and adopt the
-  // freshly-settled transcript into it.
+  // through the spread. adoptSettledTranscript recognises "the same thread
+  // settle just rebuilt" by id, not by array identity (a rebuilt array is not
+  // a reliable "still pending" signal — see settleTranscriptProjection's own
+  // doc), and adopts the freshly-settled transcript into it. Checks
+  // state.realSession before state.session, same order as the old inline check.
   const settled = settleTranscriptProjection();
-  let flushedSession = session;
-  if (settled && session?.active_thread_id) {
-    if (session.active_thread_id === state.realSession?.active_thread_id) {
-      flushedSession = { ...session, transcript: state.realSession.transcript };
-    } else if (session.active_thread_id === state.session?.active_thread_id) {
-      flushedSession = { ...session, transcript: state.session.transcript };
-    }
-  }
+  const flushedSession = adoptSettledTranscript(state, session, settled, ["realSession", "session"]);
   transcriptFlushScheduler.cancel();
   renderSession(flushedSession);
   const message = `[session-state] renderSession prev=${previousThreadId} next=${flushedSession?.active_thread_id || "-"} state=${state.session?.active_thread_id || "-"} entries=${flushedSession?.transcript?.length || 0} hydrate=${hydrateTranscript ? "1" : "0"} hydration_input=${hydrationSnapshot?.active_thread_id || "-"}`;

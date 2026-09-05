@@ -8,6 +8,10 @@ import {
 } from "./session/stream.js";
 import { adoptSettledTranscript, settleTranscriptProjection } from "./transcript/store.js";
 import {
+  cancelAndSettlePendingTranscriptFlush,
+  resolveDirectRenderSession,
+} from "./session/render-session-flush.js";
+import {
   createTranscriptFlushScheduler,
   TRANSCRIPT_FLUSH_CHAR_THRESHOLD,
   TRANSCRIPT_FLUSH_MAX_WINDOW_MS,
@@ -83,8 +87,7 @@ function makeController({ ensureConversationTranscript } = {}) {
   // settleTranscriptProjection() reliable no matter which path triggered the
   // render.
   function renderSessionAndClearPendingFlush(session) {
-    transcriptFlushScheduler.cancel();
-    const settled = settleTranscriptProjection(state);
+    const settled = cancelAndSettlePendingTranscriptFlush(transcriptFlushScheduler, state);
     return baseRenderSession(adoptSettledTranscript(state, session, settled));
   }
   const transcriptFlushScheduler = createTranscriptFlushScheduler({
@@ -113,15 +116,13 @@ function makeController({ ensureConversationTranscript } = {}) {
     transcriptFlushScheduler,
   });
 
-  // Mirrors session-controller.js's exposed cancelPendingTranscriptFlush —
-  // app.js's `renderer.renderSession` wrap (frontend/app.js:1192) calls this
-  // BEFORE painting `state.session` directly, bypassing
-  // renderSessionAndClearPendingFlush/ctx.renderSession entirely. Must
-  // settle as well as cancel, or that direct paint sees the stale
-  // pre-projection array.
+  // The SAME function session-controller.js's exposed cancelPendingTranscriptFlush
+  // calls — app.js's `renderer.renderSession` wrap (frontend/app.js:1191) calls
+  // that BEFORE painting `state.session` directly, bypassing
+  // renderSessionAndClearPendingFlush/ctx.renderSession entirely. Must settle
+  // as well as cancel, or that direct paint sees the stale pre-projection array.
   function cancelPendingTranscriptFlush() {
-    transcriptFlushScheduler.cancel();
-    return settleTranscriptProjection(state);
+    return cancelAndSettlePendingTranscriptFlush(transcriptFlushScheduler, state);
   }
 
   // Mirrors render-session.js's OWN renderSession after the P1 fix: it calls
@@ -359,23 +360,19 @@ test("cancelPendingTranscriptFlush settles the pending projection, so a direct r
   assert.equal(state.session.transcript[0].text, "");
   assert.equal(transcriptFlushScheduler.stats().pending, true);
 
-  // Reproduces app.js's wrappedRenderSession EXACTLY (frontend/app.js:1184):
-  // every direct `renderer.renderSession(state.session)` call site there
-  // (~30 of them) passes state.session, calls cancelPendingTranscriptFlush()
-  // first — never ctx.renderSession — then hands the (possibly reassigned)
-  // session to the real renderer. `renders` below stands in for that
-  // renderer, so the assertion is on what it actually RECEIVED, not on
-  // state.session read back out independently of any render call.
-  function wrappedRenderSession(session) {
-    const wasLiveSession = session === state.session;
-    cancelPendingTranscriptFlush();
-    if (wasLiveSession) {
-      session = state.session;
-    }
-    renders.push(session);
-  }
-
-  wrappedRenderSession(state.session);
+  // Drives the SAME resolveDirectRenderSession app.js's wrappedRenderSession
+  // (frontend/app.js:1191) calls — not a hand-mirrored copy of its logic —
+  // for every direct `renderer.renderSession(state.session)` call site there
+  // (~30 of them): passes state.session, settles via cancelPendingTranscriptFlush
+  // first, then hands the (possibly reassigned) session to the real renderer.
+  // `renders` below stands in for that renderer, so the assertion is on what
+  // it actually RECEIVED, not on state.session read back out independently of
+  // any render call.
+  const resolved = resolveDirectRenderSession(state.session, {
+    state,
+    cancelPendingTranscriptFlush,
+  });
+  renders.push(resolved);
 
   assert.equal(
     transcriptFlushScheduler.stats().pending,
@@ -509,11 +506,13 @@ test("an entry patch for one item, landing between a delta for another item and 
 });
 
 // P1: settling before a patch reads the array only protects THAT ONE flush.
-// A patch that never writes into the hydration window is still invisible to
-// it — so a SECOND delta after the patch (still before the flush) re-arms
+// A SECOND delta after the patch (still before the flush) re-arms
 // transcriptWindowProjectionPending, and the eventual settle rebuilds the
-// array PURELY from the window, which has never heard of the patch. The
-// patch must therefore also land in the window itself, not just the array.
+// array from the window — which never received the patch's fields (it can
+// never safely write them; see invalidateTranscriptWindowEntryForPatch) and
+// was invalidated instead. renderedTranscriptFromWindow's array-fallback for
+// that invalidated entry is what keeps the patch from being overwritten by
+// the window's own (blanked) copy.
 test("a patch survives a later delta for another item re-arming the pending projection before the flush", () => {
   const { clock, controller, renders, state } = makeController();
   state.session.transcript.push({
@@ -617,22 +616,21 @@ test("a completion patch before hydration has loaded anything must not turn an e
   assert.ok(rendered.some((entry) => entry.item_id === "agent-2"));
 });
 
-// P1: applyTranscriptPatchOverlay (transcript-hydration-store.js) deliberately
-// no-ops for an item absent from an otherwise-LOADED window — a patch carries
-// no authoritative body, so it must never be what teaches the window about a
-// new item (see .sealwire/PLAN.md, "Invalidate; do not write"). But
-// applyLocalTranscriptEntryPatch still appends the item to
-// state.session.transcript so it is visible right away, and that array-only
-// write is not itself durable: a LATER delta for some other item re-arms the
-// pending projection, and settling it rebuilds the WHOLE array from the
-// window (settleTranscriptProjection) — which has never heard of this item —
-// silently dropping it with no path back. The fix invalidates the window for
-// repair AND drives a fetch directly (mirroring transcript_stream_lagged
-// above), so hydration re-establishes the truth instead of leaving the array
-// write to vanish for good.
-test("a completion patch for an item a LOADED window has never seen invalidates the window for repair, not just the array", () => {
+// P1 (review, transcriptPatchOverlay): invalidateTranscriptWindowEntryForPatch
+// deliberately no-ops for an item absent from an otherwise-LOADED window — a
+// patch carries no authoritative body, so it must never be what teaches the
+// window about a new item (see .sealwire/PLAN.md, "Invalidate; do not
+// write"). applyLocalTranscriptEntryPatch still appends the item to
+// state.session.transcript so it is visible right away, and drives a real
+// hydration merge (ensureConversationTranscript) so the window learns about
+// it properly. A previous attempt at this ALSO blanket-invalidated every
+// OTHER entry already in the window (a blunt whole-window repair) to keep a
+// later settle from dropping the new item — that is no longer necessary
+// (and no longer happens): renderedTranscriptFromWindow's own array-fallback
+// for a window-missing item means an untouched sibling stays trusted.
+test("a completion patch for an item a LOADED window has never seen survives a later settle, without invalidating its siblings", () => {
   const ensureConversationTranscriptCalls = [];
-  const { state, controller } = makeController({
+  const { clock, state, controller } = makeController({
     ensureConversationTranscript: (session) => {
       ensureConversationTranscriptCalls.push(session);
     },
@@ -640,7 +638,7 @@ test("a completion patch for an item a LOADED window has never seen invalidates 
   state.transcriptHydrationThreadId = "thread-1";
   state.transcriptHydrationOrder = ["agent-1"];
   state.transcriptHydrationEntries = new Map([
-    ["agent-1", { ...state.session.transcript[0], content_state: "full" }],
+    ["agent-1", { ...state.session.transcript[0], text: "sibling text", content_state: "full" }],
   ]);
 
   controller.applyLocalTranscriptEntryPatch(
@@ -654,14 +652,70 @@ test("a completion patch for an item a LOADED window has never seen invalidates 
   );
   assert.equal(
     state.transcriptHydrationEntries.get("agent-1")?.content_state,
-    "preview",
-    "the window must be invalidated for repair — agent-2 has no body of its own to seed it with, " +
-      "so the window can no longer be trusted as loaded-and-complete"
+    "full",
+    "an untouched sibling must not be blanket-invalidated just because a DIFFERENT item was patched"
   );
   assert.equal(
     ensureConversationTranscriptCalls.length,
     1,
-    "a repair fetch must be driven directly — marking the window dirty alone is not enough " +
-      "(same reasoning as transcript_stream_lagged above)"
+    "a real hydration merge must be driven so the window learns about the new item properly"
+  );
+
+  // A later delta for the SIBLING re-arms the pending projection; settling it
+  // rebuilds the array from the window — which still has never heard of
+  // agent-2. Must not silently drop it.
+  controller.applyLocalTranscriptEntryDelta({
+    delta: " more",
+    item_id: "agent-1",
+    text_offset: "sibling text".length,
+    thread_id: "thread-1",
+  });
+  clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+
+  assert.ok(
+    state.session.transcript.some((entry) => entry.item_id === "agent-2"),
+    "agent-2 must survive the sibling's later settle, not vanish because the window never tracked it"
+  );
+});
+
+// P1 (review, transcriptPatchOverlay): a text-replacement patch used to
+// change the window's PROJECTION via a side overlay without ever touching
+// entries.get's own cached body. A later delta for the SAME item reconciled
+// against that untouched, pre-patch body — not the patch's replacement — and,
+// on success, cleared the overlay as "stale now". So patching "Hello" ->
+// "Jello" then appending "!" at offset 5 (valid against the cached "Hello",
+// coincidentally the same length) resolved to "Hello!", silently discarding
+// the replacement. Now the patch clears the window's own cached text
+// (invalidateTranscriptWindowEntryForPatch), so that same delta's offset (5
+// against a blank cache) reads as a gap and is correctly refused instead of
+// silently corrupting the text — the replacement survives, uncorrupted; the
+// "!" is lost until hydration re-fetches, the "coarser, not cleverer"
+// tradeoff .sealwire/PLAN.md accepts.
+test("a text-replacement patch is not silently discarded by a later delta for the same item", () => {
+  const { controller, state } = makeController();
+  state.session.transcript[0].text = "Hello";
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([
+    ["agent-1", { ...state.session.transcript[0], content_state: "full" }],
+  ]);
+  state.transcriptHydrationOrder = ["agent-1"];
+
+  controller.applyLocalTranscriptEntryPatch(
+    { item_id: "agent-1", text: "Jello", status: "running", thread_id: "thread-1" }
+  );
+  assert.equal(state.session.transcript[0].text, "Jello", "the replacement must land immediately");
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "!",
+    item_id: "agent-1",
+    text_offset: 5,
+    thread_id: "thread-1",
+  });
+  settleTranscriptProjection(state);
+
+  assert.equal(
+    state.session.transcript[0].text,
+    "Jello",
+    "the replacement must survive a later delta for the same item — never revert to the pre-patch text"
   );
 });

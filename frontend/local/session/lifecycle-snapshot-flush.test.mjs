@@ -310,6 +310,61 @@ test("a snapshot introducing a brand-new entry keeps it after a same-flush pendi
   );
 });
 
+// P1 (review, reverse of the two tests above): restoreHydratedTranscriptSnapshot
+// (transcript-hydration-store.js) merges a snapshot's tail onto the window only
+// for the RETURNED array — it never writes that merge back into
+// state.transcriptHydrationEntries/order. So when a snapshot introduces an
+// entry the window has never cached, and a genuine continuation delta for
+// THAT SAME entry arrives before the next flush, the delta finds no cached
+// base text, takes the "unknown item" branch, and — because its offset is
+// non-zero — stores an EMPTY preview shell for it. The next settle rebuilds
+// state.session.transcript purely from the window and overwrites the
+// snapshot's own text with that empty shell, silently erasing text nobody
+// ever restreamed. The fix must synchronize the snapshot's tail merge into
+// the canonical window, not just the returned object.
+test("a delta for an entry the snapshot just introduced does not erase the snapshot's own text at settle", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot({ transcript: [entry("agent-1", "Hello", { status: "running" })] });
+  h.state.transcriptHydrationOrder = ["agent-1"];
+  h.state.transcriptHydrationEntries = new Map([
+    ["agent-1", entry("agent-1", "Hello", { status: "running" })],
+  ]);
+
+  // An ordinary snapshot introduces "agent-2" with a body the window has
+  // never cached — e.g. a tool result written in one shot, not streamed
+  // token-by-token yet. Turn state is unchanged, so this coalesces.
+  h.lifecycle.applySessionSnapshot(
+    baseSnapshot({
+      transcript: [
+        entry("agent-1", "Hello", { status: "running" }),
+        entry("agent-2", "Partial result", { status: "running" }),
+      ],
+    })
+  );
+  assert.equal(h.rendered.length, 0, "an ordinary snapshot must coalesce, not paint immediately");
+
+  // Before the flush, a genuine continuation delta for agent-2 arrives,
+  // offset at the length of the text the snapshot just introduced.
+  h.stream.applyLocalTranscriptEntryDelta({
+    item_id: "agent-2",
+    thread_id: THREAD,
+    turn_id: "turn-1",
+    delta: " continues",
+    delta_kind: "agent_text",
+    text_offset: "Partial result".length,
+  });
+
+  h.clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+
+  assert.equal(h.rendered.length, 1);
+  const rendered = h.rendered[0].transcript;
+  assert.equal(
+    rendered.find((candidate) => candidate.item_id === "agent-2")?.text,
+    "Partial result continues",
+    "the snapshot's own text for agent-2 must survive, with the delta appended — not be erased"
+  );
+});
+
 test("an ordinary streaming snapshot coalesces rather than painting immediately", () => {
   const h = buildHarness();
   h.state.session = baseSnapshot();

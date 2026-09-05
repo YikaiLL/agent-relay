@@ -20,7 +20,8 @@ import { createTranscriptController } from "./session/transcript.js";
 import { createPairingController } from "./session/pairing.js";
 import { createLifecycleController } from "./session/lifecycle.js";
 import { createTranscriptFlushScheduler } from "../shared/transcript-flush-scheduler.js";
-import { adoptSettledTranscript, settleTranscriptProjection } from "./transcript/store.js";
+import { adoptSettledTranscript } from "./transcript/store.js";
+import { cancelAndSettlePendingTranscriptFlush } from "./session/render-session-flush.js";
 
 export function createSessionController({
   state,
@@ -155,8 +156,7 @@ export function createSessionController({
   // session object by spreading state.session, so settling elsewhere would
   // miss it and paint the stale array with the just-armed token invisible.
   function renderSessionAndClearPendingFlush(session) {
-    transcriptFlushScheduler.cancel();
-    const settled = settleTranscriptProjection(state);
+    const settled = cancelAndSettlePendingTranscriptFlush(transcriptFlushScheduler, state);
     return renderSession(adoptSettledTranscript(state, session, settled));
   }
 
@@ -222,10 +222,7 @@ export function createSessionController({
     // Returns whether it settled, so a caller holding a session-shaped copy
     // (or an earlier read of state.session) knows whether to reconcile via
     // adoptSettledTranscript before rendering it.
-    cancelPendingTranscriptFlush: () => {
-      transcriptFlushScheduler.cancel();
-      return settleTranscriptProjection(state);
-    },
+    cancelPendingTranscriptFlush: () => cancelAndSettlePendingTranscriptFlush(transcriptFlushScheduler, state),
     connectSessionStream: controller.connectSessionStream,
     copyPairingLink: controller.copyPairingLink,
     decidePairingRequest: controller.decidePairingRequest,

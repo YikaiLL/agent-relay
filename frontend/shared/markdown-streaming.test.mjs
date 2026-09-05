@@ -115,6 +115,20 @@ test("a fence-shaped line with only trailing whitespace DOES close the fence", (
   assert.equal(text.slice(offset), "After, still typ");
 });
 
+// CommonMark permits only spaces/tabs after a closing fence marker. JS's
+// trim() strips far more (all Unicode whitespace, including NBSP), so a
+// fence followed by a non-breaking space used to read as closed — and the
+// blank line after it as a safe split point, inside what is really still an
+// open fence.
+test("a fence-shaped line followed by a non-breaking space does NOT close the fence", () => {
+  const text = "```js\ncode\n``` \n\nAfter, still typ";
+  assert.equal(
+    findStreamingSplitOffset(text),
+    null,
+    "NBSP is not CommonMark whitespace — the fence must stay open, so nothing here is a safe split point"
+  );
+});
+
 // A fence opened inside a list item is itself indented (to align with the
 // item's content column). Closing it with an unindented "```" dedents the
 // closer out of the list item, so it fails to close the real fence and
