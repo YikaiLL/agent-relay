@@ -367,11 +367,22 @@ export function createStreamController(ctx) {
       // only refusal (a gap or byte mismatch); `""` is a duplicate we already
       // hold — a falsy check would treat both alike and refetch on every
       // re-delivered chunk.
+      //
+      // An item the window has never tracked at all is a SECOND refusal shape
+      // resolveDeltaAppend never sees: applyTranscriptDeltaToWindow's own
+      // "unknown item" branch stores a nonzero-offset first delta as an empty
+      // preview (the opening text went missing), never `full` — functionally
+      // identical to a refused append, just reached with no existing text to
+      // reconcile against. `startsAtZero` mirrors that branch's own check so
+      // this can't drift from what it actually decides.
       const existingWindowEntry = state.transcriptHydrationEntries.get(event.item_id);
+      const startsAtZero =
+        event.text_offset == null
+        || (Number.isSafeInteger(event.text_offset) && event.text_offset === 0);
       const resolvedAppend = existingWindowEntry
         ? resolveDeltaAppend(existingWindowEntry.text ?? "", event.delta ?? "", event.text_offset)
         : undefined;
-      const isRefusal = resolvedAppend === null;
+      const isRefusal = existingWindowEntry ? resolvedAppend === null : !startsAtZero;
       if (isRefusal) {
         settleTranscriptProjection(state);
       }
@@ -392,11 +403,12 @@ export function createStreamController(ctx) {
       };
       if (isRefusal) {
         // A true refusal, not a duplicate — this item's window entry was just
-        // downgraded to preview IN PLACE above, so there is nothing left to
-        // project for it here. Bring the repair forward instead of letting it
-        // sit out the coalescing window behind a copy we already know is
-        // stale, same immediate tail as transcript_stream_lagged (settle,
-        // above, already ran) — minus that path's window-wide invalidation,
+        // downgraded to preview IN PLACE above (or, for a brand-new item,
+        // created directly as one), so there is nothing left to project for
+        // it here. Bring the repair forward instead of letting it sit out the
+        // coalescing window behind a copy we already know is incomplete,
+        // same immediate tail as transcript_stream_lagged (settle, above,
+        // already ran) — minus that path's window-wide invalidation,
         // which would wrongly downgrade every OTHER entry over one bad chunk.
         state.session = nextSession;
         void ensureConversationTranscript?.(state.session);

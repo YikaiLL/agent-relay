@@ -479,6 +479,82 @@ test("a duplicate delta for an item already fully held triggers neither a refetc
   assert.equal(renders.length, 1, "the coalesced window still renders once");
 });
 
+// P1 (review): the two tests above only cover an item the window ALREADY
+// tracks — resolveDeltaAppend, and the isRefusal check built on it, never run
+// for an item the window has never seen at all. applyTranscriptDeltaToWindow
+// has its OWN refusal for that case: a first delta with a nonzero offset
+// means the entry's opening text went missing, so it stores an empty preview
+// rather than ever marking the entry `full`. Before this fix that shape fell
+// straight through to the ordinary coalesced path with no refetch requested —
+// reproducing as fetchCalls: 0, renders: 0, pending: true, the same signature
+// the original per-item defect had.
+test("a first delta for a new item with a missing head (nonzero offset) flushes immediately, instead of coalescing", () => {
+  let fetchCalls = 0;
+  const ensureConversationTranscript = () => {
+    fetchCalls += 1;
+    return Promise.resolve();
+  };
+  const { clock, controller, renders, state, transcriptFlushScheduler } = makeController({
+    ensureConversationTranscript,
+  });
+
+  // The window is loaded for the thread (it already tracks "agent-1"), but
+  // "agent-2" has never been seen by it — this exercises
+  // applyTranscriptDeltaToWindow's "unknown item" branch, not the
+  // resolveDeltaAppend-guarded "existing item" branch the tests above do.
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationOrder = ["agent-1"];
+  state.transcriptHydrationEntries = new Map([
+    [
+      "agent-1",
+      {
+        item_id: "agent-1",
+        kind: "agent_text",
+        status: "running",
+        text: "hello",
+        tool: null,
+        entry_seq: null,
+        content_state: "full",
+      },
+    ],
+  ]);
+  state.session.transcript[0].text = "hello";
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "world",
+    item_id: "agent-2",
+    revision: 1,
+    text_offset: 5,
+    thread_id: "thread-1",
+  });
+
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-2")?.content_state,
+    "preview",
+    "precondition: a missing head is recorded as an untrusted preview, never full"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-2")?.text,
+    "",
+    "precondition: the tail must not be stored as if it were the whole body"
+  );
+
+  assert.equal(
+    renders.length,
+    1,
+    "a missing-head delta for a brand-new item must flush immediately, not sit out the coalescing window"
+  );
+  assert.equal(fetchCalls, 1, "a missing head must trigger exactly one refetch");
+  assert.equal(
+    transcriptFlushScheduler.stats().pending,
+    false,
+    "no coalesced timer may be left armed behind the immediate flush"
+  );
+
+  clock.tick(TRANSCRIPT_FLUSH_MAX_WINDOW_MS);
+  assert.equal(renders.length, 1, "the absorbed window timer must not render a second time later");
+});
+
 // P1 (review): a terminal entry patch used to end at the same coalescing
 // queueTranscriptRender() as an ordinary streaming delta, so a completion /
 // failure / error / cancellation sat behind the 100-300ms window instead of
