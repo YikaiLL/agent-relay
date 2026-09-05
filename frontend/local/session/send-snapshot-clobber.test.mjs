@@ -79,6 +79,20 @@ globalThis.window = {
 
 const { createLifecycleController } = await import("./lifecycle.js");
 
+// This file is exercising the send/snapshot clobber guard, not the shared
+// flush scheduler (see lifecycle-snapshot-flush.test.mjs for that), so
+// renders fire synchronously regardless of how snapshotIsInteractive would
+// classify them.
+function createSyncTranscriptFlushScheduler(render) {
+  return {
+    queue: render,
+    note() {},
+    flushNow: render,
+    cancel() {},
+    stats: () => ({ renderCount: 0, windowMs: 100, pending: false, pendingChars: 0 }),
+  };
+}
+
 const THREAD = "thread-1";
 const USER_TEXT = "ask-user-live";
 
@@ -134,6 +148,10 @@ function buildController({
     localUiStore: { getState: () => ({ clearTranscriptDetailLoading() {} }) },
   };
   let controller = null;
+  const renderSession = (session) => {
+    state.session = session;
+    rendered.push(session);
+  };
   controller = createLifecycleController({
     state,
     apiFetch: async () => {
@@ -146,10 +164,12 @@ function buildController({
       return { ok: true, json: async () => ({ ok: true, data: response }) };
     },
     logLine: () => {},
-    renderSession: (session) => {
-      state.session = session;
-      rendered.push(session);
-    },
+    renderSession,
+    transcriptFlushScheduler: createSyncTranscriptFlushScheduler(() => {
+      if (state.session) {
+        renderSession(state.session);
+      }
+    }),
     canCurrentDeviceWrite: () => true,
     seedDefaults: () => {},
     setSelectedCwd: () => {},

@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import {
   createClearedTranscriptHydrationPatch,
+  invalidateTranscriptWindowEntryForPatch,
   stashTranscriptHydrationForThread,
   restoreTranscriptHydrationForThread,
   clearTranscriptHydrationThreadCache,
@@ -103,6 +104,37 @@ test("a stash is independent of later live mutations to the active slot", () => 
   // mutation of the (since-reused) live slot.
   assert.deepEqual(state.transcriptHydrationOrder, ["a1", "a2"]);
   assert.equal(state.transcriptHydrationEntries.get("a2").text, "body-a2");
+});
+
+// A patch invalidation lives directly on the window entry itself (content_state
+// + a blanked text — see invalidateTranscriptWindowEntryForPatch), not in a
+// separate side store, so it travels with the window across a stash/restore
+// for free: whatever copies `transcriptHydrationEntries` copies the
+// invalidation too. This replaces a test pinning the same guarantee for the
+// deleted `transcriptPatchOverlay`, which needed its own dedicated stash/
+// restore handling to avoid leaking across threads.
+test("an invalidated window entry survives leaving a thread and coming back, and does not leak into a different thread switched to in between", () => {
+  const state = hydratedThreadState("thread-A", ["a1", "a2"]);
+  // A completion patch landed for a2 just before the pin/switch away.
+  invalidateTranscriptWindowEntryForPatch(state, "thread-A", { item_id: "a2", status: "completed" });
+  assert.equal(state.transcriptHydrationEntries.get("a2").content_state, "preview");
+
+  stashTranscriptHydrationForThread(state);
+  Object.assign(state, restoreTranscriptHydrationForThread(state, "thread-B"));
+  assert.equal(
+    state.transcriptHydrationEntries.has("a2"),
+    false,
+    "thread-B must not inherit thread-A's window at all, invalidated or not"
+  );
+
+  stashTranscriptHydrationForThread(state); // stash B (empty -> no-op)
+  Object.assign(state, restoreTranscriptHydrationForThread(state, "thread-A"));
+
+  assert.equal(
+    state.transcriptHydrationEntries.get("a2")?.content_state,
+    "preview",
+    "the invalidation for a2 must travel with its window across the switch away and back"
+  );
 });
 
 test("a genuine reset drops every retained window so stale history can't resurface", () => {

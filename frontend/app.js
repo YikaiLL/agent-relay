@@ -152,6 +152,11 @@ import {
 import { createSessionRenderer } from "./local/render-session.js";
 import { createSessionController } from "./local/session-controller.js";
 import {
+  runLocalBootDataPhase,
+  syncProjectsForSession,
+} from "./local/boot-session-view.js";
+import { resolveDirectRenderSession } from "./local/session/render-session-flush.js";
+import {
   createLocalUiStore,
   readLocalUiState,
 } from "./local/ui-store.js";
@@ -422,6 +427,10 @@ const state = {
   transcriptHydrationStatus: "idle",
   transcriptHydrationTailReady: false,
   transcriptHydrationThreadId: null,
+  // Bumped on every per-item delta refusal (session/stream.js), so a tail
+  // fetch already in flight when the refusal happens reads back stale on
+  // arrival — see shared/transcript-hydration.js's isStaleTranscriptPage.
+  transcriptRefusalEpoch: 0,
   transcriptLiveEntryDetails: new Map(),
   transcriptLiveEntryThreadId: null,
   transcriptPreserveScroll: false,
@@ -999,6 +1008,12 @@ const renderer = createSessionRenderer({
   cancelControllerLeaseRefresh() {
     return controller?.cancelControllerLeaseRefresh();
   },
+  // See render-session.js's own doc on this option: renderSession calls it
+  // directly so its internal closures (not just this file's `renderer.renderSession`
+  // wrap below) clear a pending transcript flush too.
+  cancelPendingTranscriptFlush() {
+    return controller?.cancelPendingTranscriptFlush?.();
+  },
   logLine,
   renderClientLogLines,
   ingestRelayLogs,
@@ -1204,10 +1219,36 @@ const renderer = createSessionRenderer({
 // through the wrapper.
 const _baseRenderSession = renderer.renderSession;
 renderer.renderSession = function wrappedRenderSession(session) {
+  // Late-bound: `controller` is assigned after this wrap runs (see
+  // createSessionController below), but nothing calls renderSession before
+  // boot finishes assigning it. Every render through this ONE function —
+  // whether reached via ctx.renderSession or one of the many direct
+  // renderer.renderSession(...) calls elsewhere in this file — must satisfy
+  // the flush scheduler's pending slot, or a coalesced delta timer left over
+  // from before this render fires later and paints a second time.
+  //
+  // Settles any pending window projection into state.session too — a bare
+  // cancel would destroy the only scheduled catch-up while leaving the stale
+  // pre-projection array in place, which is what this render would then
+  // paint. See resolveDirectRenderSession's own doc.
+  session = resolveDirectRenderSession(session, {
+    state,
+    cancelPendingTranscriptFlush: () => controller?.cancelPendingTranscriptFlush?.(),
+  });
   if (devicesCache.hasData()) {
     session = { ...session, ...devicesCache.current() };
   }
-  const previousLiveSession = state.session;
+  // lifecycle.js's applySessionSnapshot now advances state.session
+  // synchronously before every render it triggers (queue() defers only the
+  // paint, never the write — see .sealwire/PLAN.md), so state.session can no
+  // longer be trusted to still hold "the live session a moment ago" by the
+  // time this wrap runs. It stashes that value here itself when the active
+  // thread just switched; fall back to state.session for every other render
+  // path (deltas/patches), which do not pre-write it and so still satisfy
+  // the old assumption. Consumed once — clear it so a later, unrelated
+  // render can't read a stale switch that already happened.
+  const previousLiveSession = state.previousLiveSessionForPin || state.session;
+  state.previousLiveSessionForPin = null;
   const viewedThreadWasLive = Boolean(
     state.viewThreadId
     && previousLiveSession?.active_thread_id === state.viewThreadId
@@ -1507,10 +1548,10 @@ function syncThreadListViewFromContext(context) {
   if (readActiveProjectId(state.threadListStore) !== projectId) {
     store.setActiveProject(projectId);
   }
-  // Unconditional: the switcher offers the project list from every context, so
-  // gating the fetch on Projects mode would leave it empty exactly where it is the
-  // only way IN to a project.
-  projectsStore.syncToRevision(state.session?.projects_revision || 0);
+  // Unconditional once a session snapshot exists: the switcher offers the project
+  // list from every context, so gating the fetch on Projects mode would leave it
+  // empty exactly where it is the only way IN to a project.
+  syncProjectsForSession(projectsStore, state.session);
 }
 
 // Drop a selection whose project is gone (deleted here or by a remote peer). It used
@@ -2910,18 +2951,27 @@ async function boot() {
     return;
   }
 
-  await loadSession("initial boot");
-  await loadThreads("initial boot");
   // No `preview` intent, unlike the popstate handler above. Boot means "route to
   // this, changing nothing about a tab that already exists": a link to a session
   // you are not holding open opens a kept tab, while a refresh on one you were
-  // only peeking at stays a peek — reload is not a gesture.
-  await sessionViewController.restoreHistory(
-    window.history.state,
-    readThreadIdFromUrl()
-  );
-  connectSessionStream();
-  scheduleThreadsPoll();
+  // only peeking at stays a peek — reload is not a gesture. This MUST happen
+  // before loading the session: applying that snapshot starts an asynchronous
+  // Projects reconciliation, and its history replace has to read the restored
+  // thread route. If it sees the initial null location instead, it removes the
+  // URL's `?thread=` while boot is still in flight and a large-thread reload
+  // lands on console home.
+  await runLocalBootDataPhase({
+    restoreHistory: () => sessionViewController.restoreHistory(
+      window.history.state,
+      readThreadIdFromUrl()
+    ),
+    loadSession: () => loadSession("initial boot"),
+    loadThreads: () => loadThreads("initial boot"),
+    connectSessionStream,
+    scheduleThreadsPoll,
+    onRestoreError: (error) =>
+      logLine(`Session view history restore failed during boot: ${error?.message || error}`),
+  });
 }
 
 async function refreshAuthSession(reason) {

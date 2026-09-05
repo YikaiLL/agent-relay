@@ -6,6 +6,7 @@ import {
   createMergedTranscriptHydrationPagePatch,
   prepareTranscriptHydrationState,
   createTranscriptHydrationCompletePatch,
+  createOwnedTranscriptHydrationIdlePatch,
   createTranscriptHydrationRevisionPatch,
   createTranscriptHydrationPromisePatch,
   createTranscriptHydrationStatusPatch,
@@ -13,6 +14,12 @@ import {
   restoreTranscriptHydrationForThread,
   stashTranscriptHydrationForThread,
   clearTranscriptHydrationThreadCache,
+  applyTranscriptDeltaToWindow,
+  invalidateTranscriptWindowEntryForPatch,
+  markTranscriptWindowNeedsRepair,
+  renderedTranscriptFromWindow,
+  resolveDeltaAppend,
+  transcriptWindowIsLoaded,
 } from "../../shared/transcript-hydration-store.js";
 import { prepareTranscriptEntryForSurface } from "./details.js";
 import { applyRemoteSurfacePatch } from "../surface-state.js";
@@ -39,6 +46,30 @@ export function restoreHydratedTranscript(state, snapshot) {
   return restoreHydratedTranscriptSnapshot(state, snapshot);
 }
 
+/// Append a live transcript delta to the loaded window. Mirrors
+/// local/transcript/store.js's appendTranscriptDelta — the rendered
+/// transcript is rebuilt from this window at settle time, so a delta must
+/// land here to survive.
+export function appendTranscriptDelta(state, delta) {
+  return applyTranscriptDeltaToWindow(state, delta);
+}
+
+/// A non-delta entry patch can never safely write the window — see
+/// invalidateTranscriptWindowEntryForPatch. A no-op unless the window is
+/// already loaded for `threadId` and already tracks this item as `full`.
+export function applyEntryPatchToWindow(state, threadId, patchedEntry) {
+  return invalidateTranscriptWindowEntryForPatch(state, threadId, patchedEntry);
+}
+
+/// Mark every loaded entry non-authoritative after a delta gap, so the
+/// re-hydration gate refetches instead of trusting a body that may now be
+/// missing an interior chunk.
+export function invalidateTranscriptWindowForRepair(state) {
+  return markTranscriptWindowNeedsRepair(state);
+}
+
+export { renderedTranscriptFromWindow, resolveDeltaAppend, transcriptWindowIsLoaded };
+
 export function prepareTranscriptHydration(state, snapshot) {
   const prepared = prepareTranscriptHydrationState(state, snapshot);
   if (prepared.patch) {
@@ -62,8 +93,11 @@ export function clearTranscriptHydrationPromise(state, promise) {
   }
 }
 
-export function setTranscriptHydrationIdle() {
-  applyRemoteSurfacePatch(createTranscriptHydrationStatusPatch("idle"));
+export function setTranscriptHydrationIdle(state, promise) {
+  const patch = createOwnedTranscriptHydrationIdlePatch(state, promise);
+  if (patch) {
+    applyRemoteSurfacePatch(patch);
+  }
 }
 
 export function clearTranscriptHydrationFetchedRevision() {

@@ -13,9 +13,13 @@ import assert from "node:assert/strict";
 
 import {
   createClearedTranscriptHydrationPatch,
+  invalidateTranscriptWindowEntryForPatch,
   prepareTranscriptHydrationState,
+  renderedTranscriptFromWindow,
   restoreHydratedTranscriptSnapshot,
+  __readTranscriptArrayFallbackLookupBuildCount,
   __readTranscriptFullWindowCopyCount,
+  __resetTranscriptArrayFallbackLookupBuildCount,
   __resetTranscriptFullWindowCopyCount,
 } from "./shared/transcript-hydration-store.js";
 
@@ -106,6 +110,49 @@ test("per-snapshot work stays bounded as the window grows (no O(n) regression)",
       __readTranscriptFullWindowCopyCount(),
       0,
       `window n=${n}: steady-state snapshots must not copy the full window`
+    );
+  }
+});
+
+// P1 (review): renderedTranscriptFromWindow's array-fallback for an
+// invalidated/absent window entry (invalidateTranscriptWindowEntryForPatch —
+// see .sealwire/PLAN.md, "Invalidate; do not write") builds a lookup Map from
+// the CURRENT array in ONE linear pass, not a `.find()` per window entry —
+// the latter would turn every settle into O(window * array) instead of
+// O(window + array). Proved with a counter that totals ARRAY ENTRIES VISITED
+// (transcriptArrayFallbackLookupBuildCount), not wall time: it must equal
+// exactly (calls * array length) at both 1k and 20k — a per-window-entry
+// `.find()` would instead multiply that by the window length too, since it
+// re-scans the whole array for every window entry.
+test("the array-fallback lookup scans the array once per call as the window grows 1k -> 20k, not once per window entry", () => {
+  for (const n of [1000, 20000]) {
+    const state = hydratedState(n);
+    // Invalidate one entry so every call actually exercises the fallback
+    // path (a no-op invalidate would let the fast "no array-only ids, no
+    // untrusted entries" path hide a regression).
+    invalidateTranscriptWindowEntryForPatch(state, "t1", { item_id: "item-0" });
+    const session = {
+      active_thread_id: "t1",
+      transcript: Array.from({ length: n }, (_, i) => entry(i)),
+    };
+    __resetTranscriptArrayFallbackLookupBuildCount();
+
+    const calls = 10;
+    let lastProjected = null;
+    for (let i = 0; i < calls; i += 1) {
+      lastProjected = renderedTranscriptFromWindow(state, session);
+    }
+
+    assert.equal(
+      __readTranscriptArrayFallbackLookupBuildCount(),
+      calls * n,
+      `window n=${n}: the array must be scanned exactly once per call (${calls} calls * ${n} entries), ` +
+        "not once per window entry per call"
+    );
+    assert.equal(
+      lastProjected.find((e) => e.item_id === "item-0").text,
+      session.transcript[0].text,
+      "the invalidated entry must still resolve correctly via the array fallback"
     );
   }
 });

@@ -7,6 +7,18 @@ import { createViewOnlyRefreshOps } from "./view-only-refresh-ops.js";
 const LIVE_THREAD = "thread-live";
 const BG_THREAD = "thread-bg";
 
+// This file exercises the view-only refresh policy, not the shared flush
+// scheduler, so renders fire synchronously rather than stepping a fake clock.
+function createSyncTranscriptFlushScheduler(render) {
+  return {
+    queue: render,
+    note() {},
+    flushNow: render,
+    cancel() {},
+    stats: () => ({ renderCount: 0, windowMs: 100, pending: false, pendingChars: 0 }),
+  };
+}
+
 function session({ threadActivity = [] } = {}) {
   return {
     active_thread_id: LIVE_THREAD,
@@ -72,22 +84,27 @@ function createHarness() {
     return loadViewOnlyTranscript(threadId, options);
   };
 
+  const streamRenderSession = (nextSession) => {
+    state.session = nextSession;
+    ops.maybeRefreshViewOnly(nextSession);
+  };
   const stream = createStreamController({
     state,
     ensureConversationTranscript: () => {},
     logLine: () => {},
     seedDefaults: () => {},
-    renderSession: (nextSession) => {
-      state.session = nextSession;
-      ops.maybeRefreshViewOnly(nextSession);
-    },
+    renderSession: streamRenderSession,
     handleUnauthorized: () => {},
     applySessionSnapshot: () => {},
     cancelSessionPoll: () => {},
     cancelStreamReconnect: () => {},
     scheduleSessionPoll: () => {},
     scheduleStreamReconnect: () => {},
-    scheduleRenderFrame: (callback) => callback(),
+    transcriptFlushScheduler: createSyncTranscriptFlushScheduler(() => {
+      if (state.session) {
+        streamRenderSession(state.session);
+      }
+    }),
   });
 
   return {

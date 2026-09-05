@@ -580,6 +580,98 @@ test("hydrateLocalTranscript clears its in-flight promise on settle even if the 
   );
 });
 
+test("a stale-thread early return releases loading when the settling request still owns the hydration slot", async () => {
+  const state = createState();
+  const snapshot = {
+    active_thread_id: "thread-A",
+    transcript_truncated: true,
+    transcript: [
+      {
+        item_id: "item-A",
+        kind: "agent_text",
+        text: "shell...",
+        status: "running",
+        turn_id: "turn-A",
+        tool: null,
+        content_state: "omitted",
+      },
+    ],
+  };
+  let releasePage;
+  const pageGate = new Promise((resolve) => {
+    releasePage = resolve;
+  });
+
+  const hydrationPromise = hydrateLocalTranscript(state, snapshot, {
+    async fetchPage() {
+      await pageGate;
+      return {
+        thread_id: "thread-A",
+        prev_cursor: null,
+        entries: [
+          {
+            item_id: "item-A",
+            kind: "agent_text",
+            text: "stale thread-A body",
+            status: "completed",
+            turn_id: "turn-A",
+            tool: null,
+          },
+        ],
+      };
+    },
+    onProgress() {},
+  });
+
+  assert.equal(state.transcriptHydrationStatus, "loading");
+  // Only the visible session moved. No replacement hydration request owns the
+  // slot, so this request is still responsible for releasing its own loading
+  // status when the stale-page gate returns before merge.
+  state.session = { active_thread_id: "thread-B" };
+  releasePage();
+  await hydrationPromise;
+
+  assert.equal(state.transcriptHydrationPromise, null);
+  assert.equal(
+    state.transcriptHydrationStatus,
+    "idle",
+    "the shared finally path must release an owned loading status even when no merge ran"
+  );
+});
+
+test("a synchronous tail-fetch failure still releases the promise and loading status it owns", async () => {
+  const state = createState();
+  const errors = [];
+
+  await hydrateLocalTranscript(state, {
+    active_thread_id: "thread-1",
+    transcript_truncated: true,
+    transcript: [
+      {
+        item_id: "item-1",
+        kind: "agent_text",
+        text: "shell...",
+        status: "running",
+        turn_id: "turn-1",
+        tool: null,
+        content_state: "omitted",
+      },
+    ],
+  }, {
+    fetchPage() {
+      throw new Error("synchronous fetch setup failure");
+    },
+    onError(error) {
+      errors.push(error.message);
+    },
+    onProgress() {},
+  });
+
+  assert.deepEqual(errors, ["synchronous fetch setup failure"]);
+  assert.equal(state.transcriptHydrationPromise, null);
+  assert.equal(state.transcriptHydrationStatus, "idle");
+});
+
 test("hydrateLocalTranscript does not publish a new emergency shell while its full page is pending", async () => {
   const state = createState();
   const previousSnapshot = {
@@ -808,6 +900,29 @@ test("loadOlderLocalTranscript prepends older hydrated entries", async () => {
     progress.at(-1)?.transcript?.map((entry) => entry.item_id),
     ["item-1", "item-2", "item-3"]
   );
+});
+
+test("a synchronous older-page fetch failure releases its owned loading gate", async () => {
+  const state = createState({
+    transcriptHydrationOlderCursor: "older-cursor",
+    transcriptHydrationStatus: "idle",
+  });
+  const errors = [];
+
+  const result = await loadOlderLocalTranscript(state, {
+    fetchPage() {
+      throw new Error("synchronous older-page setup failure");
+    },
+    onError(error) {
+      errors.push(error.message);
+    },
+    onProgress() {},
+  });
+
+  assert.equal(result, null);
+  assert.deepEqual(errors, ["synchronous older-page setup failure"]);
+  assert.equal(state.transcriptHydrationPromise, null);
+  assert.equal(state.transcriptHydrationStatus, "idle");
 });
 
 test("clearTranscriptHydration resets local hydration state", () => {
@@ -1303,6 +1418,11 @@ test("a stale thread-A tail fetch must not clear thread-B's fetched-revision arm
     state.transcriptHydrationFetchedRevision,
     REVISION_B,
     "thread A's stale discard must not clear thread B's once-per-revision arm"
+  );
+  assert.equal(
+    state.transcriptHydrationStatus,
+    "loading",
+    "thread A's stale settle must not release the loading status owned by thread B's request"
   );
 
   state.session = { active_thread_id: "thread-B", active_turn_id: "turn-b" };

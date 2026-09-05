@@ -23,7 +23,7 @@ import {
   getFileChanges,
   parseUnifiedDiffRows,
 } from "./file-change-diff.js";
-import { renderMarkdown } from "./markdown.js";
+import { renderMarkdown, renderStreamingMarkdown } from "./markdown.js";
 import { didPrependOlderTranscript } from "./transcript-scroll.js";
 
 const h = React.createElement;
@@ -32,7 +32,10 @@ const COLLAPSIBLE_CHAR_THRESHOLD = 900;
 const COLLAPSIBLE_LINE_THRESHOLD = 12;
 const INITIAL_DIFF_ROW_LIMIT = 400;
 const TRANSCRIPT_VIRTUALIZATION_THRESHOLD = 20;
-const TRANSCRIPT_VIRTUAL_OVERSCAN = 6;
+// Exported so the overscan requirement can be proven behaviorally against
+// the real @tanstack/virtual-core Virtualizer, not just asserted as a number
+// — see transcript-virtualizer-overscan.test.mjs.
+export const TRANSCRIPT_VIRTUAL_OVERSCAN = 6;
 const EMPTY_FORKABLE_IDS = new Set();
 
 function isCollapsible(value) {
@@ -161,9 +164,12 @@ function ExpandableBlock({
   );
 }
 
-function renderMessageBody(text) {
+// `isStreaming` is only ever true while status is "running" — mergeTranscriptEntry
+// (shared/transcript-hydration-store.js) guarantees a completing entry's text
+// is still the full body, so completed always gets the ordinary full parse.
+function renderMessageBody(text, isStreaming = false) {
   if (!text) return "(empty)";
-  return renderMarkdown(text);
+  return isStreaming ? renderStreamingMarkdown(text) : renderMarkdown(text);
 }
 
 // Per-message action row for agent messages.
@@ -230,7 +236,26 @@ function renderMessageActions(entry, showFork) {
   );
 }
 
+// Test-only render observer. Unlike transcriptFullRebuildCount
+// (frontend/local/transcript/store.js) — a single O(1) integer — a per-item
+// record here would grow with every distinct item_id ever rendered over the
+// app's lifetime and never shrink. A single nullable callback keeps this hot
+// path at O(1), zero-cost state in production (the common case, observer
+// null); a test installs its own bounded, test-scoped counting by supplying
+// one.
+let transcriptEntryImplRenderObserver = null;
+export function __setTranscriptEntryImplRenderObserver(observer) {
+  transcriptEntryImplRenderObserver = typeof observer === "function" ? observer : null;
+}
+function recordTranscriptEntryImplRender(itemId) {
+  if (!itemId) {
+    return;
+  }
+  transcriptEntryImplRenderObserver?.(itemId);
+}
+
 function UserEntryImpl({ entry, isLatestUser = false, isJustPrepended = false }) {
+  recordTranscriptEntryImplRender(entry?.item_id);
   // `data-latest-user-message` is the anchor that the scroll layer uses to
   // pin a freshly sent user message to the top of the viewport.
   return h(
@@ -271,6 +296,7 @@ function messageAvatar(provider) {
 // transcript change, which would defeat React.memo for every agent message in
 // a long thread.
 function AgentEntryImpl({ entry, isJustPrepended = false, isForkable = false, provider = "" }) {
+  recordTranscriptEntryImplRender(entry?.item_id);
   return h(
     "article",
     transcriptEntryDomAttrs(entry, "chat-message chat-message-assistant", null, {
@@ -280,7 +306,11 @@ function AgentEntryImpl({ entry, isJustPrepended = false, isForkable = false, pr
     h(
       "div",
       { className: "message-card" },
-      h("div", { className: "message-body" }, renderMessageBody(entry.text)),
+      h(
+        "div",
+        { className: "message-body" },
+        renderMessageBody(entry.text, entry.status === "running")
+      ),
       renderMessageActions(entry, isForkable)
     )
   );
@@ -2231,40 +2261,59 @@ export function diffPrependedItemIds(previousEntries, nextEntries) {
   return ids;
 }
 
+// Test-only instrumentation: counts actual recomputations of
+// useJustPrependedItemIds's body, so a test can assert the useMemo below
+// really did skip the O(n) prevIds scan on a render that left `entries`
+// untouched, rather than just asserting the eventual output looked right.
+let justPrependedComputeCount = 0;
+export function __readJustPrependedComputeCount() {
+  return justPrependedComputeCount;
+}
+export function __resetJustPrependedComputeCount() {
+  justPrependedComputeCount = 0;
+}
+
 function useJustPrependedItemIds(entries) {
   const previousEntriesRef = React.useRef([]);
   const prependedIdsRef = React.useRef(new Set());
 
-  // If there's no overlap between the previous and current entry lists, we
-  // jumped to a different thread (or the transcript was reset). Drop the
-  // accumulated set so we don't accidentally tag a new thread's entries
-  // because their item_ids happen to match the old thread's set.
-  if (previousEntriesRef.current.length > 0 && entries.length > 0) {
-    const prevIds = new Set();
-    for (const entry of previousEntriesRef.current) {
-      if (entry?.item_id) prevIds.add(entry.item_id);
-    }
-    let hasOverlap = false;
-    for (const entry of entries) {
-      if (entry?.item_id && prevIds.has(entry.item_id)) {
-        hasOverlap = true;
-        break;
+  // Keyed on `entries` identity: a render that doesn't touch the transcript
+  // (this component re-rendering for an unrelated reason, e.g. an approval
+  // banner) must not pay the O(n) prevIds scan below just to conclude nothing
+  // prepended.
+  return React.useMemo(() => {
+    justPrependedComputeCount += 1;
+    // If there's no overlap between the previous and current entry lists, we
+    // jumped to a different thread (or the transcript was reset). Drop the
+    // accumulated set so we don't accidentally tag a new thread's entries
+    // because their item_ids happen to match the old thread's set.
+    if (previousEntriesRef.current.length > 0 && entries.length > 0) {
+      const prevIds = new Set();
+      for (const entry of previousEntriesRef.current) {
+        if (entry?.item_id) prevIds.add(entry.item_id);
+      }
+      let hasOverlap = false;
+      for (const entry of entries) {
+        if (entry?.item_id && prevIds.has(entry.item_id)) {
+          hasOverlap = true;
+          break;
+        }
+      }
+      if (!hasOverlap) {
+        prependedIdsRef.current = new Set();
       }
     }
-    if (!hasOverlap) {
-      prependedIdsRef.current = new Set();
-    }
-  }
 
-  const newlyPrepended = diffPrependedItemIds(previousEntriesRef.current, entries);
-  if (newlyPrepended.length > 0) {
-    for (const id of newlyPrepended) {
-      prependedIdsRef.current.add(id);
+    const newlyPrepended = diffPrependedItemIds(previousEntriesRef.current, entries);
+    if (newlyPrepended.length > 0) {
+      for (const id of newlyPrepended) {
+        prependedIdsRef.current.add(id);
+      }
     }
-  }
 
-  previousEntriesRef.current = entries;
-  return prependedIdsRef.current;
+    previousEntriesRef.current = entries;
+    return prependedIdsRef.current;
+  }, [entries]);
 }
 
 export function TranscriptContent({

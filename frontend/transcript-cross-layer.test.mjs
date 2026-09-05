@@ -16,7 +16,9 @@ import {
   buildHydratedTranscriptProgress,
   createClearedTranscriptHydrationPatch,
   createClearedTranscriptHydrationFetchedRevisionPatch,
+  createClearedTranscriptHydrationPromisePatch,
   createMergedTranscriptHydrationPagePatch,
+  createOwnedTranscriptHydrationIdlePatch,
   createTranscriptHydrationCompletePatch,
   createTranscriptHydrationRevisionPatch,
   prepareTranscriptHydrationState,
@@ -48,12 +50,13 @@ function makeStore() {
       state.transcriptHydrationPromise = promise;
     },
     clearTranscriptHydrationPromise(state, promise) {
-      if (state.transcriptHydrationPromise === promise) {
-        state.transcriptHydrationPromise = null;
-      }
+      Object.assign(
+        state,
+        createClearedTranscriptHydrationPromisePatch(state, promise) || {}
+      );
     },
-    setTranscriptHydrationIdle(state) {
-      state.transcriptHydrationStatus = "idle";
+    setTranscriptHydrationIdle(state, promise) {
+      Object.assign(state, createOwnedTranscriptHydrationIdlePatch(state, promise) || {});
     },
     clearTranscriptHydrationFetchedRevision(state) {
       Object.assign(state, createClearedTranscriptHydrationFetchedRevisionPatch());

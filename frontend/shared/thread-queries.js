@@ -100,3 +100,48 @@ export function createThreadTranscriptPageQueryOptions({
     }),
   };
 }
+
+/**
+ * Fetch a transcript page bypassing the query cache's in-flight
+ * de-duplication, and seed the cache with the result. Mirrors
+ * `fetchThreadListFresh` above for the identical reason: a caller here needs
+ * data that reflects a moment AFTER a client-detected event (a per-item
+ * delta gap/mismatch/missing-head), and a request that began BEFORE that
+ * moment must not be allowed to satisfy it.
+ *
+ * `fetchPage` itself must ALSO bypass any read-through disk cache (pass the
+ * raw, uncached primitive) — evicting the query here only stops a race with
+ * `fetchQuery`'s own dedup; it does nothing if `fetchPage` reads stale data
+ * from somewhere else first.
+ *
+ * `removeQueries` does not just detach the key for future readers: query-core's
+ * `Query.destroy()` cancels its retryer outright (`retryer.js`'s `cancel`),
+ * rejecting the promise every caller is holding — including one from BEFORE
+ * this eviction whose fetch is still in flight. So the request this call
+ * supersedes fails with a `CancelledError` rather than quietly resolving
+ * unread; callers going through the ordinary `ensureConversationTranscript` /
+ * `hydrateTranscript` path already treat a rejected `fetchPage` as a normal,
+ * loggable failure (`onError`), not a crash. Because a FRESH Query is built
+ * for the evicted key, any caller who calls `fetchQuery` for it AFTER this
+ * eviction — even before this function's own fetch resolves — starts its own
+ * independent request rather than attaching to anything this call touched.
+ * `setQueryData` once this function's own fetch resolves seeds that fresh
+ * Query with the authoritative answer, so a reader arriving after BOTH have
+ * settled reads this one, not whichever happened to finish first.
+ */
+export async function fetchThreadTranscriptPageFresh({
+  before = null,
+  fetchPage,
+  queryClient = null,
+  scope = "default",
+  surface,
+  threadId,
+}) {
+  const queryKey = threadTranscriptPageQueryKey({ before, scope, surface, threadId });
+  // Before the request, so a request racing this one cannot dedupe onto a
+  // request that predates it.
+  queryClient?.removeQueries({ queryKey, exact: true });
+  const page = await fetchPage({ before, threadId });
+  queryClient?.setQueryData(queryKey, page);
+  return page;
+}

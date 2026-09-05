@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createStreamController } from "./stream.js";
+import { settleTranscriptProjection } from "../transcript/store.js";
 import { createViewedThreadRefreshLatch } from "../../shared/viewed-thread-refresh.js";
 import {
   applyOrchestratorLoadFinally,
@@ -18,6 +19,20 @@ import {
 // transcript again, so a re-delivered chunk rendered as duplicated text.
 //
 // These tests drive the REAL controller through its real event entry point.
+
+// This file is exercising the delta REDUCER, not the shared flush scheduler
+// (transcript-flush-scheduler.test.mjs and session-stream.test.mjs own that),
+// so renders fire synchronously and every assertion reads state right after
+// delivering an event rather than stepping a fake clock.
+function createSyncTranscriptFlushScheduler(render) {
+  return {
+    queue: render,
+    note() {},
+    flushNow: render,
+    cancel() {},
+    stats: () => ({ renderCount: 0, windowMs: 100, pending: false, pendingChars: 0 }),
+  };
+}
 
 function harness({ threadId = "thread-1", itemId = "item-1", text = "Hello world" } = {}) {
   const entry = {
@@ -44,22 +59,37 @@ function harness({ threadId = "thread-1", itemId = "item-1", text = "Hello world
   };
   const rendered = [];
   const hydrationCalls = [];
-  const controller = createStreamController({
+  const renderSession = (session) => rendered.push(session);
+  // Late-bound: the scheduler is constructed before the controller it flushes
+  // through exists (same seam as session-controller.js's real render callback).
+  let controller;
+  const transcriptFlushScheduler = createSyncTranscriptFlushScheduler(() => {
+    // The window-loaded delta path only bumps transcript_revision; this is
+    // what derives the rendered array from the window (once per flush,
+    // synchronous here so assertions can read state right after delivering).
+    // Mirrors session-controller.js's ctx.renderSession wrapper, which
+    // settles state.session in place before rendering.
+    if (state.session) {
+      settleTranscriptProjection(state);
+      renderSession(state.session);
+    }
+  });
+  controller = createStreamController({
     state,
     ensureConversationTranscript: (session) => {
       hydrationCalls.push(session);
     },
     logLine: () => {},
     seedDefaults: () => {},
-    renderSession: (session) => rendered.push(session),
+    renderSession,
     handleUnauthorized: () => {},
     applySessionSnapshot: () => {},
     cancelSessionPoll: () => {},
     cancelStreamReconnect: () => {},
     scheduleSessionPoll: () => {},
     scheduleStreamReconnect: () => {},
-    // Render synchronously so assertions do not race an animation frame.
-    scheduleRenderFrame: (callback) => callback(),
+    // Render synchronously so assertions do not race the scheduler's window.
+    transcriptFlushScheduler,
   });
   const deliver = (event) =>
     controller.applySessionStreamEvent("transcript_entry_delta", {
@@ -315,19 +345,24 @@ function orchHarness({ orchThreadId = "orch-1", entries = null } = {}) {
     ],
   };
   const rendered = [];
+  const renderSession = (session) => rendered.push(session);
   const controller = createStreamController({
     state,
     ensureConversationTranscript: () => {},
     logLine: () => {},
     seedDefaults: () => {},
-    renderSession: (session) => rendered.push(session),
+    renderSession,
     handleUnauthorized: () => {},
     applySessionSnapshot: () => {},
     cancelSessionPoll: () => {},
     cancelStreamReconnect: () => {},
     scheduleSessionPoll: () => {},
     scheduleStreamReconnect: () => {},
-    scheduleRenderFrame: (callback) => callback(),
+    transcriptFlushScheduler: createSyncTranscriptFlushScheduler(() => {
+      if (state.session) {
+        renderSession(state.session);
+      }
+    }),
   });
   const deliver = (event) =>
     controller.applySessionStreamEvent("transcript_entry_delta", {

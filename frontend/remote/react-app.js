@@ -2051,42 +2051,66 @@ function RemoteApp() {
 
   // Opening an individual file section calls this to pull omitted diff bodies.
   // Idempotent: skips when full detail is cached/live or a fetch is in flight.
-  async function ensureFileChangeDetail(itemId) {
-    if (!itemId || !session?.active_thread_id) {
-      return;
-    }
-    const threadId = session.active_thread_id;
-    // Skip only when we already hold the FULL detail — a stripped summary parked
-    // in the live store (running turnDiff) must not block the fetch.
-    const cached = getCachedTranscriptEntryDetail(currentState, threadId, itemId);
-    const live = getLiveTranscriptEntryDetail(currentState, threadId, itemId);
-    const hasFullDetail =
-      (cached && !isOmittedFileChangeDetail(cached))
-      || (live && !isOmittedFileChangeDetail(live));
-    if (hasFullDetail || transcriptUiState.transcriptLoadingItemIds.has(itemId)) {
-      return;
-    }
-
-    dispatchTranscriptUi({ type: "transcript/startLoadingDetail", itemId });
-    try {
-      const detail = await fetchRemoteTranscriptEntryDetail(threadId, itemId);
-      if (!detail || session?.active_thread_id !== threadId) {
+  //
+  // Hoisted via useCallback rather than a fresh function every render: this
+  // flows into transcriptOptions (RemoteTranscriptPanel), where a fresh
+  // reference every render defeated stableTranscriptOptions no matter how
+  // stable every other field was. Depends on session?.active_thread_id, not
+  // `session` itself, so a routine transcript delta (which replaces `session`
+  // but not its active_thread_id) does not recreate this — the async
+  // continuation's `session?.active_thread_id !== threadId` re-check below
+  // still reads the CURRENT value correctly, because a real thread switch is
+  // exactly the case that invalidates this dependency and recreates the
+  // callback.
+  const ensureFileChangeDetail = useCallback(
+    async (itemId) => {
+      if (!itemId || !session?.active_thread_id) {
         return;
       }
-      const { cached } = cacheTranscriptEntryDetail(currentState, threadId, detail);
-      if (!cached) {
-        setLiveTranscriptEntryDetail(currentState, threadId, detail);
+      const threadId = session.active_thread_id;
+      // Skip only when we already hold the FULL detail — a stripped summary parked
+      // in the live store (running turnDiff) must not block the fetch.
+      const cached = getCachedTranscriptEntryDetail(currentState, threadId, itemId);
+      const live = getLiveTranscriptEntryDetail(currentState, threadId, itemId);
+      const hasFullDetail =
+        (cached && !isOmittedFileChangeDetail(cached))
+        || (live && !isOmittedFileChangeDetail(live));
+      if (hasFullDetail || transcriptUiState.transcriptLoadingItemIds.has(itemId)) {
+        return;
       }
-    } catch (error) {
-      // The shared renderer fires this without awaiting, so swallow the
-      // rejection here to avoid an unhandled promise rejection; the entry stays
-      // on its "Loading diff…" summary until a new load edge (such as remounting
-      // the entry) tries again.
-      console.warn(`[file-change] diff load failed for ${itemId}:`, error);
-    } finally {
-      dispatchTranscriptUi({ type: "transcript/finishLoadingDetail", itemId });
-    }
-  }
+
+      dispatchTranscriptUi({ type: "transcript/startLoadingDetail", itemId });
+      try {
+        const detail = await fetchRemoteTranscriptEntryDetail(threadId, itemId);
+        if (!detail || session?.active_thread_id !== threadId) {
+          return;
+        }
+        const { cached } = cacheTranscriptEntryDetail(currentState, threadId, detail);
+        if (!cached) {
+          setLiveTranscriptEntryDetail(currentState, threadId, detail);
+        }
+      } catch (error) {
+        // The shared renderer fires this without awaiting, so swallow the
+        // rejection here to avoid an unhandled promise rejection; the entry stays
+        // on its "Loading diff…" summary until a new load edge (such as remounting
+        // the entry) tries again.
+        console.warn(`[file-change] diff load failed for ${itemId}:`, error);
+      } finally {
+        dispatchTranscriptUi({ type: "transcript/finishLoadingDetail", itemId });
+      }
+    },
+    [session?.active_thread_id, currentState, transcriptUiState.transcriptLoadingItemIds, dispatchTranscriptUi]
+  );
+
+  // Same identity-stability reason as ensureFileChangeDetail above, and the
+  // same fix already established for the reviewer actions bundle nearby
+  // (handlersRef + useMemo([])): `handlers` itself is rebuilt every render
+  // (createRemoteAppHandlers() above), so reading the latest through a ref
+  // inside a permanently-stable callback is what keeps this out of
+  // transcriptOptions's way instead of merely moving the instability here.
+  const handleSubmitAskUserAnswers = useCallback((requestId, answers) => {
+    void handlersRef.current.onSubmitAskUserAnswers?.(requestId, answers);
+  }, []);
 
   function handleExpandableBlockToggle(expandKey) {
     if (!expandKey) {
@@ -2333,9 +2357,7 @@ function RemoteApp() {
           onSubmitDecision(decision, scope) {
             void handlers.onSubmitDecision(decision, scope);
           },
-          onSubmitAskUserAnswers(requestId, answers) {
-            void handlers.onSubmitAskUserAnswers?.(requestId, answers);
-          },
+          onSubmitAskUserAnswers: handleSubmitAskUserAnswers,
           onApplyFileChange(itemId, direction) {
             void handlers.onApplyFileChange?.(itemId, direction);
           },
@@ -3251,7 +3273,65 @@ function RemoteThreadPanel({
   );
 }
 
-function RemoteTranscriptPanel({
+// transcriptOptions carries a few collection fields (transcriptDetailEntries
+// is rebuilt as a fresh Map by buildExpandedTranscriptDetailEntries on every
+// render regardless of content, and the askUserDetail*/askUserErrors
+// fallbacks allocate a fresh empty Map/Set) that would defeat a plain
+// useMemo — its dependency check is Object.is per entry, which a freshly
+// allocated collection always fails even when empty/identical. Compared by
+// value for the collection shapes transcriptOptions actually carries;
+// everything else compares by reference.
+export function transcriptOptionValueEqual(a, b) {
+  if (Object.is(a, b)) {
+    return true;
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
+  }
+  if (a instanceof Set && b instanceof Set) {
+    if (a.size !== b.size) {
+      return false;
+    }
+    for (const value of a) {
+      if (!b.has(value)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (a instanceof Map && b instanceof Map) {
+    if (a.size !== b.size) {
+      return false;
+    }
+    for (const [key, value] of a) {
+      if (!b.has(key) || !Object.is(b.get(key), value)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+// Reuses the PREVIOUS transcriptOptions object when every field is equal to
+// this render's, so React.memo on each transcript entry actually short-
+// circuits on a render tick that didn't touch anything it reads, instead of
+// re-rendering the whole transcript because the options object is a fresh
+// literal every time.
+export function stableTranscriptOptions(previous, next) {
+  if (previous) {
+    const nextKeys = Object.keys(next);
+    if (
+      nextKeys.length === Object.keys(previous).length
+      && nextKeys.every((key) => transcriptOptionValueEqual(previous[key], next[key]))
+    ) {
+      return previous;
+    }
+  }
+  return next;
+}
+
+export function RemoteTranscriptPanel({
   currentState,
   emptyStateModel,
   onApplyFileChange,
@@ -3272,6 +3352,7 @@ function RemoteTranscriptPanel({
 }) {
   const relayNicknames = useRelayNicknames();
   const transcriptRef = useRef(null);
+  const transcriptOptionsRef = useRef(null);
 
   const approval = sessionView?.approval || null;
   const entries = session?.transcript || [];
@@ -3281,6 +3362,47 @@ function RemoteTranscriptPanel({
       && currentState.transcriptHydrationThreadId === session.active_thread_id
       && currentState.transcriptHydrationStatus === "loading"
   );
+
+  // Hoisted via useCallback rather than defined inline below: an inline
+  // arrow is a fresh function every render, which would fail
+  // transcriptOptionValueEqual's Object.is check on this one field and
+  // defeat stableTranscriptOptions no matter how stable everything else is.
+  const handleSubmitAskUserAnswers = useCallback(
+    (requestId, answers) => {
+      void onSubmitAskUserAnswers?.(requestId, answers);
+    },
+    [onSubmitAskUserAnswers]
+  );
+
+  transcriptOptionsRef.current = stableTranscriptOptions(transcriptOptionsRef.current, {
+    currentCwd: session?.current_cwd || "",
+    detailEntries: transcriptDetailEntries,
+    // sessionView is deliberately null for the no-session/relay-home/
+    // server-disconnected empty states (see the `sessionView = session ?
+    // ... : null` construction above) — this object is built unconditionally
+    // on every render now, including those, so this must be null-safe. See
+    // remote-transcript-panel-empty-states.test.mjs.
+    enableFileChangeActions: Boolean(sessionView?.canWrite),
+    expandedItemIds: uiState.transcriptExpandedItemIds,
+    expandedKeys: uiState.transcriptExpandedItemIds,
+    loadingItemIds: uiState.transcriptLoadingItemIds,
+    // The per-message fork button is the ONLY fork entry that works on
+    // iOS: thread-row contextmenu never fires for touch long-press.
+    canFork: canForkInSession(session),
+    // Stamps each agent message with the mark of whoever wrote it.
+    provider: session?.provider || "",
+    onEnsureFileChangeDetail,
+    pendingAskUserQuestions,
+    onSubmitAskUserAnswers: handleSubmitAskUserAnswers,
+    askUserSubmittingRequestId: uiState.askUserSubmittingRequestId || "",
+    askUserErrors: uiState.askUserErrors instanceof Map ? uiState.askUserErrors : new Map(),
+    askUserDetailErrors: askUserDetailErrors instanceof Map ? askUserDetailErrors : new Map(),
+    askUserDetailLoadingRequestIds:
+      askUserDetailLoadingRequestIds instanceof Set
+        ? askUserDetailLoadingRequestIds
+        : new Set(),
+  });
+  const transcriptOptions = transcriptOptionsRef.current;
 
   useRemoteTranscriptScrollBookkeeping({
     currentState,
@@ -3329,31 +3451,7 @@ function RemoteTranscriptPanel({
         shortId,
         waitingCopy: "This session is already open, but another device currently has control. You can still approve or decline requests here; take over only if you want to send messages from this device.",
       },
-      transcriptOptions: {
-        currentCwd: session?.current_cwd || "",
-        detailEntries: transcriptDetailEntries,
-        enableFileChangeActions: sessionView.canWrite,
-        expandedItemIds: uiState.transcriptExpandedItemIds,
-        expandedKeys: uiState.transcriptExpandedItemIds,
-        loadingItemIds: uiState.transcriptLoadingItemIds,
-        // The per-message fork button is the ONLY fork entry that works on
-        // iOS: thread-row contextmenu never fires for touch long-press.
-        canFork: canForkInSession(session),
-        // Stamps each agent message with the mark of whoever wrote it.
-        provider: session?.provider || "",
-        onEnsureFileChangeDetail,
-        pendingAskUserQuestions,
-        onSubmitAskUserAnswers: (requestId, answers) => {
-          void onSubmitAskUserAnswers?.(requestId, answers);
-        },
-        askUserSubmittingRequestId: uiState.askUserSubmittingRequestId || "",
-        askUserErrors: uiState.askUserErrors instanceof Map ? uiState.askUserErrors : new Map(),
-        askUserDetailErrors: askUserDetailErrors instanceof Map ? askUserDetailErrors : new Map(),
-        askUserDetailLoadingRequestIds:
-          askUserDetailLoadingRequestIds instanceof Set
-            ? askUserDetailLoadingRequestIds
-            : new Set(),
-      },
+      transcriptOptions,
       // The same dispatcher the local surface uses. This chain had drifted from
       // that one in ways nobody chose: it alone handled a bare `data-expand-key`
       // summary, and it alone called preventDefault. Both are preserved here —

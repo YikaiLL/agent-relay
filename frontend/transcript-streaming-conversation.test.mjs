@@ -22,7 +22,9 @@ import { hydrateTranscript } from "./shared/transcript-hydration.js";
 import {
   buildHydratedTranscriptProgress,
   createClearedTranscriptHydrationPatch,
+  createClearedTranscriptHydrationPromisePatch,
   createMergedTranscriptHydrationPagePatch,
+  createOwnedTranscriptHydrationIdlePatch,
   createTranscriptHydrationCompletePatch,
   prepareTranscriptHydrationState,
   createTranscriptHydrationRevisionPatch,
@@ -46,12 +48,13 @@ function makeStore() {
       state.transcriptHydrationPromise = promise;
     },
     clearTranscriptHydrationPromise(state, promise) {
-      if (state.transcriptHydrationPromise === promise) {
-        state.transcriptHydrationPromise = null;
-      }
+      Object.assign(
+        state,
+        createClearedTranscriptHydrationPromisePatch(state, promise) || {}
+      );
     },
-    setTranscriptHydrationIdle(state) {
-      state.transcriptHydrationStatus = "idle";
+    setTranscriptHydrationIdle(state, promise) {
+      Object.assign(state, createOwnedTranscriptHydrationIdlePatch(state, promise) || {});
     },
     // Forwarding the revision matters: it is what gates the once-per-revision
     // re-arm, so a stub that drops it models a client that re-fetches forever.

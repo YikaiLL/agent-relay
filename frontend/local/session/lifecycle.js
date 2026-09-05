@@ -53,11 +53,180 @@ import {
 import {
   clearTranscriptHydration,
   restoreHydratedTranscript,
+  settleTranscriptProjection,
   switchTranscriptHydrationThread,
 } from "../transcript/store.js";
 import { threadAttention } from "../../shared/thread-attention.js";
 import { isDocumentForeground, notifyThreadEvents } from "../../shared/thread-notify.js";
 import { imageFileToDataUrl } from "../image-attachments.js";
+
+function requestIdSet(list) {
+  return new Set(
+    (Array.isArray(list) ? list : [])
+      .map((entry) => entry?.request_id)
+      .filter(Boolean)
+  );
+}
+
+function idSetsDiffer(a, b) {
+  if (a.size !== b.size) {
+    return true;
+  }
+  for (const value of a) {
+    if (!b.has(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The only session-level error-shaped field (a vanished cwd). There is no
+// other session-level "last error" — a turn FAILING is signaled per-entry
+// (below), the same way a turn completing is signaled by active_turn_id /
+// current_status going idle.
+function workspaceMissingSignature(session) {
+  const missing = session?.workspace_missing;
+  return missing ? missing.recorded_cwd || "missing" : null;
+}
+
+// Mirrors the terminal-but-not-successful statuses transcript-hydration-store.js
+// treats as terminal (its TERMINAL_ENTRY_STATUSES also includes "completed" /
+// "complete", which are not error signals and are covered by the turn-state
+// comparison instead). An error entry rides an ordinary snapshot with no
+// dedicated event of its own, so this is the only way one is ever seen here.
+const ERROR_ENTRY_STATUSES = new Set(["failed", "error", "cancelled"]);
+
+function errorEntryIdSet(session) {
+  const transcript = Array.isArray(session?.transcript) ? session.transcript : [];
+  const ids = new Set();
+  for (const entry of transcript) {
+    if (entry?.item_id && ERROR_ENTRY_STATUSES.has(entry.status)) {
+      ids.add(entry.item_id);
+    }
+  }
+  return ids;
+}
+
+// Guards a snapshot against regressing already-visible text — independent of
+// the hydration window, unlike restoreHydratedTranscript (which is a no-op
+// returning the snapshot verbatim whenever the window has never loaded for
+// this thread; see .sealwire/PLAN.md, "Traps"). Deltas legitimately arrive
+// before the first hydration fetch resolves, so state.session can already
+// hold longer text than a compacted snapshot for the same entry — mirrors
+// remote's preserveVisibleTranscriptText (session-ops.js).
+function isFullSnapshotEntry(entry) {
+  const state = entry?.content_state;
+  return state !== "preview" && state !== "omitted";
+}
+
+function selectVisibleSnapshotEntry(current, incoming) {
+  const currentText = current?.text;
+  const incomingText = incoming?.text;
+  // Take the incoming entry as-is when it is authoritative, or when we have no
+  // full text of our own to protect.
+  if (
+    isFullSnapshotEntry(incoming)
+    || typeof currentText !== "string"
+    || !isFullSnapshotEntry(current)
+  ) {
+    return incoming;
+  }
+  // Omitted: the incoming shell text is meaningless, so keep our visible body —
+  // but DO NOT promote content_state to full; the snapshot still says
+  // "omitted", so the hydration store re-fetches the authoritative body.
+  if (incoming?.content_state === "omitted") {
+    return {
+      ...incoming,
+      text: currentText,
+    };
+  }
+  // Preview: keep our visible body only if it is at least as long (more
+  // complete); otherwise the grown preview is fresher. Either way the incoming
+  // content_state (preview) is preserved so hydration still settles the entry.
+  if (currentText.length >= incomingText.length) {
+    return {
+      ...incoming,
+      text: currentText,
+    };
+  }
+  return incoming;
+}
+
+function preserveVisibleTranscriptText(currentSession, snapshot) {
+  if (
+    !currentSession?.active_thread_id
+    || !snapshot?.active_thread_id
+    || currentSession.active_thread_id !== snapshot.active_thread_id
+    || !Array.isArray(currentSession.transcript)
+    || !Array.isArray(snapshot.transcript)
+  ) {
+    return snapshot;
+  }
+
+  const currentByItemId = new Map(
+    currentSession.transcript
+      .filter((entry) => entry?.item_id)
+      .map((entry) => [entry.item_id, entry])
+  );
+  let changed = false;
+  const transcript = snapshot.transcript.map((entry) => {
+    const current = currentByItemId.get(entry?.item_id);
+    const resolved = selectVisibleSnapshotEntry(current, entry);
+    if (resolved === entry) {
+      return entry;
+    }
+    changed = true;
+    return resolved;
+  });
+
+  return changed
+    ? {
+      ...snapshot,
+      transcript,
+    }
+    : snapshot;
+}
+
+/**
+ * Whether a just-applied snapshot needs to paint immediately rather than
+ * coalesce with pending delta text: an approval/AskUserQuestion added or
+ * resolved, a turn starting/ending (locally the only way a turn's completion
+ * reaches this surface at all), a transcript entry failing, the workspace
+ * going missing, or a thread switch. `prev` null (first paint) is always
+ * interactive.
+ */
+export function snapshotIsInteractive(prev, next) {
+  if (!prev) {
+    return true;
+  }
+  if (prev.active_thread_id !== next?.active_thread_id) {
+    return true;
+  }
+  if ((prev.active_turn_id || null) !== (next?.active_turn_id || null)) {
+    return true;
+  }
+  if ((prev.current_status || null) !== (next?.current_status || null)) {
+    return true;
+  }
+  if (workspaceMissingSignature(prev) !== workspaceMissingSignature(next)) {
+    return true;
+  }
+  if (idSetsDiffer(requestIdSet(prev.pending_approvals), requestIdSet(next?.pending_approvals))) {
+    return true;
+  }
+  if (
+    idSetsDiffer(
+      requestIdSet(prev.pending_ask_user_questions),
+      requestIdSet(next?.pending_ask_user_questions)
+    )
+  ) {
+    return true;
+  }
+  if (idSetsDiffer(errorEntryIdSet(prev), errorEntryIdSet(next))) {
+    return true;
+  }
+  return false;
+}
 
 export function createLifecycleController(ctx) {
   const {
@@ -79,6 +248,7 @@ export function createLifecycleController(ctx) {
     setStartControlsBusy,
     liveElement,
     isViewingConversation,
+    transcriptFlushScheduler,
   } = ctx;
   // A ctx seam, not a store import, so the controller stays testable.
   const readSessionDraft = () => ctx.readSessionDraft?.() || {};
@@ -840,6 +1010,17 @@ export function createLifecycleController(ctx) {
       snapshot = withRenderedTranscriptEntriesKept(snapshot);
     }
     if (snapshot?.active_thread_id !== state.transcriptHydrationThreadId) {
+      // Settle BEFORE switching the window away: settleTranscriptProjection
+      // keys off state.session.active_thread_id (still the OUTGOING thread
+      // here) and the CURRENT window, so it must run while both still
+      // describe that thread. switchTranscriptHydrationThread below repoints
+      // the window at the incoming thread; settling after that would have
+      // the outgoing thread's pending delta fail transcriptWindowIsLoaded
+      // against the new thread's window, clear the pending flag as a side
+      // effect, and never rebuild the array — dropping the outgoing thread's
+      // latest streamed text from the very session the stash below freezes
+      // into a view-only pin.
+      settleTranscriptProjection(state);
       // Thread switch: retain the leaving thread's loaded window and restore the
       // target thread's retained window (if any) instead of clearing — so
       // switching away and back keeps the older history already scrolled into
@@ -897,8 +1078,47 @@ export function createLifecycleController(ctx) {
     syncLiveTranscriptEntryDetailsFromSnapshot(state, snapshot);
     // Stashed raw (pre-merge) for hydration to read — see selectHydrationSnapshot.
     state.rawSessionSnapshot = snapshot;
-    const merged = restoreHydratedTranscript(state, snapshot);
-    renderSession(merged);
+    // restoreHydratedTranscript overlays this snapshot's tail onto the window
+    // WITHOUT writing the overlay back into the window itself (it deliberately
+    // avoids an O(n) copy on every snapshot) — so `merged` below can be fresher
+    // than state.transcriptHydrationEntries/order. Settle any pending delta
+    // projection FIRST: otherwise it stays pending, and a later flush rebuilds
+    // straight from the (older) window, silently reverting the snapshot-only
+    // entries and status updates `merged` is about to introduce.
+    settleTranscriptProjection(state);
+    // Unconditional, not window-conditional (see preserveVisibleTranscriptText's
+    // own doc above): restoreHydratedTranscript alone leaves an unhydrated
+    // window's snapshot free to overwrite longer text already streamed into
+    // state.session.
+    const preservedSnapshot = preserveVisibleTranscriptText(state.session, snapshot);
+    const merged = restoreHydratedTranscript(state, preservedSnapshot);
+    // Approval/AskUserQuestion/turn-state changes paint at once — locally a
+    // snapshot is the only way a turn's completion reaches this surface at
+    // all. An ordinary mid-stream snapshot coalesces with pending delta text
+    // through the same scheduler slot stream.js queues onto, which is what
+    // stops the double render a synchronous renderSession(merged) used to
+    // cause when it landed between a delta's state write and its pending
+    // frame.
+    const interactive = snapshotIsInteractive(state.session, merged);
+    if (state.session && state.session.active_thread_id !== merged?.active_thread_id) {
+      // app.js's renderSession wrap freezes the thread the user is viewing
+      // into a view-only pin when the ACTIVE thread switches out from under
+      // it, using the live session as it was a moment ago — it used to
+      // recover that by reading state.session before ITS OWN write reached
+      // it. That stopped being possible once state.session had to advance
+      // synchronously here too (queue() below defers only the PAINT, never
+      // the write), so stash it explicitly. Always a thread switch when this
+      // differs, so snapshotIsInteractive above already chose flushNow — the
+      // render (this stash's only consumer) happens synchronously, before
+      // anything else can run.
+      state.previousLiveSessionForPin = state.session;
+    }
+    state.session = merged;
+    if (interactive) {
+      transcriptFlushScheduler.flushNow("snapshot");
+    } else {
+      transcriptFlushScheduler.queue("snapshot");
+    }
   }
 
   /// `snapshot` with the rendered tail it does not carry appended back onto it.
