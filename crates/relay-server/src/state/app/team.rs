@@ -2197,13 +2197,16 @@ over on resume"
         let sent_turn_id: Option<String>;
         {
             let _gate = self.team_drive_gate.lock().await;
-            // Repeated under the gate: a stop can land in the awaits between the
-            // early check above and here. `request_stop` mutates its flags under
-            // this same gate, and `team_turn_preflight` below does NOT catch a
-            // graceful/draining stop by itself because it leaves the run
-            // `PausePending`, which is neither terminal nor settled-without-driver.
-            // Once we hold the gate a concurrent stop either already completed
-            // its gated mutation (so this sees it) or is queued behind us.
+            // Repeated under the gate: a stop/pause mutation can land in the
+            // awaits between the early check above and here. User Stop reaches
+            // `request_stop` through this same gate, but driver-side
+            // `TeamPort::update_run` callers can mutate the same flags under
+            // only the relay write lock. `team_turn_preflight` below does NOT
+            // catch a graceful/draining stop by itself because it leaves the run
+            // `PausePending`, which is neither terminal nor
+            // settled-without-driver. Once we hold the drive gate and repeat
+            // the relay-lock refusal, we have the last coherent status boundary
+            // before dispatch.
             if let Some(reason) = self.reviewer_turn_refusal(run_id, slot).await {
                 return TeamTurnOutcome::Failed(reason);
             }

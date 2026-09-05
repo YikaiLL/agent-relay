@@ -3178,11 +3178,13 @@ impl relay_api::TeamDriver for RaceWindowDriver {
 
 /// [P1 fix] The early reviewer-gate check (before any thread is resolved) is
 /// NOT sufficient by itself: `team_turn` still has to resolve the thread and
-/// reach `team_drive_gate` before it can dispatch — and a stop's `request_stop`
-/// sets its flags without ever taking that gate, so it can land in exactly that
-/// window. This pins that the gate is REPEATED once `team_drive_gate` is held,
-/// using the pre-side-effect latch (`hold_team_turn_barrier`) to land the stop
-/// deterministically rather than racing real wall-clock timing.
+/// reach `team_drive_gate` before it can dispatch. A user Stop reaches
+/// `request_stop` through that same drive gate, but a driver-side
+/// `TeamPort::update_run` can set the same flags while holding only the relay
+/// write lock, so it can land in exactly that window. This pins that the
+/// refusal is REPEATED once `team_drive_gate` is held, using the pre-side-effect
+/// latch (`hold_team_turn_barrier`) to land the stop deterministically rather
+/// than racing real wall-clock timing.
 #[tokio::test]
 async fn a_stop_landing_between_the_reviewer_gates_early_check_and_the_drive_gate_is_still_caught()
 {
@@ -3559,10 +3561,10 @@ async fn a_stop_settling_after_phase_stamp_before_drive_gate_must_not_dispatch()
 ///
 /// The fix folds decide-and-commit into ONE write-lock hold, so nothing can
 /// land between them. This proves it directly: park the refusal on a latch
-/// AFTER it has decided but BEFORE it commits — still holding the write lock
-/// `request_stop` also needs — and show a concurrent stop cannot even start
-/// until the refusal releases it, so it can only ever observe an already-
-/// consistent outcome, never corrupt one mid-flight.
+/// AFTER it has decided but BEFORE it commits — still holding the write lock a
+/// driver-side `TeamPort::update_run` needs to call `request_stop` — and show
+/// that update cannot even start until the refusal releases it, so it can only
+/// ever observe an already-consistent outcome, never corrupt one mid-flight.
 #[tokio::test]
 async fn a_stop_racing_the_atomic_refusal_cannot_land_between_its_decision_and_its_commit() {
     let (_repo, root) = init_team_repo().await;
@@ -3591,8 +3593,8 @@ async fn a_stop_racing_the_atomic_refusal_cannot_land_between_its_decision_and_i
     let run_id = app.start_team_run(team_input(&root)).await.expect("start");
 
     // The refusal has now decided (fresh flags: nothing pausing, landed == 0)
-    // and is parked on our latch — still holding the SAME write lock a stop
-    // needs for its very first step, `request_stop`.
+    // and is parked on our latch — still holding the SAME write lock this test's
+    // driver-side `request_stop` update needs.
     for _ in 0..2_000 {
         if app.reviewer_refusal_arrivals() > before {
             break;
@@ -3617,8 +3619,8 @@ async fn a_stop_racing_the_atomic_refusal_cannot_land_between_its_decision_and_i
     sleep(Duration::from_millis(50)).await;
     assert!(
         !stop_task.is_finished(),
-        "a stop cannot complete while the refusal it raced still holds the \
-write lock its own first step (`request_stop`) requires"
+        "a driver-side stop update cannot complete while the refusal it raced \
+still holds the write lock its `request_stop` mutation requires"
     );
 
     drop(latch);
