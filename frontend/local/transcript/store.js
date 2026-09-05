@@ -173,13 +173,12 @@ export function __recordTranscriptFullRebuild() {
 /// slot, so the default `sessionKeys` (`["session"]`) apply throughout.
 export { markTranscriptWindowProjectionPending, adoptSettledTranscript };
 
-/// Settle onto state.session, recording the rebuild on THIS module's counter
-/// (transcriptFullRebuildCount) — see transcript-projection.js for the
-/// shared settle algorithm itself.
+/// Settle onto state.session, recording each actual rebuild on THIS module's
+/// counter (transcriptFullRebuildCount) via transcript-projection.js's
+/// onRebuild callback — see that module for the shared settle algorithm
+/// itself. Local has only one session slot, so this can only ever fire 0 or
+/// 1 times per call; driven through the callback anyway so both surfaces
+/// count the same way.
 export function settleTranscriptProjection(state) {
-  const changed = settlePendingTranscriptProjection(state);
-  if (changed) {
-    __recordTranscriptFullRebuild();
-  }
-  return changed;
+  return settlePendingTranscriptProjection(state, ["session"], __recordTranscriptFullRebuild);
 }

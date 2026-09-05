@@ -63,6 +63,58 @@ test("settleTranscriptProjection rebuilds once and keeps two aliased session slo
   assert.equal(state.session.transcript[0].text, "hello world");
 });
 
+test("settleTranscriptProjection's onRebuild fires exactly once for two aliased session slots", () => {
+  const state = loadedWindowState("thread-1", [
+    { item_id: "a", text: "hello world", status: "running" },
+  ]);
+  const shared = {
+    active_thread_id: "thread-1",
+    transcript: [{ item_id: "a", text: "hello", status: "running" }],
+  };
+  state.realSession = shared;
+  state.session = shared;
+  markTranscriptWindowProjectionPending(state);
+
+  let rebuildCount = 0;
+  settleTranscriptProjection(state, ["realSession", "session"], () => {
+    rebuildCount += 1;
+  });
+
+  assert.equal(rebuildCount, 1, "one object, one actual rebuild, regardless of how many slots point at it");
+});
+
+// P1 regression (.sealwire/PLAN.md, "The criterion-3 proof is currently
+// unsound"): a caller's own rebuild counter (remote's
+// transcriptDeltaRebuildCount) must be driven by onRebuild firing per actual
+// rebuild, not by "did this settle() call change anything" — two DIFFERENT
+// session objects that both happen to match the window's thread is exactly
+// the case a once-per-call counter cannot tell apart from the aliased case
+// above, and would silently under-report by half.
+test("settleTranscriptProjection's onRebuild fires once per DISTINCT session object rebuilt, not once per call", () => {
+  const state = loadedWindowState("thread-1", [
+    { item_id: "a", text: "hello world", status: "running" },
+  ]);
+  state.realSession = {
+    active_thread_id: "thread-1",
+    transcript: [{ item_id: "a", text: "hello", status: "running" }],
+  };
+  // A second, genuinely different object for the SAME thread — not the
+  // aliasing case above, and not the pinned-different-thread case below.
+  state.session = {
+    active_thread_id: "thread-1",
+    transcript: [{ item_id: "a", text: "hello", status: "running" }],
+  };
+  markTranscriptWindowProjectionPending(state);
+
+  let rebuildCount = 0;
+  const changed = settleTranscriptProjection(state, ["realSession", "session"], () => {
+    rebuildCount += 1;
+  });
+
+  assert.equal(changed, true);
+  assert.equal(rebuildCount, 2, "two distinct objects were rebuilt — the counter must reflect both, not one");
+});
+
 // A background thread pinned view-only: state.realSession (the live thread)
 // and state.session (the pinned projection) are genuinely different threads.
 // Only the slot(s) matching the window's own thread may be rebuilt.

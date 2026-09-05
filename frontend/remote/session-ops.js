@@ -177,6 +177,14 @@ export function flushRemoteTranscriptRenderForTest() {
 // (applyArrayTranscriptDeltaAppend) alike, so it stays one counter across both
 // full-rebuild sites, the same shape as transcriptFullWindowCopyCount
 // (frontend/shared/transcript-hydration-store.js).
+//
+// Driven by transcript-projection.js's onRebuild callback, NOT by whether
+// this settle call changed anything: a pinned background thread gives this
+// surface two genuinely different session slots (state.realSession,
+// state.session), and one settle can rebuild BOTH. Incrementing once per
+// call (rather than once per actual renderedTranscriptFromWindow invocation)
+// would silently under-count by half in exactly that case — see
+// .sealwire/PLAN.md, "The criterion-3 proof is currently unsound".
 let transcriptDeltaRebuildCount = 0;
 
 export function __readTranscriptDeltaRebuildCount() {
@@ -193,14 +201,12 @@ export function __resetTranscriptDeltaRebuildCount() {
 // which case it is a re-projection). The shared settle already handles
 // aliasing (rebuilds once, keeps both slots pointing at the same object) and
 // checking each slot's own active_thread_id against the window's — this just
-// supplies which slots to check and records the rebuild on this module's own
-// counter.
+// supplies which slots to check and records each actual rebuild on this
+// module's own counter.
 function settleTranscriptProjection() {
-  const changed = settlePendingTranscriptProjection(state, ["realSession", "session"]);
-  if (changed) {
+  return settlePendingTranscriptProjection(state, ["realSession", "session"], () => {
     transcriptDeltaRebuildCount += 1;
-  }
-  return changed;
+  });
 }
 
 function invalidateViewOnlyNavigation() {

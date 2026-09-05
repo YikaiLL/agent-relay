@@ -51,10 +51,20 @@ export function markTranscriptWindowProjectionPending(state) {
 /// currently holds. See .sealwire/PLAN.md, "Discarding the session must
 /// discard pending derived state".
 ///
+/// `onRebuild`, if given, fires once per DISTINCT session object actually
+/// rebuilt this call — never once per call regardless of how many slots
+/// changed. A caller's own rebuild counter (remote's
+/// transcriptDeltaRebuildCount, local's transcriptFullRebuildCount) must be
+/// driven by this, not by this function's boolean return: a pinned
+/// background thread gives remote two genuinely different session slots, and
+/// one settle can rebuild BOTH — counting "once per settle call" instead of
+/// "once per rebuild" silently under-reports by half exactly there. See
+/// .sealwire/PLAN.md, "The criterion-3 proof is currently unsound".
+///
 /// Returns whether it materialised anything, so a caller holding a
 /// session-shaped copy (spread from a session before this ran) knows whether
 /// it needs to fold the freshly-settled transcript back in (adoptSettledTranscript).
-export function settleTranscriptProjection(state, sessionKeys = ["session"]) {
+export function settleTranscriptProjection(state, sessionKeys = ["session"], onRebuild) {
   if (!state?.transcriptWindowProjectionPending) {
     return false;
   }
@@ -76,6 +86,7 @@ export function settleTranscriptProjection(state, sessionKeys = ["session"]) {
         ...session,
         transcript: renderedTranscriptFromWindow(state, session),
       });
+      onRebuild?.();
     }
     state[key] = rebuiltByIdentity.get(session);
     changed = true;

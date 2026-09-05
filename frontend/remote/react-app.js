@@ -3331,7 +3331,7 @@ export function stableTranscriptOptions(previous, next) {
   return next;
 }
 
-function RemoteTranscriptPanel({
+export function RemoteTranscriptPanel({
   currentState,
   emptyStateModel,
   onApplyFileChange,
@@ -3377,7 +3377,12 @@ function RemoteTranscriptPanel({
   transcriptOptionsRef.current = stableTranscriptOptions(transcriptOptionsRef.current, {
     currentCwd: session?.current_cwd || "",
     detailEntries: transcriptDetailEntries,
-    enableFileChangeActions: sessionView.canWrite,
+    // sessionView is deliberately null for the no-session/relay-home/
+    // server-disconnected empty states (see the `sessionView = session ?
+    // ... : null` construction above) — this object is built unconditionally
+    // on every render now, including those, so this must be null-safe. See
+    // remote-transcript-panel-empty-states.test.mjs.
+    enableFileChangeActions: Boolean(sessionView?.canWrite),
     expandedItemIds: uiState.transcriptExpandedItemIds,
     expandedKeys: uiState.transcriptExpandedItemIds,
     loadingItemIds: uiState.transcriptLoadingItemIds,

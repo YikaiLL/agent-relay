@@ -32,7 +32,10 @@ const COLLAPSIBLE_CHAR_THRESHOLD = 900;
 const COLLAPSIBLE_LINE_THRESHOLD = 12;
 const INITIAL_DIFF_ROW_LIMIT = 400;
 const TRANSCRIPT_VIRTUALIZATION_THRESHOLD = 20;
-const TRANSCRIPT_VIRTUAL_OVERSCAN = 6;
+// Exported so the overscan requirement can be proven behaviorally against
+// the real @tanstack/virtual-core Virtualizer, not just asserted as a number
+// — see transcript-virtualizer-overscan.test.mjs.
+export const TRANSCRIPT_VIRTUAL_OVERSCAN = 6;
 const EMPTY_FORKABLE_IDS = new Set();
 
 function isCollapsible(value) {

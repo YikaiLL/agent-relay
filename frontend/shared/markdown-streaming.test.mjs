@@ -218,6 +218,54 @@ test("a run of blank lines before unrelated prose still swallows the WHOLE run i
   assert.equal(text.slice(offset), "More text, still typ");
 });
 
+// P1 regression: CommonMark's blank line is a line of nothing but SPACE/TAB.
+// A line of only U+00A0 (non-breaking space) is non-blank content — "alpha" /
+// NBSP-only-line / "omega" is one paragraph with soft breaks, same as if the
+// middle line were any other word. `line.trim()` strips NBSP along with every
+// other Unicode whitespace character, so `line.trim() === ""` misreads that
+// line as blank and offers a split there — this is the SAME class of bug as
+// the tab-indented-continuation and fence-closer fixes already in this file
+// (never use a JS whitespace built-in to decide a CommonMark question).
+test("a line containing only a non-breaking space is not a blank line (regression: trim() strips NBSP)", () => {
+  // No REAL blank line anywhere in this text, so a correct scan must refuse
+  // to split at all. A later real blank line would otherwise overwrite an
+  // erroneous NBSP-triggered boundary and hide the bug (see the next test),
+  // so this case isolates it.
+  const text = "alpha\n \nomega";
+  assert.equal(
+    findStreamingSplitOffset(text),
+    null,
+    "an NBSP-only line must not be treated as a blank-line boundary"
+  );
+});
+
+test("a line containing only a non-breaking space does not itself end a blank-line run — the split still lands on the REAL blank line after it", () => {
+  const text = "alpha\n \nomega\n\nreal next paragraph, safe to split before";
+  const offset = findStreamingSplitOffset(text);
+  assert.ok(offset != null, "a safe boundary must exist once the REAL blank line is behind us");
+  assert.equal(
+    text.slice(0, offset),
+    "alpha\n \nomega\n\n",
+    "the NBSP-only line must not itself be read as a paragraph boundary — the split must land after the real blank line, not before/after it"
+  );
+});
+
+test("streaming and completed renders agree: a line of only NBSP does not split the paragraph", () => {
+  const text = "alpha\n \nomega";
+  const completedMarkup = renderToStaticMarkup(
+    h(React.Fragment, null, renderMarkdown(text))
+  );
+  const streamingMarkup = renderStreaming(text);
+  const paragraphCount = (markup) => (markup.match(/<p[ >]/g) || []).length;
+
+  assert.equal(paragraphCount(completedMarkup), 1, "sanity: CommonMark reads this whole text as one paragraph");
+  assert.equal(
+    paragraphCount(streamingMarkup),
+    paragraphCount(completedMarkup),
+    "the streaming split must not fragment into two paragraphs what the completed render treats as one"
+  );
+});
+
 // -- Boundary rule: blockquotes -----------------------------------------------
 
 test("no split between two blockquote continuation lines", () => {

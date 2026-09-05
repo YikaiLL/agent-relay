@@ -228,6 +228,15 @@ function toggleFence(openFence, line) {
   return openFence;
 }
 
+// CommonMark: a blank line is a line containing nothing, or only space/tab —
+// NOT trim()'s full Unicode whitespace set, which also strips NBSP and every
+// other Unicode space character. A line of just NBSP is non-blank CONTENT
+// (e.g. "alpha\n \nomega" is one paragraph with soft breaks), so
+// `line.trim() === ""` misreads it as blank and offers a split CommonMark
+// does not allow — same class of bug as the fence-closer check above, which
+// already gets this right.
+const BLANK_LINE_RE = /^[ \t]*\r?$/;
+
 // Returns the character offset of the last safe prefix/tail boundary in
 // `text`, or null if none exists yet (the caller then treats the whole text
 // as tail).
@@ -241,13 +250,13 @@ function findStreamingSplitOffset(text) {
     const line = lines[i];
     const wasFenceLine = FENCE_LINE_RE.test(line);
     openFence = toggleFence(openFence, line);
-    const isBlank = !wasFenceLine && openFence == null && line.trim() === "";
+    const isBlank = !wasFenceLine && openFence == null && BLANK_LINE_RE.test(line);
     // A run of several blank lines must be judged by the first NON-blank line
     // after it, not by the line immediately following the first blank (which
     // is just another blank line, and never looks like a continuation) — so
     // only the LAST blank line of a run is a candidate boundary.
     const nextLine = lines[i + 1];
-    const isEndOfBlankRun = isBlank && (nextLine === undefined || nextLine.trim() !== "");
+    const isEndOfBlankRun = isBlank && (nextLine === undefined || !BLANK_LINE_RE.test(nextLine));
     if (
       isEndOfBlankRun
       && i + 1 < lines.length

@@ -2880,6 +2880,384 @@ test("a queued delta render is cancelled by an immediate thread switch", async (
   clearSessionRuntime();
 });
 
+// The four tests below mirror local's lifecycle-snapshot-flush.test.mjs
+// coverage (approval/ask-user/completion flush on the same tick) using this
+// file's own established technique for proving it — subscribeRemoteState's
+// notification COUNT, not just the eventual data — for the immediate-class
+// events local's snapshot path bundles into one signal but remote receives
+// as their own distinct event kinds.
+
+test("a queued delta render is cancelled by an immediate approval_added event", async () => {
+  const browser = installBrowserStubs();
+  const { state, subscribeRemoteState } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    applyTranscriptEvent,
+    clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
+  } = await import("./session-ops.js");
+  flushRemoteTranscriptRenderForTest();
+  clearSessionRuntime();
+
+  state.realSession = {
+    active_thread_id: "thread-live",
+    transcript_revision: 0,
+    pending_approvals: [],
+    transcript: [{
+      item_id: "item-live",
+      kind: "agent_text",
+      status: "running",
+      text: "",
+      turn_id: "turn-live",
+      tool: null,
+    }],
+  };
+  state.session = state.realSession;
+
+  const notifications = [];
+  const unsubscribe = subscribeRemoteState((_nextState, patch) => {
+    if (patch.session) {
+      notifications.push(patch.session);
+    }
+  });
+
+  applyTranscriptDelta({
+    thread_id: "thread-live",
+    revision: 1,
+    item_id: "item-live",
+    turn_id: "turn-live",
+    delta: "partial",
+    delta_kind: "agent_text",
+  });
+  assert.equal(notifications.length, 0, "the delta must still be coalescing, not yet painted");
+
+  applyTranscriptEvent({
+    kind: "approval_added",
+    approval: { request_id: "approval-1", summary: "Run a thing" },
+  });
+
+  assert.equal(notifications.length, 1, "an approval must render exactly once, immediately");
+  assert.equal(
+    notifications[0].transcript[0].text,
+    "partial",
+    "the approval's render must include the pending delta text, not stale text"
+  );
+  assert.equal(notifications[0].pending_approvals[0].request_id, "approval-1");
+
+  browser.runNextTimer();
+  assert.equal(
+    notifications.length,
+    1,
+    "the delta timer left over from before the approval must not render a second time"
+  );
+
+  unsubscribe();
+  clearSessionRuntime();
+});
+
+test("a queued delta render is cancelled by an immediate approval_resolved event", async () => {
+  const browser = installBrowserStubs();
+  const { state, subscribeRemoteState } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    applyTranscriptEvent,
+    clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
+  } = await import("./session-ops.js");
+  flushRemoteTranscriptRenderForTest();
+  clearSessionRuntime();
+
+  state.realSession = {
+    active_thread_id: "thread-live",
+    transcript_revision: 0,
+    pending_approvals: [{ request_id: "approval-1", summary: "Run a thing" }],
+    transcript: [{
+      item_id: "item-live",
+      kind: "agent_text",
+      status: "running",
+      text: "",
+      turn_id: "turn-live",
+      tool: null,
+    }],
+  };
+  state.session = state.realSession;
+
+  const notifications = [];
+  const unsubscribe = subscribeRemoteState((_nextState, patch) => {
+    if (patch.session) {
+      notifications.push(patch.session);
+    }
+  });
+
+  applyTranscriptDelta({
+    thread_id: "thread-live",
+    revision: 1,
+    item_id: "item-live",
+    turn_id: "turn-live",
+    delta: "partial",
+    delta_kind: "agent_text",
+  });
+  assert.equal(notifications.length, 0, "the delta must still be coalescing, not yet painted");
+
+  applyTranscriptEvent({ kind: "approval_resolved", request_id: "approval-1" });
+
+  assert.equal(notifications.length, 1, "resolving an approval must render exactly once, immediately");
+  assert.deepEqual(notifications[0].pending_approvals, []);
+  assert.equal(
+    notifications[0].transcript[0].text,
+    "partial",
+    "the resolve's render must include the pending delta text, not stale text"
+  );
+
+  browser.runNextTimer();
+  assert.equal(
+    notifications.length,
+    1,
+    "the delta timer left over from before the resolve must not render a second time"
+  );
+
+  unsubscribe();
+  clearSessionRuntime();
+});
+
+test("a queued delta render is cancelled by an immediate AskUserQuestion arriving via session_meta_updated", async () => {
+  const browser = installBrowserStubs();
+  const { state, subscribeRemoteState } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    applyTranscriptEvent,
+    clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
+  } = await import("./session-ops.js");
+  flushRemoteTranscriptRenderForTest();
+  clearSessionRuntime();
+
+  state.realSession = {
+    active_thread_id: "thread-live",
+    transcript_revision: 0,
+    pending_ask_user_questions: [],
+    transcript: [{
+      item_id: "item-live",
+      kind: "agent_text",
+      status: "running",
+      text: "",
+      turn_id: "turn-live",
+      tool: null,
+    }],
+  };
+  state.session = state.realSession;
+
+  const notifications = [];
+  const unsubscribe = subscribeRemoteState((_nextState, patch) => {
+    if (patch.session) {
+      notifications.push(patch.session);
+    }
+  });
+
+  applyTranscriptDelta({
+    thread_id: "thread-live",
+    revision: 1,
+    item_id: "item-live",
+    turn_id: "turn-live",
+    delta: "partial",
+    delta_kind: "agent_text",
+  });
+  assert.equal(notifications.length, 0, "the delta must still be coalescing, not yet painted");
+
+  // Remote has no dedicated AskUserQuestion event — it rides the same
+  // generic metadata patch as approvals and turn/error status (see
+  // applySessionMetadataPatch's own comment in session-ops.js).
+  applyTranscriptEvent({
+    kind: "session_meta_updated",
+    session: {
+      pending_ask_user_questions: [{ request_id: "ask-1", questions: [] }],
+    },
+  });
+
+  assert.equal(notifications.length, 1, "an incoming AskUserQuestion must render exactly once, immediately");
+  assert.equal(notifications[0].pending_ask_user_questions[0].request_id, "ask-1");
+  assert.equal(
+    notifications[0].transcript[0].text,
+    "partial",
+    "the AskUserQuestion's render must include the pending delta text, not stale text"
+  );
+
+  browser.runNextTimer();
+  assert.equal(
+    notifications.length,
+    1,
+    "the delta timer left over from before the AskUserQuestion must not render a second time"
+  );
+
+  unsubscribe();
+  clearSessionRuntime();
+});
+
+test("a completed transcript entry flushes immediately, but a merely-started one still coalesces", async () => {
+  const browser = installBrowserStubs();
+  const { state, subscribeRemoteState } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    applyTranscriptEvent,
+    clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
+  } = await import("./session-ops.js");
+  flushRemoteTranscriptRenderForTest();
+  clearSessionRuntime();
+
+  state.realSession = {
+    active_thread_id: "thread-live",
+    transcript_revision: 0,
+    transcript: [{
+      item_id: "item-live",
+      kind: "agent_text",
+      status: "running",
+      text: "",
+      turn_id: "turn-live",
+      tool: null,
+    }],
+  };
+  state.session = state.realSession;
+
+  const notifications = [];
+  const unsubscribe = subscribeRemoteState((_nextState, patch) => {
+    if (patch.session) {
+      notifications.push(patch.session);
+    }
+  });
+
+  applyTranscriptDelta({
+    thread_id: "thread-live",
+    revision: 1,
+    item_id: "item-live",
+    turn_id: "turn-live",
+    delta: "partial",
+    delta_kind: "agent_text",
+  });
+  assert.equal(notifications.length, 0, "the delta must still be coalescing, not yet painted");
+
+  // A "started" patch on a DIFFERENT item is a routine in-flight update — it
+  // must join the same coalescing window as the delta above, not flush it.
+  applyTranscriptEvent({
+    kind: "transcript_entry_started",
+    thread_id: "thread-live",
+    item_id: "item-tool",
+    entry_kind: "tool_call",
+    turn_id: "turn-live",
+    revision: 2,
+  });
+  assert.equal(notifications.length, 0, "a merely-started entry must not flush the pending delta early");
+
+  applyTranscriptEvent({
+    kind: "transcript_entry_completed",
+    thread_id: "thread-live",
+    item_id: "item-live",
+    entry_kind: "agent_text",
+    text: "done",
+    turn_id: "turn-live",
+    revision: 3,
+  });
+
+  assert.equal(notifications.length, 1, "a completed entry must render exactly once, immediately");
+  assert.equal(
+    notifications[0].transcript.find((entry) => entry.item_id === "item-live")?.text,
+    "done",
+    "the completion's own text must win over the pending delta text it absorbed"
+  );
+
+  browser.runNextTimer();
+  assert.equal(
+    notifications.length,
+    1,
+    "the delta timer left over from before the completion must not render a second time"
+  );
+
+  unsubscribe();
+  clearSessionRuntime();
+});
+
+// P2: completion/approval/AskUserQuestion all had this same-tick,
+// one-render, pending-timer-cancellation proof; a failed/error entry patch
+// did not. Remote has no dedicated "error" event kind — a turn/tool error
+// arrives as a transcript_entry_patched with status: "failed", which is
+// exactly the entryPatch.status !== "running" branch every other terminal
+// status takes.
+test("a failed transcript entry flushes immediately, exactly like a completed one, and cancels the pending delta timer", async () => {
+  const browser = installBrowserStubs();
+  const { state, subscribeRemoteState } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    applyTranscriptEvent,
+    clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
+  } = await import("./session-ops.js");
+  flushRemoteTranscriptRenderForTest();
+  clearSessionRuntime();
+
+  state.realSession = {
+    active_thread_id: "thread-live",
+    transcript_revision: 0,
+    transcript: [{
+      item_id: "item-live",
+      kind: "tool_call",
+      status: "running",
+      text: "",
+      turn_id: "turn-live",
+      tool: null,
+    }],
+  };
+  state.session = state.realSession;
+
+  const notifications = [];
+  const unsubscribe = subscribeRemoteState((_nextState, patch) => {
+    if (patch.session) {
+      notifications.push(patch.session);
+    }
+  });
+
+  applyTranscriptDelta({
+    thread_id: "thread-live",
+    revision: 1,
+    item_id: "item-live",
+    turn_id: "turn-live",
+    delta: "partial",
+    delta_kind: "agent_text",
+  });
+  assert.equal(notifications.length, 0, "the delta must still be coalescing, not yet painted");
+
+  applyTranscriptEvent({
+    kind: "transcript_entry_patched",
+    thread_id: "thread-live",
+    item_id: "item-live",
+    entry_kind: "tool_call",
+    status: "failed",
+    text: "command exited 1",
+    turn_id: "turn-live",
+    revision: 2,
+  });
+
+  assert.equal(notifications.length, 1, "a failed entry must render exactly once, immediately");
+  assert.equal(
+    notifications[0].transcript.find((entry) => entry.item_id === "item-live")?.status,
+    "failed"
+  );
+  assert.equal(
+    notifications[0].transcript.find((entry) => entry.item_id === "item-live")?.text,
+    "command exited 1",
+    "the failure's own text must win over the pending delta text it absorbed"
+  );
+
+  browser.runNextTimer();
+  assert.equal(
+    notifications.length,
+    1,
+    "the delta timer left over from before the failure must not render a second time"
+  );
+
+  unsubscribe();
+  clearSessionRuntime();
+});
+
 test("applyTranscriptDelta does not mutate the previous session snapshot", async () => {
   activeBrowser || installBrowserStubs();
 
