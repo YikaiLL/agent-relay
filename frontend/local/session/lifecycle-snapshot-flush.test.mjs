@@ -365,6 +365,44 @@ test("a delta for an entry the snapshot just introduced does not erase the snaps
   );
 });
 
+// P1 (review): restoreHydratedTranscriptSnapshot returns the incoming
+// snapshot UNCHANGED whenever the hydration window has never loaded for this
+// thread (transcriptHydrationOrder is empty) — a normal steady state, since
+// deltas legitimately arrive before the first hydration fetch resolves, not
+// an edge case. Nothing then protects the longer text already streamed into
+// state.session from a shorter/compacted snapshot body for the same entry
+// before it overwrites state.session — unlike remote, which guards this
+// unconditionally via preserveVisibleTranscriptText (.sealwire/PLAN.md, "Traps").
+test("a snapshot arriving before hydration ever loads does not overwrite longer streamed text with a shorter/compacted body", () => {
+  const h = buildHarness();
+  h.state.session = baseSnapshot({
+    transcript: [
+      entry("agent-1", "Hello world, this is the full streamed answer", { status: "running" }),
+    ],
+  });
+  // Hydration has never loaded for this thread.
+  h.state.transcriptHydrationOrder = [];
+  h.state.transcriptHydrationEntries = new Map();
+
+  // A compacted/preview snapshot arrives for the SAME entry with shorter text
+  // (e.g. the relay's max_transcript_chars clip) — turn state is unchanged.
+  h.lifecycle.applySessionSnapshot(
+    baseSnapshot({
+      active_turn_id: null,
+      transcript: [entry("agent-1", "Hello wor", { status: "running", content_state: "preview" })],
+    })
+  );
+
+  h.clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+
+  assert.equal(h.rendered.length, 1);
+  assert.equal(
+    h.rendered[0].transcript.find((candidate) => candidate.item_id === "agent-1")?.text,
+    "Hello world, this is the full streamed answer",
+    "the longer already-visible text must survive an unhydrated snapshot's shorter body"
+  );
+});
+
 test("an ordinary streaming snapshot coalesces rather than painting immediately", () => {
   const h = buildHarness();
   h.state.session = baseSnapshot();

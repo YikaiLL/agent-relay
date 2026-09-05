@@ -493,10 +493,9 @@ export function createStreamController(ctx) {
     // True when applyEntryPatchToWindow just no-op'd because the window has
     // never tracked this item at all. renderedTranscriptFromWindow's own
     // array-fallback means the array rebuild below is never silently dropped
-    // by a later settle — but the window still doesn't know this item
-    // exists, so drive a real hydration merge (mirrors remote's
-    // applyTranscriptEntryPatch / hydrateActiveTranscript) to fold it into
-    // the window properly instead of leaving it permanently array-only.
+    // by a later settle, so the window still not knowing this item exists is
+    // not a data-loss risk — see the comment below on why it must STAY that
+    // way rather than being taught about it via this patch.
     const patchIntroducesUntrackedItem = entryIndex < 0 && transcriptWindowIsLoaded(state, currentThreadId);
     const nextTranscript = entryIndex >= 0
       ? state.session.transcript.map((candidate, index) =>
@@ -528,12 +527,30 @@ export function createStreamController(ctx) {
         : state.session.transcript_revision,
     };
     if (patchIntroducesUntrackedItem) {
-      // Sync the window from nextSession, not state.session: hydration's own
-      // tail merge only picks up ids it does not already have, so it needs
-      // to see this item in the snapshot it merges against.
-      void ensureConversationTranscript(nextSession);
+      // state.session (still pre-patch here), NOT nextSession: a patch has no
+      // content_state field, so exposing this item's fabricated array entry to
+      // hydration's tail merge would default the missing field to "full" and
+      // poison the window with an empty-but-"full" entry — permanently
+      // suppressing the real fetch (transcript-hydration-store.js's
+      // contentStateOf; see .sealwire/PLAN.md, "Invalidate; do not write" ->
+      // "Never route non-authoritative data through the authoritative path" ->
+      // "Invalidate and refetch instead of merging a patch-derived session").
+      // state.session never mentions this item, so the merge can only repair
+      // OTHER already-tracked entries — a real snapshot later teaches the
+      // window about this one honestly.
+      void ensureConversationTranscript(state.session);
     }
-    queueTranscriptRender(nextSession);
+    // Completion, failure, error and cancellation are terminal, and a patch is
+    // the ONLY way local ever learns of them for an entry with no dedicated
+    // snapshot turn-state change — so this must paint at once, not wait out
+    // the coalescing window (.sealwire/PLAN.md). Mirrors remote's
+    // commitLiveSession(nextSession, { immediate: entryPatch.status !== "running" }).
+    if (patchedEntry.status !== "running") {
+      state.session = nextSession;
+      transcriptFlushScheduler.flushNow("transcript_entry_patch");
+    } else {
+      queueTranscriptRender(nextSession);
+    }
   }
 
   return {

@@ -607,6 +607,27 @@ function scheduleTranscriptGapRepair(threadId, reason, targetRevision, detail = 
   if (!threadId) {
     return;
   }
+  // Invalidate the moment the gap is DETECTED, not only once a repair fetch
+  // succeeds: repairActiveTranscriptTail only invalidates on its own success
+  // path, so a failed fetch (or MAX_TRANSCRIPT_REPAIR_FAILURES giving up)
+  // used to leave incomplete text trusted as `content_state: full` forever
+  // (.sealwire/PLAN.md, "Invalidate; do not write" -> "invalidate when the
+  // problem is detected, not when the repair succeeds"). Gated on this
+  // thread's window actually being the one loaded — markTranscriptWindowNeedsRepair
+  // has no thread param of its own and would otherwise blank whatever OTHER
+  // thread's window happens to be loaded.
+  if (transcriptWindowIsLoaded(state, threadId)) {
+    // Settle FIRST: renderedTranscriptFromWindow treats a non-"full" entry as
+    // untrusted and falls back to the ARRAY's current copy (correct for a
+    // patch, which always writes its array directly and synchronously — see
+    // invalidateTranscriptWindowEntryForPatch). A delta is different: its
+    // array lags the window until settle (the whole point of deferring the
+    // projection), so downgrading content_state here BEFORE the array has
+    // caught up would make that fallback discard the window's own
+    // just-buffered text and render the stale pre-delta array instead.
+    settleTranscriptProjection();
+    invalidateTranscriptWindowForRepair(state);
+  }
   const target = numericRevision(targetRevision) ?? 0;
   const existingTarget = pendingGapRepairThreads.get(threadId);
   if (existingTarget != null) {
@@ -1331,20 +1352,23 @@ function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null 
     nextSession.server_time = event.server_time;
   }
   if (patchIntroducesUntrackedItem) {
-    // Sync the window from nextSession — NOT currentSession: hydration's own
-    // tail merge (createMergedSnapshotTailPatch, run unconditionally by
-    // prepareTranscriptHydrationState whenever this thread's window has
-    // visible entries) folds a snapshot's own transcript array into the
-    // window, adding any id not yet in `order`. Passing the stale array would
-    // merge nothing new and — because "more authoritative wins" — would also
-    // promote every existing entry straight back to `full`, undoing an
-    // invalidation for nothing. Passing nextSession lets that same merge pick
-    // up this item directly, which is the general "hydration/snapshot merges
-    // may write the window" case the plan already sanctions (.sealwire/PLAN.md,
-    // "Invalidate; do not write"), rather than a bespoke append. Mirrors
+    // currentSession (pre-patch), NOT nextSession: a patch carries no
+    // content_state field, so feeding this item's fabricated array entry to
+    // hydration's tail merge (createMergedSnapshotTailPatch, run
+    // unconditionally by prepareTranscriptHydrationState whenever this
+    // thread's window has visible entries) would default the missing field
+    // to "full" and poison the window with an empty-but-"full" entry —
+    // permanently suppressing the real fetch (transcript-hydration-store.js's
+    // contentStateOf; see .sealwire/PLAN.md, "Invalidate; do not write" ->
+    // "Never route non-authoritative data through the authoritative path" ->
+    // "Invalidate and refetch instead of merging a patch-derived session").
+    // currentSession never mentions this item, so the merge can only repair
+    // OTHER already-tracked entries — renderedTranscriptFromWindow's own
+    // array-fallback already renders this one correctly from nextTranscript
+    // until a genuine snapshot teaches the window about it honestly. Mirrors
     // local's applyLocalTranscriptEntryPatch (local/session/stream.js), which
-    // reaches the same place by calling ensureConversationTranscript.
-    void hydrateActiveTranscript(nextSession);
+    // reaches the same place via ensureConversationTranscript(state.session).
+    void hydrateActiveTranscript(currentSession);
   }
   // A patch that leaves the entry "running" is a routine update on an
   // in-flight stream and coalesces with the delta path; anything else

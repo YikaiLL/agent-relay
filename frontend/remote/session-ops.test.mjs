@@ -6237,7 +6237,19 @@ test("applyTranscriptEntryPatch invalidates the window entry, not just the array
 // already window-tracked item re-arms the deferred projection, and settling
 // it rebuilds the array purely from the window (settleTranscriptProjection)
 // — which never heard of the patched item, so it silently vanished.
-test("a completion patch for an item a LOADED window has never seen is absorbed into the window, so a later delta's settle does not drop it", async () => {
+// P1 (review): this test used to assert the window absorbed a patch-introduced
+// item directly ("the window must pick up the new item directly, not just
+// the array") — but a patch carries no content_state field at all, so that
+// absorption defaults the missing field to "full" via contentStateOf, which
+// is safe only by accident when (as here) the patch happens to carry real
+// text. A status-only completion with no body poisons the window with an
+// empty-but-"full" entry, permanently suppressing the real fetch. Inverted
+// per .sealwire/PLAN.md, "Invalidate; do not write" -> "Invalidate and
+// refetch instead of merging a patch-derived session": the window must no
+// longer learn about a patch-introduced item at all; the array fallback
+// (renderedTranscriptFromWindow) is what keeps it visible and survives a
+// later settle.
+test("a completion patch for an item a LOADED window has never seen stays array-only, and still survives a later delta's settle", async () => {
   activeBrowser || installBrowserStubs();
   const { state } = await import("./state.js");
   const { applyTranscriptDelta, applyTranscriptEvent, clearSessionRuntime, flushRemoteTranscriptRenderForTest } =
@@ -6279,8 +6291,8 @@ test("a completion patch for an item a LOADED window has never seen is absorbed 
     "the new entry must still be visible right away"
   );
   assert.ok(
-    state.transcriptHydrationOrder.includes("item-2"),
-    "the window must pick up the new item directly, not just the array"
+    !state.transcriptHydrationOrder.includes("item-2"),
+    "a patch must never teach the window about a new item directly — only a real hydration/snapshot merge may"
   );
 
   // A delta for item-1 (already window-tracked) re-arms the deferred
@@ -6300,6 +6312,57 @@ test("a completion patch for an item a LOADED window has never seen is absorbed 
   assert.ok(
     state.session.transcript.some((entry) => entry.item_id === "item-2"),
     "the patch-introduced item must survive a later delta's settle, not just the first render"
+  );
+});
+
+// P1 (review): a status-only completion for an item the window has NEVER
+// tracked — no text at all, unlike the "brand new" text in the test above.
+// Before the fix, hydrateActiveTranscript(nextSession) fed this item's
+// fabricated array entry (content_state undefined -> "full" via
+// contentStateOf) straight into the window, poisoning it with an
+// empty-but-"full" entry that permanently suppresses ever fetching the real
+// body (see .sealwire/PLAN.md, "Invalidate; do not write" -> "Never route
+// non-authoritative data through the authoritative path").
+test("a status-only completion for an item a LOADED window has never seen must not poison the window with a full-but-empty entry", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await import("./state.js");
+  const { applyTranscriptEvent, clearSessionRuntime } = await import("./session-ops.js");
+
+  clearSessionRuntime();
+  state.realSession = state.session = {
+    active_thread_id: "thread-1",
+    transcript_revision: 1,
+    transcript_truncated: true,
+    transcript: [
+      { item_id: "item-1", kind: "agent_text", status: "completed", text: "Hello", turn_id: "turn-1", tool: null },
+    ],
+  };
+  state.socket = null;
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationEntries = new Map([
+    ["item-1", { ...state.session.transcript[0], content_state: "full" }],
+  ]);
+  state.transcriptHydrationOrder = ["item-1"];
+
+  // A status-only completion for a NEW item, never delta-streamed and
+  // carrying no body of its own — the real text, if any, lives only server-side.
+  applyTranscriptEvent({
+    kind: "transcript_entry_completed",
+    thread_id: "thread-1",
+    item_id: "item-2",
+    entry_kind: "agent_text",
+    turn_id: "turn-2",
+    revision: 2,
+  });
+
+  const windowEntry = state.transcriptHydrationEntries.get("item-2");
+  assert.ok(
+    !windowEntry || windowEntry.content_state !== "full",
+    "a status-only patch must never poison the window with a 'full' entry that has no real body"
+  );
+  assert.ok(
+    state.session.transcript.some((entry) => entry.item_id === "item-2"),
+    "the new entry must still be visible right away via the array"
   );
 });
 

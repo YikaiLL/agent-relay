@@ -512,10 +512,16 @@ test("with a loaded hydration window, a byte mismatch schedules repair instead o
     "Hello wor",
     "the window's pre-mismatch text must survive — the mismatched delta itself must not apply"
   );
+  // P1 (review): invalidate when the gap/mismatch is DETECTED, not only once
+  // the repair fetch succeeds — a failed or exhausted retry must not leave
+  // this trusted `full` forever (.sealwire/PLAN.md, "Invalidate; do not
+  // write"). This inverts a prior assertion that codified the fail-open bug:
+  // scheduleTranscriptGapRepair now downgrades the window synchronously, at
+  // schedule time, rather than only in repairActiveTranscriptTail's success path.
   assert.equal(
     state.transcriptHydrationEntries.get("item-1").content_state,
-    "full",
-    "a rejected delta must not itself touch content_state — only the async repair fetch may downgrade it"
+    "preview",
+    "a detected mismatch must downgrade content_state at once, so hydration can still refetch even if repair fails"
   );
   flushRemoteTranscriptRenderForTest();
   assert.equal(state.session.transcript[0].text, "Hello wor");

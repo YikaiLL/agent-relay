@@ -252,6 +252,62 @@ test("transcript_stream_lagged brings a pending render forward instead of leavin
   assert.equal(renders.length, 1, "the absorbed window timer must not render a second time");
 });
 
+// P1 (review): a terminal entry patch used to end at the same coalescing
+// queueTranscriptRender() as an ordinary streaming delta, so a completion /
+// failure / error / cancellation sat behind the 100-300ms window instead of
+// painting at once — the only signal local gets that a turn just went idle
+// for an entry with no dedicated snapshot turn-state change of its own.
+test("a completed entry patch flushes immediately instead of coalescing", () => {
+  const { clock, controller, renders, transcriptFlushScheduler } = makeController();
+
+  controller.applyLocalTranscriptEntryPatch(
+    { item_id: "agent-1", text: "final answer", thread_id: "thread-1" },
+    { defaultStatus: "completed" }
+  );
+
+  assert.equal(
+    renders.length,
+    1,
+    "a terminal completion must paint at once, not wait out the coalescing window"
+  );
+  assert.equal(
+    transcriptFlushScheduler.stats().pending,
+    false,
+    "nothing must be left pending to render a second time"
+  );
+
+  clock.tick(TRANSCRIPT_FLUSH_MAX_WINDOW_MS);
+  assert.equal(renders.length, 1, "the immediate flush must not be followed by a second, coalesced one");
+});
+
+test("failed/error/cancelled entry patches flush immediately, same as completed", () => {
+  for (const status of ["failed", "error", "cancelled"]) {
+    const { clock, controller, renders } = makeController();
+
+    controller.applyLocalTranscriptEntryPatch(
+      { item_id: "agent-1", status, thread_id: "thread-1" },
+      { defaultStatus: null }
+    );
+
+    assert.equal(renders.length, 1, `a "${status}" patch must paint at once`);
+    clock.tick(TRANSCRIPT_FLUSH_MAX_WINDOW_MS);
+    assert.equal(renders.length, 1, `"${status}" must not render a second time later`);
+  }
+});
+
+test("a running (in-progress) entry patch still coalesces on the scheduler window", () => {
+  const { clock, controller, renders } = makeController();
+
+  controller.applyLocalTranscriptEntryPatch(
+    { item_id: "agent-1", thread_id: "thread-1" },
+    { defaultStatus: "running" }
+  );
+
+  assert.equal(renders.length, 0, "a non-terminal patch must still coalesce, not paint immediately");
+  clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+  assert.equal(renders.length, 1);
+});
+
 test("with a loaded hydration window, deltas within one window rebuild the transcript only once, at the flush", () => {
   __resetTranscriptFullRebuildCount();
   const { clock, controller, renders, state } = makeController();
@@ -540,21 +596,31 @@ test("a patch survives a later delta for another item re-arming the pending proj
     { item_id: "agent-2", status: "completed", text: "done", thread_id: "thread-1" },
     { defaultStatus: "completed" }
   );
-  // A second delta for agent-1 lands AFTER the patch, still before the
-  // flush — this re-arms the pending window projection the patch's own
-  // settle-before-read already cleared once.
+  // The completion patch is terminal, so — per the immediate-flush fix — it
+  // paints AT ONCE, settling agent-1's still-pending delta text along with it
+  // rather than leaving both to coalesce.
+  assert.equal(renders.length, 1, "a terminal patch must paint at once");
+  assert.equal(
+    renders[0].transcript.find((entry) => entry.item_id === "agent-1").text,
+    "one",
+    "the pending delta must be settled into the immediate flush, not dropped"
+  );
+  assert.equal(renders[0].transcript.find((entry) => entry.item_id === "agent-2").text, "done");
+
+  // A second delta for agent-1 lands AFTER the patch's immediate flush,
+  // re-arming the pending window projection for a fresh coalesced render.
   controller.applyLocalTranscriptEntryDelta({
     delta: " two",
     item_id: "agent-1",
     revision: 2,
     thread_id: "thread-1",
   });
-  assert.equal(renders.length, 0, "still coalescing");
+  assert.equal(renders.length, 1, "still coalescing");
 
   clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
 
-  assert.equal(renders.length, 1);
-  const rendered = renders[0].transcript;
+  assert.equal(renders.length, 2);
+  const rendered = renders[1].transcript;
   assert.equal(
     rendered.find((entry) => entry.item_id === "agent-1").text,
     "one two",
@@ -658,7 +724,18 @@ test("a completion patch for an item a LOADED window has never seen survives a l
   assert.equal(
     ensureConversationTranscriptCalls.length,
     1,
-    "a real hydration merge must be driven so the window learns about the new item properly"
+    "a real hydration merge must still be driven, so it can repair OTHER already-tracked entries"
+  );
+  // P1 (review): the pushed session must be the PRE-patch state.session, not
+  // a patch-derived nextSession — a patch carries no content_state field, so
+  // exposing agent-2's fabricated entry to hydration's tail merge would
+  // default the missing field to "full" and poison the window with an
+  // empty-but-"full" entry, permanently suppressing the real fetch (see
+  // .sealwire/PLAN.md, "Invalidate; do not write" -> "Never route
+  // non-authoritative data through the authoritative path").
+  assert.ok(
+    !ensureConversationTranscriptCalls[0]?.transcript?.some((entry) => entry.item_id === "agent-2"),
+    "the session handed to hydration must not mention the patch-only item at all"
   );
 
   // A later delta for the SIBLING re-arms the pending projection; settling it
