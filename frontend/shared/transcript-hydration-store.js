@@ -957,9 +957,13 @@ export function applyTranscriptDeltaToWindow(state, delta) {
     entry_seq: Number.isSafeInteger(delta.entry_seq) ? delta.entry_seq : null,
     content_state: startsAtZero ? CONTENT_STATE_FULL : CONTENT_STATE_PREVIEW,
   });
-  if (!order.includes(itemId)) {
-    order.push(itemId);
-  }
+  // We only reach here when `entries.get(itemId)` was undefined above, and
+  // `entries`/`order` are always written as a pair (clear, stash/restore, tail
+  // and snapshot merge all keep them in sync — see placeOrderedTailIds' "an id
+  // we have never seen cannot be in the order" above) — so `itemId` cannot
+  // already be in `order`. Push is O(1); the `includes` scan this replaced
+  // was the one O(window) step left in the per-token delta path.
+  order.push(itemId);
   return startsAtZero;
 }
 

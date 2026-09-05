@@ -188,14 +188,16 @@ function loadWindowFromSession(state, session) {
   state.transcriptHydrationOrder = session.transcript.map((entry) => entry.item_id);
 }
 
-// Shadows find/findIndex/map as OWN properties on this one array instance
-// (never touches Array.prototype, so nothing else in the test run is
+// Shadows find/findIndex/map/includes as OWN properties on this one array
+// instance (never touches Array.prototype, so nothing else in the test run is
 // affected) and counts how many times any of them run. The per-token path
 // must never touch the transcript array with any of these — the array
 // projection is deferred to settle, and settle rebuilds from the hydration
-// window's `order` array, never by scanning the old `.transcript`.
+// window's `order` array, never by scanning the old `.transcript`. `includes`
+// is here because that is exactly what the order array's insert used to do —
+// see the "brand-new item" test below.
 function instrumentArrayScans(array) {
-  const counts = { find: 0, findIndex: 0, map: 0 };
+  const counts = { find: 0, findIndex: 0, map: 0, includes: 0 };
   for (const method of Object.keys(counts)) {
     const original = Array.prototype[method];
     Object.defineProperty(array, method, {
@@ -207,7 +209,7 @@ function instrumentArrayScans(array) {
     });
   }
   return {
-    total: () => counts.find + counts.findIndex + counts.map,
+    total: () => counts.find + counts.findIndex + counts.map + counts.includes,
     counts,
   };
 }
@@ -317,6 +319,59 @@ test("with a loaded hydration window, per-token deltas never call find, findInde
     const streamed = state.session.transcript.find((entry) => entry.item_id === "item-0");
     const expectedTail = Array.from({ length: 25 }, (_, i) => ` tok${i}`).join("");
     assert.equal(streamed.text, expectedTail);
+  }
+});
+
+test("with a loaded hydration window, the first delta for a brand-new item is O(1): no scan of the order array or the transcript array", async () => {
+  activeBrowser || installBrowserStubs();
+  const { state } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    flushRemoteTranscriptRenderForTest,
+    clearSessionRuntime,
+  } = await import("./session-ops.js");
+
+  for (const n of [1000, 20000]) {
+    clearSessionRuntime();
+    state.session = buildLargeSession(n);
+    state.realSession = state.session;
+    state.socket = null;
+    loadWindowFromSession(state, state.session);
+
+    // The other tests in this file only ever stream to "item-0", which is
+    // already in the window before streaming starts — they never exercise a
+    // delta's `!existing` branch (transcript-hydration-store.js). That branch
+    // used to answer "is this id already ordered?" via `order.includes(itemId)`,
+    // an O(window) scan on every brand-new item; the counters above would stay
+    // flat at 20k rows while this one insert stayed O(n). Instrument the order
+    // array (what that scan ran on) and the transcript array (the other thing
+    // a per-token delta must never touch before settle).
+    const orderScans = instrumentArrayScans(state.transcriptHydrationOrder);
+    const transcriptScans = instrumentArrayScans(state.realSession.transcript);
+
+    applyTranscriptDelta({
+      thread_id: "thread-1",
+      item_id: "item-new",
+      turn_id: "turn-new",
+      delta: "hello",
+      delta_kind: "agent_text",
+      text_offset: 0,
+    });
+
+    assert.equal(
+      orderScans.total(),
+      0,
+      `n=${n}: a brand-new item's first delta must not scan the hydration order array (saw ${JSON.stringify(orderScans.counts)})`
+    );
+    assert.equal(
+      transcriptScans.total(),
+      0,
+      `n=${n}: a brand-new item's first delta must not scan the transcript array (saw ${JSON.stringify(transcriptScans.counts)})`
+    );
+
+    flushRemoteTranscriptRenderForTest();
+    const streamed = state.session.transcript.find((entry) => entry.item_id === "item-new");
+    assert.equal(streamed?.text, "hello", `n=${n}: the new item's text must land in the rebuilt transcript after settle`);
   }
 });
 
