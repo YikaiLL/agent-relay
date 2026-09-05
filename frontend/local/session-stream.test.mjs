@@ -22,6 +22,7 @@ import { createRelayQueryClient } from "../shared/query-client.js";
 import {
   createThreadTranscriptPageQueryOptions,
   fetchThreadTranscriptPageFresh,
+  threadTranscriptPageQueryKey,
 } from "../shared/thread-queries.js";
 
 /**
@@ -1007,11 +1008,11 @@ test("a stale pre-gap hydration fetch resolving AFTER the repair must not overwr
 // own gate (`state.transcriptHydrationPromise || status === "loading"`)
 // would then block scroll-up on this thread forever, even after the
 // concurrent repair that invalidated the discarded fetch lands successfully.
-test("an epoch-discarded pre-gap hydration fetch does not wedge transcriptHydrationStatus, so loadOlderTranscript is not blocked afterward", async () => {
+test("an epoch-discarded pre-gap hydration fetch releases its status after a failed repair, so hydration can retry", async () => {
   const oldFetch = createDeferred();
-  const repairFetch = createDeferred();
-  const { controller, state } = setUpRaceState(() => repairFetch.promise);
-  state.transcriptHydrationOlderCursor = "older-cursor-1";
+  const { controller, state } = setUpRaceState(() =>
+    Promise.reject(new Error("simulated fresh repair failure"))
+  );
 
   void hydrateLocalTranscript(
     state,
@@ -1055,8 +1056,99 @@ test("an epoch-discarded pre-gap hydration fetch does not wedge transcriptHydrat
     "the epoch-discarded fetch must release the loading gate, or every later hydration attempt on this thread is blocked"
   );
 
-  // Prove it concretely, not just via the internal field: a scroll-up load
-  // must actually reach the network, not bail out on a wedged status check.
+  // Prove it concretely, not just via the internal field: after the concurrent
+  // fresh repair fails, ordinary hydration must be able to retry the live tail
+  // instead of bailing out on a wedged status.
+  const retryFetchCalls = [];
+  await hydrateLocalTranscript(state, {
+    active_thread_id: "thread-1",
+    transcript_truncated: true,
+    transcript: [
+      {
+        item_id: "agent-1",
+        kind: "agent_text",
+        status: "completed",
+        text: "hello world",
+        tool: null,
+        turn_id: "turn-1",
+        content_state: "preview",
+      },
+    ],
+  }, {
+    fetchPage: ({ threadId, before }) => {
+      retryFetchCalls.push({ threadId, before });
+      return Promise.resolve({
+        thread_id: "thread-1",
+        entries: [
+          {
+            item_id: "agent-1",
+            kind: "agent_text",
+            status: "completed",
+            text: "hello world, repaired by retry",
+            tool: null,
+            turn_id: "turn-1",
+          },
+        ],
+        prev_cursor: null,
+      });
+    },
+    onProgress() {},
+    onError() {},
+  });
+  assert.equal(
+    retryFetchCalls.length,
+    1,
+    "the retry must actually reach the network, not be gated by a wedged status"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").text,
+    "hello world, repaired by retry",
+    "the retry must be able to establish authority after the failed fresh repair"
+  );
+});
+
+test("an epoch-discarded pre-gap hydration fetch does not leave a promise that blocks scroll-up", async () => {
+  const oldFetch = createDeferred();
+  const repairFetch = createDeferred();
+  const { controller, state } = setUpRaceState(() => repairFetch.promise);
+  state.transcriptHydrationOlderCursor = "older-cursor-1";
+
+  void hydrateLocalTranscript(
+    state,
+    {
+      active_thread_id: "thread-1",
+      transcript_truncated: true,
+      transcript: [
+        {
+          item_id: "agent-1",
+          kind: "agent_text",
+          status: "running",
+          text: "hello world",
+          tool: null,
+          turn_id: "turn-1",
+          content_state: "full",
+        },
+      ],
+    },
+    { fetchPage: () => oldFetch.promise, onProgress() {}, onError() {} }
+  );
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "z",
+    item_id: "agent-1",
+    revision: 7,
+    text_offset: 100,
+    thread_id: "thread-1",
+  });
+
+  oldFetch.resolve({
+    thread_id: "thread-1",
+    entries: [{ item_id: "agent-1", kind: "agent_text", status: "running", text: STALE_PRE_GAP_TEXT }],
+    prev_cursor: null,
+    revision: 6,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
   const olderFetchCalls = [];
   await loadOlderLocalTranscript(state, {
     fetchPage: ({ threadId, before }) => {
@@ -1066,10 +1158,11 @@ test("an epoch-discarded pre-gap hydration fetch does not wedge transcriptHydrat
     onProgress() {},
     onError() {},
   });
-  assert.equal(
-    olderFetchCalls.length,
-    1,
-    "the scroll-up fetch must actually reach the network, not be gated by a wedged status"
+
+  assert.deepEqual(
+    olderFetchCalls,
+    [{ threadId: "thread-1", before: "older-cursor-1" }],
+    "the settled pre-gap owner must not leave either gate blocking the scroll-up request"
   );
 });
 
@@ -1305,6 +1398,177 @@ test("a hydration re-arm racing the repair does not dedupe onto the pre-gap requ
     "hello world, repaired",
     "the re-arm must settle from its OWN independent fetch once that resolves, not the evicted one"
   );
+});
+
+test("real QueryClient race matrix: the pre-gap query and post-refusal raw repair never dedupe or grant stale authority", async (t) => {
+  const orders = [
+    { name: "old response, then fresh repair", first: "old" },
+    { name: "fresh repair, then old response", first: "fresh" },
+  ];
+
+  for (const order of orders) {
+    await t.test(order.name, async () => {
+      const queryClient = createRelayQueryClient();
+      const oldFetch = createDeferred();
+      const repairFetch = createDeferred();
+      const ordinaryCalls = [];
+      const rawRepairCalls = [];
+      const queryKey = threadTranscriptPageQueryKey({
+        before: null,
+        scope: "local",
+        surface: "local",
+        threadId: "thread-1",
+      });
+
+      const fetchFreshTranscriptPage = (threadId, { before } = {}) =>
+        fetchThreadTranscriptPageFresh({
+          before,
+          fetchPage: (request) => {
+            rawRepairCalls.push(request);
+            return repairFetch.promise;
+          },
+          queryClient,
+          scope: "local",
+          surface: "local",
+          threadId,
+        });
+      const { controller, state } = setUpRaceState(fetchFreshTranscriptPage);
+
+      const hydrationPromise = hydrateLocalTranscript(
+        state,
+        {
+          active_thread_id: "thread-1",
+          transcript_truncated: true,
+          transcript: [
+            {
+              item_id: "agent-1",
+              kind: "agent_text",
+              status: "running",
+              text: "hello world",
+              tool: null,
+              turn_id: "turn-1",
+              content_state: "full",
+            },
+          ],
+        },
+        {
+          fetchPage: ({ before, threadId }) =>
+            queryClient.fetchQuery(
+              createThreadTranscriptPageQueryOptions({
+                before,
+                fetchPage: (request) => {
+                  ordinaryCalls.push(request);
+                  return oldFetch.promise;
+                },
+                scope: "local",
+                surface: "local",
+                threadId,
+              })
+            ),
+          onProgress() {},
+          onError() {},
+        }
+      );
+
+      assert.equal(ordinaryCalls.length, 1, "precondition: hydration started one ordinary request");
+      assert.deepEqual(
+        queryClient.getQueryCache().find({ queryKey, exact: true })?.queryKey,
+        queryKey,
+        "the pre-gap hydration request must own the production tail query key"
+      );
+
+      controller.applyLocalTranscriptEntryDelta({
+        delta: "z",
+        item_id: "agent-1",
+        revision: 7,
+        text_offset: 100,
+        thread_id: "thread-1",
+      });
+
+      assert.equal(
+        rawRepairCalls.length,
+        1,
+        "the refusal must synchronously start one independent raw repair request"
+      );
+      assert.deepEqual(rawRepairCalls[0], { before: null, threadId: "thread-1" });
+      assert.equal(
+        queryClient.getQueryCache().find({ queryKey, exact: true }),
+        undefined,
+        "the raw repair must evict the pre-gap owner instead of deduping onto it"
+      );
+      assert.equal(
+        state.transcriptHydrationEntries.get("agent-1").content_state,
+        "preview",
+        "the refusal must revoke the cached body's authority before either response resolves"
+      );
+
+      const oldPage = {
+        thread_id: "thread-1",
+        entries: [
+          {
+            item_id: "agent-1",
+            kind: "agent_text",
+            status: "running",
+            text: STALE_PRE_GAP_TEXT,
+            turn_id: "turn-1",
+          },
+        ],
+        prev_cursor: null,
+        revision: 6,
+      };
+      const freshPage = {
+        thread_id: "thread-1",
+        entries: [
+          {
+            item_id: "agent-1",
+            kind: "agent_text",
+            status: "completed",
+            text: "hello world, repaired",
+            turn_id: "turn-1",
+          },
+        ],
+        prev_cursor: null,
+        revision: 8,
+      };
+
+      if (order.first === "old") {
+        oldFetch.resolve(oldPage);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(
+          state.transcriptHydrationEntries.get("agent-1").content_state,
+          "preview",
+          "the old response must never regain authority while the fresh repair is pending"
+        );
+        assert.equal(
+          state.transcriptHydrationEntries.get("agent-1").text,
+          "hello world",
+          "the old response must not even land transiently"
+        );
+        repairFetch.resolve(freshPage);
+      } else {
+        repairFetch.resolve(freshPage);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(state.transcriptHydrationEntries.get("agent-1").content_state, "full");
+        assert.equal(state.transcriptHydrationEntries.get("agent-1").text, "hello world, repaired");
+        oldFetch.resolve(oldPage);
+      }
+
+      await hydrationPromise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(
+        state.transcriptHydrationEntries.get("agent-1").content_state,
+        "full",
+        "only the post-refusal page may establish authority"
+      );
+      assert.equal(
+        state.transcriptHydrationEntries.get("agent-1").text,
+        "hello world, repaired",
+        "the old response must be inert in either completion order"
+      );
+      assert.equal(ordinaryCalls.length, 1, "the ordinary pre-gap request must remain a single request");
+      assert.equal(rawRepairCalls.length, 1, "the raw repair must remain a separate single request");
+    });
+  }
 });
 
 // P1 (review): every race test above starts from a LOADED window

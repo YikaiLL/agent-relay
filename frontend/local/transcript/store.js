@@ -6,6 +6,7 @@ import {
   createMergedTranscriptHydrationPagePatch,
   prepareTranscriptHydrationState,
   createTranscriptHydrationCompletePatch,
+  createOwnedTranscriptHydrationIdlePatch,
   createTranscriptHydrationRevisionPatch,
   createTranscriptHydrationPromisePatch,
   createTranscriptHydrationStatusPatch,
@@ -104,8 +105,8 @@ export function clearTranscriptHydrationPromise(state, promise) {
   applyLocalTranscriptPatch(state, createClearedTranscriptHydrationPromisePatch(state, promise));
 }
 
-export function setTranscriptHydrationIdle(state) {
-  applyLocalTranscriptPatch(state, createTranscriptHydrationStatusPatch("idle"));
+export function setTranscriptHydrationIdle(state, promise) {
+  applyLocalTranscriptPatch(state, createOwnedTranscriptHydrationIdlePatch(state, promise));
 }
 
 export function clearTranscriptHydrationFetchedRevision(state) {

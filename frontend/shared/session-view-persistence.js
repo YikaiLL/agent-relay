@@ -66,6 +66,7 @@ export function createIndexedDbSessionViewPersistence({
       }
 
       const request = indexedDb.open(dbName, DB_VERSION);
+      let openSettled = false;
       request.onupgradeneeded = () => {
         const database = request.result;
         if (database.objectStoreNames.contains(WORKSPACES_STORE)) {
@@ -84,9 +85,31 @@ export function createIndexedDbSessionViewPersistence({
           }
         }
       };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () =>
+      request.onsuccess = () => {
+        // IndexedDB has no way to cancel an open request. If a blocked event
+        // already made boot fall back, close a database that eventually opens
+        // instead of leaking the late connection.
+        if (openSettled) {
+          request.result?.close?.();
+          return;
+        }
+        openSettled = true;
+        resolve(request.result);
+      };
+      request.onerror = () => {
+        if (openSettled) {
+          return;
+        }
+        openSettled = true;
         reject(request.error || new Error("failed to open session-view database"));
+      };
+      request.onblocked = () => {
+        if (openSettled) {
+          return;
+        }
+        openSettled = true;
+        reject(new Error("session-view database open blocked"));
+      };
     });
   }
 

@@ -23,7 +23,9 @@ import { hydrateTranscript } from "./shared/transcript-hydration.js";
 import {
   buildHydratedTranscriptProgress,
   createClearedTranscriptHydrationPatch,
+  createClearedTranscriptHydrationPromisePatch,
   createMergedTranscriptHydrationPagePatch,
+  createOwnedTranscriptHydrationIdlePatch,
   createTranscriptHydrationCompletePatch,
   prepareTranscriptHydrationState,
   restoreHydratedTranscriptSnapshot,
@@ -132,12 +134,13 @@ function makeStore() {
       state.transcriptHydrationPromise = promise;
     },
     clearTranscriptHydrationPromise(state, promise) {
-      if (state.transcriptHydrationPromise === promise) {
-        state.transcriptHydrationPromise = null;
-      }
+      Object.assign(
+        state,
+        createClearedTranscriptHydrationPromisePatch(state, promise) || {}
+      );
     },
-    setTranscriptHydrationIdle(state) {
-      state.transcriptHydrationStatus = "idle";
+    setTranscriptHydrationIdle(state, promise) {
+      Object.assign(state, createOwnedTranscriptHydrationIdlePatch(state, promise) || {});
     },
     markTranscriptHydrationComplete(state) {
       Object.assign(state, createTranscriptHydrationCompletePatch());

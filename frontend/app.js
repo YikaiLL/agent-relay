@@ -151,6 +151,10 @@ import {
 } from "./local/render-security.js";
 import { createSessionRenderer } from "./local/render-session.js";
 import { createSessionController } from "./local/session-controller.js";
+import {
+  runLocalBootDataPhase,
+  syncProjectsForSession,
+} from "./local/boot-session-view.js";
 import { resolveDirectRenderSession } from "./local/session/render-session-flush.js";
 import {
   createLocalUiStore,
@@ -1522,10 +1526,10 @@ function syncThreadListViewFromContext(context) {
   if (readActiveProjectId(state.threadListStore) !== projectId) {
     store.setActiveProject(projectId);
   }
-  // Unconditional: the switcher offers the project list from every context, so
-  // gating the fetch on Projects mode would leave it empty exactly where it is the
-  // only way IN to a project.
-  projectsStore.syncToRevision(state.session?.projects_revision || 0);
+  // Unconditional once a session snapshot exists: the switcher offers the project
+  // list from every context, so gating the fetch on Projects mode would leave it
+  // empty exactly where it is the only way IN to a project.
+  syncProjectsForSession(projectsStore, state.session);
 }
 
 // Drop a selection whose project is gone (deleted here or by a remote peer). It used
@@ -2925,18 +2929,27 @@ async function boot() {
     return;
   }
 
-  await loadSession("initial boot");
-  await loadThreads("initial boot");
   // No `preview` intent, unlike the popstate handler above. Boot means "route to
   // this, changing nothing about a tab that already exists": a link to a session
   // you are not holding open opens a kept tab, while a refresh on one you were
-  // only peeking at stays a peek — reload is not a gesture.
-  await sessionViewController.restoreHistory(
-    window.history.state,
-    readThreadIdFromUrl()
-  );
-  connectSessionStream();
-  scheduleThreadsPoll();
+  // only peeking at stays a peek — reload is not a gesture. This MUST happen
+  // before loading the session: applying that snapshot starts an asynchronous
+  // Projects reconciliation, and its history replace has to read the restored
+  // thread route. If it sees the initial null location instead, it removes the
+  // URL's `?thread=` while boot is still in flight and a large-thread reload
+  // lands on console home.
+  await runLocalBootDataPhase({
+    restoreHistory: () => sessionViewController.restoreHistory(
+      window.history.state,
+      readThreadIdFromUrl()
+    ),
+    loadSession: () => loadSession("initial boot"),
+    loadThreads: () => loadThreads("initial boot"),
+    connectSessionStream,
+    scheduleThreadsPoll,
+    onRestoreError: (error) =>
+      logLine(`Session view history restore failed during boot: ${error?.message || error}`),
+  });
 }
 
 async function refreshAuthSession(reason) {

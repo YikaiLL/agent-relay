@@ -345,11 +345,10 @@ export function prepareTranscriptHydrationState(state, snapshot) {
   //
   // Gate on status ONLY, never on `transcriptHydrationPromise != null`: status is
   // set to "loading" before onProgress fires (so the freeze guard still holds for
-  // the synchronous re-entry) AND is reliably reset to complete/idle on settle.
-  // The promise is NOT a reliable in-flight signal — clearTranscriptHydrationPromise
-  // no-ops when the signature changed mid-flight (a new newest message joined), so
-  // a settled fetch can leave its promise parked. Keying off that parked promise
-  // would veto re-arming forever and freeze the newest message on its `...` shell.
+  // the synchronous re-entry). The promise is the REQUEST OWNER used to make
+  // settle cleanup conditional; it is not the policy gate. A re-arm or thread
+  // switch may replace that owner while an older request is still resolving, and
+  // the older request must then leave the newer request's loading state alone.
   const hydrationInFlight = state.transcriptHydrationStatus === "loading";
 
   // candidate #3 — cap the omitted/preview re-fetch to once per revision. The
@@ -435,6 +434,24 @@ export function createTranscriptHydrationPromisePatch(promise) {
   };
 }
 
+function ownsTranscriptHydrationRequest(state, promise) {
+  return state.transcriptHydrationPromise === promise;
+}
+
+export function createOwnedTranscriptHydrationIdlePatch(state, promise) {
+  // Status and promise describe one request. An older request may settle after
+  // a re-arm or thread switch has installed a newer promise; only the promise
+  // currently stored on state owns the right to release "loading".
+  if (
+    !ownsTranscriptHydrationRequest(state, promise)
+    || state.transcriptHydrationStatus !== "loading"
+  ) {
+    return null;
+  }
+
+  return createTranscriptHydrationStatusPatch("idle");
+}
+
 export function createClearedTranscriptHydrationFetchedRevisionPatch() {
   return {
     transcriptHydrationFetchedRevision: null,
@@ -442,18 +459,23 @@ export function createClearedTranscriptHydrationFetchedRevisionPatch() {
 }
 
 export function createClearedTranscriptHydrationPromisePatch(state, promise) {
-  // Clear the in-flight promise by IDENTITY, not by signature. A new entry joining
-  // the tail mid-fetch re-keys the signature (createMergedSnapshotTailPatch), so a
-  // signature gate would leave this settled fetch's promise parked — and a parked
-  // promise makes loadOlderTranscript bail, silently stalling scroll-up of older
-  // history. Identity is correct: clear iff `state` still holds the promise this
-  // fetch set; if a newer fetch overwrote it, that fetch's own settle clears it.
-  if (state.transcriptHydrationPromise !== promise) {
+  // Release the request by IDENTITY, not by signature. A new entry joining the
+  // tail mid-fetch re-keys the signature (createMergedSnapshotTailPatch), while a
+  // re-arm or thread switch can replace the promise entirely. Identity is the
+  // ownership boundary: clear iff `state` still holds the promise this fetch set;
+  // if a newer fetch overwrote it, that fetch owns BOTH promise and status cleanup.
+  if (!ownsTranscriptHydrationRequest(state, promise)) {
     return null;
   }
 
   return {
     transcriptHydrationPromise: null,
+    // Every early-return path reaches finally. If no merge/error path selected a
+    // settled status, release loading here so a failed repair can be retried. Do
+    // not downgrade an already-idle or complete result.
+    ...(state.transcriptHydrationStatus === "loading"
+      ? { transcriptHydrationStatus: "idle" }
+      : {}),
   };
 }
 

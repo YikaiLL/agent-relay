@@ -1,3 +1,14 @@
+function createStartableRequest(run) {
+  let start;
+  const promise = new Promise((resolve, reject) => {
+    // Both callers provide an async function, so even an adapter that throws
+    // synchronously is surfaced as a rejected promise here. The important
+    // ordering is that the owner promise exists and is stored before run starts.
+    start = () => run().then(resolve, reject);
+  });
+  return { promise, start };
+}
+
 export async function hydrateTranscript(
   state,
   snapshot,
@@ -34,7 +45,12 @@ export async function hydrateTranscript(
     applyTranscriptHydrationProgress(state, store, onProgress);
   }
 
-  const hydrationPromise = (async () => {
+  // Install the promise owner before invoking fetchPage. Most fetchers return a
+  // rejected promise on failure, but an injected adapter may throw before it can
+  // return one. Starting through this deferred handle keeps that synchronous
+  // failure on the same ownership-safe catch/finally path instead of referencing
+  // `hydrationPromise` while its declaration is still being initialized.
+  const { promise: hydrationPromise, start: startHydration } = createStartableRequest(async () => {
     try {
       // Captured BEFORE the fetch, not after: a same-thread per-item delta
       // refusal (session/stream.js) bumps this while this fetch is in flight,
@@ -56,12 +72,6 @@ export async function hydrateTranscript(
         return;
       }
       if (isRefusalEpochStale(state, capturedRefusalEpoch)) {
-        // Same thread, unlike the check above — nothing else resets this
-        // thread's bookkeeping, so leaving status "loading" would wedge
-        // loadOlderTranscript's gate (and any future re-arm) forever. See
-        // isRefusalEpochStale's doc for why this cannot reuse the bare
-        // return above.
-        store.setTranscriptHydrationIdle(state);
         return;
       }
 
@@ -84,11 +94,9 @@ export async function hydrateTranscript(
       // release the loading gate and discard it so a fresh fetch, re-armed at
       // the new revision, rebuilds the tail.
       if (store.getTranscriptHydrationThreadId(state) !== snapshot.active_thread_id) {
-        store.setTranscriptHydrationIdle(state);
         return;
       }
       if (store.getTranscriptHydrationSignature(state) !== signature) {
-        store.setTranscriptHydrationIdle(state);
         store.clearTranscriptHydrationFetchedRevision(state);
         return;
       }
@@ -113,7 +121,6 @@ export async function hydrateTranscript(
           return;
         }
         if (isRefusalEpochStale(state, capturedOlderPageRefusalEpoch)) {
-          store.setTranscriptHydrationIdle(state);
           return;
         }
         store.mergeTranscriptHydrationPage(state, olderPage, { prepend: true });
@@ -141,7 +148,7 @@ export async function hydrateTranscript(
 
       applyTranscriptHydrationProgress(state, store, onProgress);
     } catch (error) {
-      store.setTranscriptHydrationIdle(state);
+      store.setTranscriptHydrationIdle(state, hydrationPromise);
       onError(error);
     } finally {
       // Clear by promise identity, not signature: a new entry joining mid-fetch
@@ -149,9 +156,10 @@ export async function hydrateTranscript(
       // then blocks loadOlderTranscript / scroll-up).
       store.clearTranscriptHydrationPromise(state, hydrationPromise);
     }
-  })();
+  });
 
   store.setTranscriptHydrationPromise(state, hydrationPromise);
+  startHydration();
   if (!progressBeforeFetch) {
     applyTranscriptHydrationProgress(state, store, onProgress);
   }
@@ -181,7 +189,7 @@ export async function loadOlderTranscript(
   }
 
   store.beginTranscriptHydration(state, "loading");
-  const loadPromise = (async () => {
+  const { promise: loadPromise, start: startLoad } = createStartableRequest(async () => {
     try {
       const capturedRefusalEpoch = state.transcriptRefusalEpoch;
       const page = await fetchPage({ threadId, before });
@@ -192,7 +200,7 @@ export async function loadOlderTranscript(
         return null;
       }
       if (isRefusalEpochStale(state, capturedRefusalEpoch)) {
-        store.setTranscriptHydrationIdle(state);
+        store.setTranscriptHydrationIdle(state, loadPromise);
         return null;
       }
 
@@ -205,7 +213,7 @@ export async function loadOlderTranscript(
       //   false → just prepended the oldest page → stop for good (reached top)
       const hasMore = page.prev_cursor != null;
       if (hasMore) {
-        store.setTranscriptHydrationIdle(state);
+        store.setTranscriptHydrationIdle(state, loadPromise);
       } else {
         // No revision: reaching the TOP of history says nothing about whether
         // the tail's cached bodies are current, and claiming otherwise would
@@ -215,16 +223,17 @@ export async function loadOlderTranscript(
       applyTranscriptHydrationProgress(state, store, onProgress);
       return hasMore;
     } catch (error) {
-      store.setTranscriptHydrationIdle(state);
+      store.setTranscriptHydrationIdle(state, loadPromise);
       onError(error);
       // Transient failure — `null` lets a later poke retry instead of wedging.
       return null;
     } finally {
       store.clearTranscriptHydrationPromise(state, loadPromise);
     }
-  })();
+  });
 
   store.setTranscriptHydrationPromise(state, loadPromise);
+  startLoad();
   return loadPromise;
 }
 
@@ -258,17 +267,10 @@ function isStaleTranscriptPage(state, page) {
 // (shared/transcript-page.js) is nullable, and a null would force a coin flip
 // exactly when this guard matters.
 //
-// A SEPARATE check from isStaleTranscriptPage, not folded into it, because
-// the two need different cleanup on discard. A cross-thread page (that check)
-// means the user navigated away — switchTranscriptHydrationThread already
-// replaced this thread's whole hydration state, so a bare `return` is
-// correct and touching status here would risk clobbering the NEW thread's
-// own in-flight status. A same-thread epoch mismatch (this check) means
-// nothing else has touched this thread's bookkeeping, so the caller MUST
-// reset status itself (see each call site) — otherwise `loading` sticks
-// forever, wedging loadOlderTranscript's gate and blocking every later
-// re-arm on this thread, even after the concurrent repair that invalidated
-// this fetch lands successfully (P1 review).
+// Both stale-page shapes return before merging. Their enclosing `finally`
+// releases `loading` only when this request's promise still owns the hydration
+// slot; if a re-arm or thread switch installed another request, the old settle
+// cannot clobber that newer request's status.
 function isRefusalEpochStale(state, capturedRefusalEpoch) {
   return capturedRefusalEpoch !== state.transcriptRefusalEpoch;
 }

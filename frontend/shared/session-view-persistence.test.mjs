@@ -308,3 +308,49 @@ test("the database name is the caller's, defaulting to the local surface's", asy
     "sealwire-session-view",
   ]);
 });
+
+test("a blocked database open rejects instead of hanging the caller indefinitely", async () => {
+  let openRequest;
+  let lateCloseCalls = 0;
+  const indexedDb = {
+    open() {
+      const request = {
+        result: null,
+        error: null,
+        onblocked: null,
+        onerror: null,
+        onsuccess: null,
+        onupgradeneeded: null,
+      };
+      openRequest = request;
+      queueMicrotask(() => request.onblocked?.());
+      return request;
+    },
+  };
+  const persistence = createIndexedDbSessionViewPersistence({
+    indexedDb,
+    legacyPersistence: null,
+  });
+
+  const outcome = await Promise.race([
+    persistence.transact(() => ({ value: null, writes: {} })).then(
+      () => "resolved",
+      (error) => `rejected:${error.message}`
+    ),
+    new Promise((resolve) => setTimeout(() => resolve("timed out"), 25)),
+  ]);
+
+  assert.match(outcome, /^rejected:.*blocked/i);
+
+  openRequest.result = {
+    close() {
+      lateCloseCalls += 1;
+    },
+  };
+  openRequest.onsuccess();
+  assert.equal(
+    lateCloseCalls,
+    1,
+    "a blocked request that later succeeds must not leak an unused database connection"
+  );
+});
