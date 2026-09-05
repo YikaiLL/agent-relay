@@ -85,6 +85,14 @@ export function createStreamController(ctx) {
     if (!threadId || !isViewingConversation?.({ active_thread_id: threadId })) {
       return;
     }
+    // Captured BEFORE the fetch, same as the shared hydration driver's own
+    // guard (shared/transcript-hydration.js's isRefusalEpochStale) — but
+    // this repair's merge never goes through that driver, so it needs its
+    // own capture+check. Two refusals for the same item in quick succession
+    // each launch their own repair; without this, an OLDER repair resolving
+    // AFTER a newer one could still overwrite the newer repair's already-
+    // authoritative text via the merge's length tie-break (P1 review).
+    const capturedRefusalEpoch = state.transcriptRefusalEpoch;
     let page;
     try {
       page = await fetchRawTranscriptPage({ threadId, before: null });
@@ -99,6 +107,12 @@ export function createStreamController(ctx) {
     // The thread may have moved on (or the window been torn down) while the
     // fetch was in flight — a legitimate no-op, not a failure to retry.
     if (state.session?.active_thread_id !== threadId || !transcriptWindowIsLoaded(state, threadId)) {
+      return;
+    }
+    if (capturedRefusalEpoch !== state.transcriptRefusalEpoch) {
+      // A newer refusal (and its own repair) started while this fetch was in
+      // flight. That repair is the authoritative one; this response predates
+      // it and must not be allowed to win the merge's length tie-break.
       return;
     }
     // The SAME merge the gated hydration path itself uses for a tail

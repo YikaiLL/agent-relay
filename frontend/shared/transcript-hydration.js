@@ -39,7 +39,7 @@ export async function hydrateTranscript(
       // Captured BEFORE the fetch, not after: a same-thread per-item delta
       // refusal (session/stream.js) bumps this while this fetch is in flight,
       // and neither the thread id nor the signature checks below notice that —
-      // see isStaleTranscriptPage.
+      // see isRefusalEpochStale.
       const capturedRefusalEpoch = state.transcriptRefusalEpoch;
       const page = await fetchPage({
         threadId: snapshot.active_thread_id,
@@ -52,7 +52,16 @@ export async function hydrateTranscript(
       if ((snapshot.transcript || []).length > 0 && (page.entries || []).length === 0) {
         throw new Error(missingTailError);
       }
-      if (isStaleTranscriptPage(state, page, capturedRefusalEpoch)) {
+      if (isStaleTranscriptPage(state, page)) {
+        return;
+      }
+      if (isRefusalEpochStale(state, capturedRefusalEpoch)) {
+        // Same thread, unlike the check above — nothing else resets this
+        // thread's bookkeeping, so leaving status "loading" would wedge
+        // loadOlderTranscript's gate (and any future re-arm) forever. See
+        // isRefusalEpochStale's doc for why this cannot reuse the bare
+        // return above.
+        store.setTranscriptHydrationIdle(state);
         return;
       }
 
@@ -92,7 +101,11 @@ export async function hydrateTranscript(
         if (!olderPage || olderPage.thread_id !== snapshot.active_thread_id) {
           throw new Error(incompletePageError);
         }
-        if (isStaleTranscriptPage(state, olderPage, capturedOlderPageRefusalEpoch)) {
+        if (isStaleTranscriptPage(state, olderPage)) {
+          return;
+        }
+        if (isRefusalEpochStale(state, capturedOlderPageRefusalEpoch)) {
+          store.setTranscriptHydrationIdle(state);
           return;
         }
         store.mergeTranscriptHydrationPage(state, olderPage, { prepend: true });
@@ -167,7 +180,11 @@ export async function loadOlderTranscript(
       if (!page || page.thread_id !== threadId) {
         throw new Error(incompletePageError);
       }
-      if (isStaleTranscriptPage(state, page, capturedRefusalEpoch)) {
+      if (isStaleTranscriptPage(state, page)) {
+        return null;
+      }
+      if (isRefusalEpochStale(state, capturedRefusalEpoch)) {
+        store.setTranscriptHydrationIdle(state);
         return null;
       }
 
@@ -212,25 +229,38 @@ function applyTranscriptHydrationProgress(state, store, onProgress) {
   onProgress(snapshot);
 }
 
+function isStaleTranscriptPage(state, page) {
+  return Boolean(
+    page?.thread_id
+      && state.session?.active_thread_id
+      && page.thread_id !== state.session.active_thread_id
+  );
+}
+
 // `capturedRefusalEpoch` is read back from `state.transcriptRefusalEpoch`
 // immediately before the fetch this page answers (see each call site above),
 // and compared here against its CURRENT value. A same-thread per-item delta
 // refusal (local/session/stream.js) bumps that counter while a fetch is in
-// flight, and neither this thread-id check nor the caller's own signature
-// check notices that — the refusal changes neither. `undefined` on both sides
-// (remote never bumps this field) compares equal, so this is a no-op there;
-// do not fork the check per surface.
+// flight, and neither isStaleTranscriptPage's thread-id check nor the
+// caller's own signature check notices that — the refusal changes neither.
+// `undefined` on both sides (remote never bumps this field) compares equal,
+// so this is a no-op there; do not fork the check per surface.
 //
 // Deliberately not a revision floor: `page.revision ?? null`
 // (shared/transcript-page.js) is nullable, and a null would force a coin flip
 // exactly when this guard matters.
-function isStaleTranscriptPage(state, page, capturedRefusalEpoch) {
-  if (
-    page?.thread_id
-    && state.session?.active_thread_id
-    && page.thread_id !== state.session.active_thread_id
-  ) {
-    return true;
-  }
+//
+// A SEPARATE check from isStaleTranscriptPage, not folded into it, because
+// the two need different cleanup on discard. A cross-thread page (that check)
+// means the user navigated away — switchTranscriptHydrationThread already
+// replaced this thread's whole hydration state, so a bare `return` is
+// correct and touching status here would risk clobbering the NEW thread's
+// own in-flight status. A same-thread epoch mismatch (this check) means
+// nothing else has touched this thread's bookkeeping, so the caller MUST
+// reset status itself (see each call site) — otherwise `loading` sticks
+// forever, wedging loadOlderTranscript's gate and blocking every later
+// re-arm on this thread, even after the concurrent repair that invalidated
+// this fetch lands successfully (P1 review).
+function isRefusalEpochStale(state, capturedRefusalEpoch) {
   return capturedRefusalEpoch !== state.transcriptRefusalEpoch;
 }

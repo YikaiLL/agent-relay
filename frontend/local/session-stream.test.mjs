@@ -7,7 +7,7 @@ import {
   __resetTranscriptFullRebuildCount,
 } from "./session/stream.js";
 import { adoptSettledTranscript, settleTranscriptProjection } from "./transcript/store.js";
-import { hydrateLocalTranscript } from "./transcript/hydration.js";
+import { hydrateLocalTranscript, loadOlderLocalTranscript } from "./transcript/hydration.js";
 import {
   cancelAndSettlePendingTranscriptFlush,
   resolveDirectRenderSession,
@@ -910,6 +910,155 @@ test("a stale pre-gap hydration fetch resolving AFTER the repair must not overwr
     state.transcriptHydrationEntries.get("agent-1").text,
     "hello world, repaired",
     "the stale pre-gap page must not overwrite the already-repaired, authoritative text"
+  );
+});
+
+// P1 (review): the epoch-stale discard above (isRefusalEpochStale,
+// shared/transcript-hydration.js) used to just `return` without resetting
+// transcriptHydrationStatus, reusing the bare shape isStaleTranscriptPage
+// uses for a CROSS-thread page. That shape is safe there because a thread
+// switch already replaces the whole hydration slot — but this is the SAME
+// thread, so nothing else ever clears "loading", and loadOlderTranscript's
+// own gate (`state.transcriptHydrationPromise || status === "loading"`)
+// would then block scroll-up on this thread forever, even after the
+// concurrent repair that invalidated the discarded fetch lands successfully.
+test("an epoch-discarded pre-gap hydration fetch does not wedge transcriptHydrationStatus, so loadOlderTranscript is not blocked afterward", async () => {
+  const oldFetch = createDeferred();
+  const repairFetch = createDeferred();
+  const { controller, state } = setUpRaceState(() => repairFetch.promise);
+  state.transcriptHydrationOlderCursor = "older-cursor-1";
+
+  void hydrateLocalTranscript(
+    state,
+    {
+      active_thread_id: "thread-1",
+      transcript_truncated: true,
+      transcript: [
+        {
+          item_id: "agent-1",
+          kind: "agent_text",
+          status: "running",
+          text: "hello world",
+          tool: null,
+          turn_id: "turn-1",
+          content_state: "full",
+        },
+      ],
+    },
+    { fetchPage: () => oldFetch.promise, onProgress() {}, onError() {} }
+  );
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "z",
+    item_id: "agent-1",
+    revision: 7,
+    text_offset: 100,
+    thread_id: "thread-1",
+  });
+
+  oldFetch.resolve({
+    thread_id: "thread-1",
+    entries: [{ item_id: "agent-1", kind: "agent_text", status: "running", text: STALE_PRE_GAP_TEXT }],
+    prev_cursor: null,
+    revision: 6,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.notEqual(
+    state.transcriptHydrationStatus,
+    "loading",
+    "the epoch-discarded fetch must release the loading gate, or every later hydration attempt on this thread is blocked"
+  );
+
+  // Prove it concretely, not just via the internal field: a scroll-up load
+  // must actually reach the network, not bail out on a wedged status check.
+  const olderFetchCalls = [];
+  await loadOlderLocalTranscript(state, {
+    fetchPage: ({ threadId, before }) => {
+      olderFetchCalls.push({ threadId, before });
+      return Promise.resolve({ thread_id: "thread-1", entries: [], prev_cursor: null });
+    },
+    onProgress() {},
+    onError() {},
+  });
+  assert.equal(
+    olderFetchCalls.length,
+    1,
+    "the scroll-up fetch must actually reach the network, not be gated by a wedged status"
+  );
+});
+
+// P1 (review): repairActiveTranscriptTail's own merge never went through the
+// shared driver's isRefusalEpochStale gate, so it had no epoch check of its
+// own. Two refusals for the same item in quick succession each launch their
+// own repair fetch — if the NEWER repair resolves first (landing the
+// correct text) and the OLDER repair then resolves late, its merge was
+// unconditional and could still overwrite the newer repair's already-
+// authoritative text via mergeTranscriptEntry's length tie-break.
+test("two successive refusals: an older repair resolving after the newer one must not overwrite it", async () => {
+  const repair1 = createDeferred();
+  const repair2 = createDeferred();
+  const fetchCalls = [];
+  const fetchRawTranscriptPage = ({ threadId, before }) => {
+    fetchCalls.push({ threadId, before });
+    return fetchCalls.length === 1 ? repair1.promise : repair2.promise;
+  };
+  const { controller, state } = setUpRaceState(fetchRawTranscriptPage);
+
+  // First refusal — fires repair1.
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "z",
+    item_id: "agent-1",
+    revision: 7,
+    text_offset: 100,
+    thread_id: "thread-1",
+  });
+  assert.equal(fetchCalls.length, 1, "precondition: the first refusal fired its own repair fetch");
+
+  // A second refusal arrives while repair1 is still in flight — bumps the
+  // epoch again and fires repair2, its own independent fetch.
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "y",
+    item_id: "agent-1",
+    revision: 8,
+    text_offset: 200,
+    thread_id: "thread-1",
+  });
+  assert.equal(fetchCalls.length, 2, "precondition: the second refusal fired its own repair fetch too");
+
+  // The NEWER repair resolves first, with the authoritative text.
+  repair2.resolve({
+    thread_id: "thread-1",
+    entries: [
+      { item_id: "agent-1", kind: "agent_text", status: "completed", text: "hello world, repaired twice", turn_id: "turn-1" },
+    ],
+    prev_cursor: null,
+    revision: 9,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(state.transcriptHydrationEntries.get("agent-1").content_state, "full");
+  assert.equal(state.transcriptHydrationEntries.get("agent-1").text, "hello world, repaired twice");
+
+  // The OLDER repair resolves late, with a longer but stale response — it
+  // predates the newer repair and must not overwrite its already-
+  // authoritative text.
+  repair1.resolve({
+    thread_id: "thread-1",
+    entries: [{ item_id: "agent-1", kind: "agent_text", status: "running", text: `${STALE_PRE_GAP_TEXT} EVEN LONGER STILL` }],
+    prev_cursor: null,
+    revision: 7,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").content_state,
+    "full",
+    "the newer repair's content_state must survive the older repair landing late"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").text,
+    "hello world, repaired twice",
+    "the older repair's stale response must not overwrite the newer repair's authoritative text"
   );
 });
 
