@@ -6,7 +6,7 @@ import {
   __readTranscriptFullRebuildCount,
   __resetTranscriptFullRebuildCount,
 } from "./session/stream.js";
-import { adoptSettledTranscript, settleTranscriptProjection } from "./transcript/store.js";
+import { adoptSettledTranscript, settleTranscriptProjection, transcriptWindowIsLoaded } from "./transcript/store.js";
 import { hydrateLocalTranscript, loadOlderLocalTranscript } from "./transcript/hydration.js";
 import {
   cancelAndSettlePendingTranscriptFlush,
@@ -1059,6 +1059,129 @@ test("two successive refusals: an older repair resolving after the newer one mus
     state.transcriptHydrationEntries.get("agent-1").text,
     "hello world, repaired twice",
     "the older repair's stale response must not overwrite the newer repair's authoritative text"
+  );
+});
+
+// P1 (review): every race test above starts from a LOADED window
+// (transcriptWindowIsLoaded === true) — the branch above this one in
+// applyLocalTranscriptEntryDelta. Deltas can arrive before the first
+// hydration ever runs, and that "no window yet" branch (below the loaded
+// branch, reconciling directly against state.session.transcript) had its OWN
+// gap/mismatch refusal shape that skipped every protection this cycle added:
+// no epoch bump, no repair, no revision advance, no immediate flush. A
+// hydration fetch already in flight when the cold gap happens (e.g. armed by
+// the very first snapshot) would resolve with pre-gap content, sail past
+// isRefusalEpochStale with a never-bumped epoch, and land as `full` —
+// exactly the race the epoch guard exists to close, just reached through the
+// one call site that never checked it. Drives the REAL hydrateLocalTranscript
+// driver, same as the loaded-window race tests, and asserts the final window
+// state, not that a function was called.
+test("a gap during COLD hydration (no window loaded yet) still bumps the epoch and discards a pre-gap response", async () => {
+  const preGapFetch = createDeferred();
+  const repairFetchCalls = [];
+  const fetchRawTranscriptPage = ({ threadId, before }) => {
+    repairFetchCalls.push({ threadId, before });
+    return Promise.resolve({ thread_id: "thread-1", entries: [], prev_cursor: null });
+  };
+  const { controller, renders, state } = makeController({ fetchRawTranscriptPage });
+
+  // Genuinely cold: no window loaded for this thread at all (the shape every
+  // OTHER test in this file that exercises the window starts from — those all
+  // populate transcriptHydrationOrder/Entries first). Mirrors app.js's real
+  // boot-time initial state rather than leaving these fields undefined, which
+  // never happens in production and would throw inside
+  // prepareTranscriptHydrationState (state.transcriptHydrationOrder.length).
+  state.transcriptHydrationEntries = new Map();
+  state.transcriptHydrationOrder = [];
+  state.transcriptHydrationOlderCursor = null;
+  state.transcriptHydrationPromise = null;
+  state.transcriptHydrationSignature = null;
+  state.transcriptHydrationStatus = "idle";
+  state.transcriptHydrationTailReady = false;
+  state.transcriptHydrationThreadId = null;
+  state.session.transcript[0].text = "hello";
+
+  // A hydration fetch already in flight BEFORE the gap — e.g. armed by the
+  // very first snapshot (transcript_truncated: true). Its own fetchPage is an
+  // independently-controlled deferred, resolved after the gap below.
+  void hydrateLocalTranscript(
+    state,
+    {
+      active_thread_id: "thread-1",
+      transcript_truncated: true,
+      transcript: [
+        {
+          item_id: "agent-1",
+          kind: "agent_text",
+          status: "running",
+          text: "",
+          tool: null,
+          turn_id: "turn-1",
+          content_state: "preview",
+        },
+      ],
+    },
+    { fetchPage: () => preGapFetch.promise, onProgress() {}, onError() {} }
+  );
+  assert.equal(
+    transcriptWindowIsLoaded(state, "thread-1"),
+    false,
+    "precondition: the window must still be unloaded — arming hydration alone must not load it"
+  );
+
+  // A gapped delta for the SAME item arrives before that fetch resolves —
+  // offset far past "hello".length, so resolveDeltaAppend refuses it.
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "z",
+    item_id: "agent-1",
+    revision: 7,
+    text_offset: 100,
+    thread_id: "thread-1",
+  });
+
+  assert.equal(
+    state.transcriptRefusalEpoch,
+    1,
+    "a cold-path gap is a true refusal and must bump the epoch, same as the loaded-window path"
+  );
+  assert.equal(
+    repairFetchCalls.length,
+    1,
+    "a cold-path gap must still launch the fresh repair — a no-op merge if the window " +
+      "stays unloaded when it resolves is fine, but the attempt must happen"
+  );
+  assert.equal(
+    state.session.transcript_revision,
+    7,
+    "the event's revision must still advance even though the window isn't loaded to reconcile the text"
+  );
+  assert.equal(
+    renders.length,
+    1,
+    "a cold-path refusal must flush immediately too, not sit behind the coalescing window"
+  );
+
+  // The pre-gap fetch resolves AFTER the refusal, carrying stale content for
+  // the same item, defaulting content_state to `full` like any raw page.
+  preGapFetch.resolve({
+    thread_id: "thread-1",
+    entries: [
+      { item_id: "agent-1", kind: "agent_text", status: "running", text: "hello STALE PRE-GAP BODY" },
+    ],
+    prev_cursor: null,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1"),
+    undefined,
+    "the pre-gap page must never land — its fetch predates the refusal that bumped the epoch, " +
+      "so isRefusalEpochStale must discard the merge before it writes anything"
+  );
+  assert.equal(
+    state.transcriptHydrationOrder.length,
+    0,
+    "a discarded merge must not bootstrap the window from stale content either"
   );
 });
 

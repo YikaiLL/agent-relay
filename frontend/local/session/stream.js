@@ -518,9 +518,37 @@ export function createStreamController(ctx) {
           event.text_offset
         )
         : (startsAtZero ? deltaText : null);
-    if (appendText == null || appendText === "") {
-      // Duplicate, gap, or a body that starts mid-stream. Hydration is authoritative
-      // for all three; splicing here would corrupt the text it will later reconcile.
+    if (appendText === "") {
+      // Duplicate — idempotent no-op, same as the loaded-window path's
+      // resolvedAppend === "" case. Hydration is authoritative for the real
+      // text; splicing a re-delivered chunk here would corrupt it.
+      return;
+    }
+    if (appendText == null) {
+      // A true refusal (a gap/mismatch, or a missing head for a brand-new
+      // item) — NOT a duplicate. This branch used to treat both the same and
+      // silently return, on the assumption hydration is "authoritative" and
+      // will reconcile it later — but nothing here made that true: a
+      // hydration fetch already in flight when this gap happens (armed by
+      // the very first snapshot, before any window ever loaded) captured its
+      // epoch before the gap and would sail past isRefusalEpochStale
+      // (shared/transcript-hydration.js) with the epoch never having moved,
+      // landing its pre-gap content as `full` — the exact race the
+      // loaded-window path's epoch bump (above) exists to close, just
+      // reached through the one call site that skipped it (P1 review).
+      state.transcriptRefusalEpoch = (state.transcriptRefusalEpoch || 0) + 1;
+      state.session = {
+        ...state.session,
+        transcript_revision: nextRevision,
+      };
+      // Same repair the loaded-window path fires. Its own merge is a no-op
+      // if the window is still unloaded when the fetch resolves
+      // (repairActiveTranscriptTail's own transcriptWindowIsLoaded guard) —
+      // but not wasted: if hydration loads the window before this resolves,
+      // it still lands the authoritative page, and either way the epoch
+      // bump above is what actually closes the race.
+      void repairActiveTranscriptTail(currentThreadId);
+      transcriptFlushScheduler.flushNow("transcript_entry_delta_refused");
       return;
     }
 
