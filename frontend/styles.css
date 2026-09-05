@@ -5766,16 +5766,18 @@ body.sidebar-collapsed .app-shell[data-view="conversation"] {
 body.sidebar-collapsed .app-shell-with-rail[data-view="conversation"] {
   grid-template-columns: 0 minmax(0, 1fr) var(--right-rail-width);
 }
-/* Tasks / teams / review hide the app right-rail. The generic collapsed rule
- * above still reserved `--right-rail-width` as a third track, so a collapsed
- * sidebar on Tasks left a blank strip beside the embedded detail. Drop to two
- * tracks — same contract as the expanded `data-view` rules further up. */
+/* Tasks / teams / review / usage hide the app right-rail. The generic collapsed
+ * rule above still reserved `--right-rail-width` as a third track, so a
+ * collapsed sidebar left a blank ~320px strip beside the full-area view. Drop
+ * to two tracks — same contract as the expanded `data-view` rules further up. */
 body.sidebar-collapsed .app-shell[data-view="tasks"],
 body.sidebar-collapsed .app-shell-with-rail[data-view="tasks"],
 body.sidebar-collapsed .app-shell[data-view="teams"],
 body.sidebar-collapsed .app-shell-with-rail[data-view="teams"],
 body.sidebar-collapsed .app-shell[data-view="review"],
-body.sidebar-collapsed .app-shell-with-rail[data-view="review"] {
+body.sidebar-collapsed .app-shell-with-rail[data-view="review"],
+body.sidebar-collapsed .app-shell[data-view="usage"],
+body.sidebar-collapsed .app-shell-with-rail[data-view="usage"] {
   grid-template-columns: 0 minmax(0, 1fr);
 }
 body.sidebar-collapsed .sidebar {
@@ -5797,12 +5799,14 @@ body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="conversati
 /* Same ghost-track trap when only the (unused) rail-collapsed class is set. */
 body.rail-collapsed .app-shell-with-rail[data-view="tasks"],
 body.rail-collapsed .app-shell-with-rail[data-view="teams"],
-body.rail-collapsed .app-shell-with-rail[data-view="review"] {
+body.rail-collapsed .app-shell-with-rail[data-view="review"],
+body.rail-collapsed .app-shell-with-rail[data-view="usage"] {
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
 }
 body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="tasks"],
 body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="teams"],
-body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="review"] {
+body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="review"],
+body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="usage"] {
   grid-template-columns: 0 minmax(0, 1fr);
 }
 body.rail-collapsed .right-rail {
@@ -6773,16 +6777,20 @@ body.is-resizing-panel {
   body.sidebar-collapsed .app-shell-with-rail[data-view="teams"],
   body.sidebar-collapsed .app-shell[data-view="review"],
   body.sidebar-collapsed .app-shell-with-rail[data-view="review"],
+  body.sidebar-collapsed .app-shell[data-view="usage"],
+  body.sidebar-collapsed .app-shell-with-rail[data-view="usage"],
   body.rail-collapsed .app-shell-with-rail,
   body.rail-collapsed .app-shell-with-rail[data-view="conversation"],
   body.rail-collapsed .app-shell-with-rail[data-view="tasks"],
   body.rail-collapsed .app-shell-with-rail[data-view="teams"],
   body.rail-collapsed .app-shell-with-rail[data-view="review"],
+  body.rail-collapsed .app-shell-with-rail[data-view="usage"],
   body.sidebar-collapsed.rail-collapsed .app-shell-with-rail,
   body.sidebar-collapsed.rail-collapsed .app-shell-with-rail[data-view="conversation"],
   body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="tasks"],
   body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="teams"],
-  body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="review"] {
+  body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="review"],
+  body.rail-collapsed.sidebar-collapsed .app-shell-with-rail[data-view="usage"] {
     grid-template-columns: 1fr;
   }
   body.sidebar-collapsed .sidebar {
@@ -9023,6 +9031,10 @@ button.team-role-name.is-link {
 .usage-week {
   padding: 20px 22px 36px;
   min-width: 0;
+  /* Track the centre column itself — side rails can leave it narrow while the
+   * viewport is still "desktop", so task rows and chart labels need CQ here. */
+  container-type: inline-size;
+  container-name: usage-center;
 }
 .usage-kicker,
 .usage-section-label {
@@ -9213,14 +9225,17 @@ button.team-role-name.is-link {
 }
 .usage-chart-frame {
   display: grid;
-  grid-template-columns: 36px minmax(0, 1fr);
+  grid-template-columns: 44px minmax(0, 1fr);
   gap: 6px;
   align-items: stretch;
+  /* Tip labels sit above the scale box; keep headroom here so plot/yaxis
+   * share one unpadded 200px percentage reference. */
+  padding-top: 18px;
 }
 .usage-chart-yaxis {
   position: relative;
   height: 200px;
-  margin-top: 18px;
+  overflow: hidden; /* translateY centering must not bleed into the date row */
 }
 .usage-chart-yaxis > span {
   position: absolute;
@@ -9229,6 +9244,7 @@ button.team-role-name.is-link {
   font-size: var(--text-2xs);
   color: var(--text-3);
   line-height: var(--leading-none);
+  white-space: nowrap;
 }
 .usage-chart-yaxis > span.is-cap {
   color: var(--warn-fg);
@@ -9236,8 +9252,9 @@ button.team-role-name.is-link {
 .usage-chart-plot {
   position: relative;
   height: 200px;
-  padding: 18px 4px 0;
+  padding: 0 4px;
   border-bottom: 1px solid var(--border-faint);
+  overflow: visible;
 }
 .usage-chart-cap {
   position: absolute;
@@ -9256,6 +9273,7 @@ button.team-role-name.is-link {
 .usage-chart-bars {
   height: 100%;
   align-items: end;
+  overflow: visible;
 }
 .usage-chart-col {
   display: flex;
@@ -9264,25 +9282,86 @@ button.team-role-name.is-link {
   justify-content: flex-end;
   height: 100%;
   min-width: 0;
-  gap: 4px;
+  overflow: visible;
+  cursor: pointer;
+  border-radius: 4px 4px 0 0;
+  outline: none;
 }
-.usage-chart-value {
-  font-size: var(--text-2xs);
+.usage-chart-col:hover .usage-chart-bar,
+.usage-chart-col:focus-visible .usage-chart-bar,
+.usage-chart-col.is-selected .usage-chart-bar {
+  filter: brightness(1.08);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.usage-chart-col:hover .usage-chart-bar.is-empty,
+.usage-chart-col.is-selected .usage-chart-bar.is-empty {
+  opacity: 0.7;
+  background: var(--accent);
+}
+.usage-chart-col.is-selected {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+/* Hover / selection always reveals the tip label, even when the narrow-centre
+ * container query hides non-today values by default. */
+.usage-chart-col:hover .usage-chart-value:not(.is-empty),
+.usage-chart-col:focus-visible .usage-chart-value:not(.is-empty),
+.usage-chart-col.is-selected .usage-chart-value:not(.is-empty) {
+  visibility: visible;
+  color: var(--text-1);
+  font-weight: var(--weight-strong);
+}
+.usage-chart-labels > span.is-selected {
+  color: var(--text-1);
+  font-weight: var(--weight-strong);
+}
+.usage-chart-day-hint {
+  margin: 10px 0 0 50px;
+  font-size: var(--text-xs);
   color: var(--text-3);
-  line-height: var(--leading-none);
-  min-height: 10px;
 }
-.usage-chart-bar-wrap {
+.usage-chart-stack {
   position: relative;
   width: 70%;
   max-width: 28px;
+  min-height: 3px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: stretch;
+}
+.usage-chart-value {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 2px);
+  transform: translateX(-50%);
+  max-width: 4.5em;
+  overflow: hidden;
+  text-overflow: clip;
+  font-size: var(--text-2xs);
+  color: var(--text-3);
+  line-height: var(--leading-none);
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 1;
+}
+.usage-chart-value.is-empty {
+  display: none;
+}
+.usage-chart-value.is-today-value {
+  color: var(--text-1);
+  font-weight: var(--weight-strong);
+}
+.usage-chart-bar-wrap {
+  position: relative;
+  width: 100%;
   flex: 1 1 auto;
-  min-height: 0;
+  min-height: 3px;
   display: flex;
   align-items: flex-end;
 }
 .usage-chart-bar {
   width: 100%;
+  height: 100%;
   display: flex;
   flex-direction: column-reverse;
   border-radius: 3px 3px 0 0;
@@ -9291,6 +9370,7 @@ button.team-role-name.is-link {
 }
 .usage-chart-bar.is-empty {
   height: 2px;
+  flex: 0 0 auto;
   background: var(--surface-3);
   opacity: 0.35;
 }
@@ -9311,7 +9391,7 @@ button.team-role-name.is-link {
 }
 .usage-chart-labels {
   margin-top: 6px;
-  margin-left: 42px; /* align under plot, past y-axis */
+  margin-left: 50px; /* align under plot, past y-axis */
 }
 .usage-chart-labels > span {
   display: block;
@@ -9325,6 +9405,9 @@ button.team-role-name.is-link {
 .usage-chart-labels > span.is-today {
   color: var(--text-1);
   font-weight: var(--weight-strong);
+  overflow: visible; /* "Today" must not clip to "Toda" in the end column */
+  position: relative;
+  z-index: 1;
 }
 .usage-chart-legend {
   display: flex;
@@ -9410,14 +9493,23 @@ button.team-role-name.is-link {
   padding: 10px 0;
   border-top: 1px solid var(--border-faint);
 }
+.usage-task-main {
+  min-width: 0;
+}
 .usage-task-title {
   font-size: var(--text-ui);
   font-weight: var(--weight-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .usage-task-meta {
   margin-top: 2px;
   color: var(--text-3);
   font-size: var(--text-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .usage-mini-stack {
   display: flex;
@@ -9622,6 +9714,28 @@ button.team-role-name.is-link {
   }
   .usage-week-table {
     min-width: 480px;
+  }
+}
+
+/* Same squeeze as the viewport rule, but keyed off the centre column — a wide
+ * window with 280px rails still leaves the day chart/task list too narrow for
+ * four task columns and fourteen tip labels. Hide non-today tip numbers by
+ * default; hover / selection reveals them (see .usage-chart-col:hover rules). */
+@container usage-center (max-width: 560px) {
+  .usage-chart-value:not(.is-today-value) {
+    visibility: hidden;
+  }
+  .usage-chart-col:hover .usage-chart-value:not(.is-empty),
+  .usage-chart-col:focus-visible .usage-chart-value:not(.is-empty),
+  .usage-chart-col.is-selected .usage-chart-value:not(.is-empty) {
+    visibility: visible;
+  }
+  .usage-task-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .usage-mini-stack,
+  .usage-task-status {
+    display: none;
   }
 }
 

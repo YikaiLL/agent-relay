@@ -25,10 +25,12 @@ import {
   priceAgeNote,
   reportState,
   stackedSeries,
+  yAxisTicks,
 } from "./usage-model.js";
 import { downloadUsageCsv } from "./usage-csv.js";
 
 const h = React.createElement;
+const { useState } = React;
 
 // Month bucket keys render as a short month name; the year is already stated
 // once in the range above the chart.
@@ -214,35 +216,91 @@ function chartScaleMax(series, cap, projectToday) {
   return Math.max(base, Math.min(projected, base * 1.2));
 }
 
-/**
- * Round gridline values, chosen rather than computed.
- *
- * A generated scale (max/4, max/2, …) produces ticks like "3.7M" that carry no
- * meaning; a reader checks a bar against a round number or not at all. The
- * `max * 0.95` cut-off drops any tick that would sit under the plot's ceiling,
- * where its label collides with the top of the tallest bar.
- *
- * The cap is always included even when it is not round: it is the one line on
- * this axis the user actually set.
- */
-function yAxisTicks(max, cap) {
-  const nice = [];
-  if (max >= 1_000_000) {
-    for (const m of [2, 4, 5, 6, 8, 10]) {
-      const v = m * 1_000_000;
-      if (v < max * 0.95) nice.push(v);
-    }
-  } else if (max >= 1_000) {
-    for (const k of [250, 500, 750]) {
-      const v = k * 1_000;
-      if (v < max * 0.95) nice.push(v);
-    }
-  }
-  if (cap && !nice.includes(cap)) nice.push(cap);
-  return [...new Set(nice)].filter((v) => v > 0 && v <= max).sort((a, b) => a - b);
+function bucketDetailLabel(key, { end = false, endLabel = "Today" } = {}) {
+  if (end) return endLabel;
+  const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);
+  if (day) return `${Number(day[2])}/${Number(day[3])}`;
+  const week = /^(\d{4})-W(\d{2})$/.exec(key);
+  if (week) return `W${week[2]}`;
+  return key;
 }
 
-function StackedChart({ series, cap, projectToday, providers, endLabel = "Today" }) {
+/** Sum ReportGroup rows into a totals-shaped object (cache share / headlines). */
+function totalsFromGroups(groups = []) {
+  const out = {
+    input: 0,
+    cached_input: 0,
+    cache_write: 0,
+    output: 0,
+    total: 0,
+    turns: 0,
+    failed_total: 0,
+    cost_usd: null,
+    cost_source: "unavailable",
+  };
+  for (const g of groups) {
+    if (!g) continue;
+    out.input += Number(g.input) || 0;
+    out.cached_input += Number(g.cached_input) || 0;
+    out.cache_write += Number(g.cache_write) || 0;
+    out.output += Number(g.output) || 0;
+    out.total += headlineTotal(g);
+    out.turns += Number(g.turns) || 0;
+  }
+  return out;
+}
+
+/**
+ * What the left/right rails show for the chart's selected day.
+ *
+ * Provider + cache come from the bucket (every day has them). Role / team /
+ * waste / top tasks are only on the today slice — past days say so.
+ */
+export function dayFocus(report, series, selectedKey) {
+  const buckets = report?.buckets || [];
+  const lastKey = series.at(-1)?.key || buckets.at(-1)?.key || null;
+  const key = selectedKey || lastKey;
+  const idx = buckets.findIndex((b) => b.key === key);
+  const bucket = idx >= 0 ? buckets[idx] : buckets.at(-1) || null;
+  const isToday = Boolean(bucket && lastKey && bucket.key === lastKey);
+  const groups = isToday && report?.today?.groups?.length
+    ? report.today.groups
+    : bucket?.groups || [];
+  const totals =
+    isToday && report?.today?.totals
+      ? report.today.totals
+      : totalsFromGroups(groups);
+  const prevBucket = idx > 0 ? buckets[idx - 1] : null;
+  const compareGroups = isToday
+    ? report?.today?.compare_groups || []
+    : prevBucket?.groups || [];
+  const compareTotals = isToday
+    ? report?.today?.compare_totals || totalsFromGroups(compareGroups)
+    : totalsFromGroups(compareGroups);
+  const end = Boolean(bucket && bucket.key === lastKey);
+  const label = bucket
+    ? bucketDetailLabel(bucket.key, { end, endLabel: "Today" })
+    : "Today";
+  return {
+    key: bucket?.key || key,
+    label,
+    isToday,
+    groups,
+    totals,
+    compareGroups,
+    compareTotals,
+  };
+}
+
+function StackedChart({
+  series,
+  cap,
+  projectToday,
+  providers,
+  endLabel = "Today",
+  selectedKey = null,
+  onSelect = null,
+}) {
   const max = chartScaleMax(series, cap, projectToday);
   const preferred = ["claude_code", "codex", "cursor"];
   const seen = new Set();
@@ -258,6 +316,14 @@ function StackedChart({ series, cap, projectToday, providers, endLabel = "Today"
   const colCount = Math.max(series.length, 1);
   const capPct = cap ? (cap / max) * 100 : null;
   const ticks = yAxisTicks(max, cap);
+  const lastKey = series.length ? series[series.length - 1].key : null;
+  const activeKey = selectedKey || lastKey;
+
+  function selectBucket(key) {
+    if (!onSelect) return;
+    // Re-clicking the active day keeps it selected (rails always have a focus).
+    onSelect(key);
+  }
 
   return h(
     "div",
@@ -292,71 +358,105 @@ function StackedChart({ series, cap, projectToday, providers, endLabel = "Today"
           : null,
         h(
           "div",
-          { className: "usage-chart-bars" },
+          { className: "usage-chart-bars", role: "listbox", "aria-label": "Spend by day" },
           ...series.map((bucket, i) => {
             const isEnd = i === series.length - 1;
             const height = bucket.total > 0 ? (bucket.total / max) * 100 : 0;
+            // Tip labels sit above the stack (`bottom: calc(100% + 2px)`) and
+            // use the plot's top padding — do not shrink bars vs ticks/quota.
+            const stackHeight = height > 0 ? Math.min(height, 100) : 0;
             const projected =
               isEnd && projectToday?.confident ? projectToday.projected : null;
             const projHeight =
-              projected != null
-                ? Math.min(100, (projected / max) * 100)
-                : null;
+              projected != null ? Math.min(100, (projected / max) * 100) : null;
             const hitCap = cap && bucket.total >= cap;
+            const isSelected = activeKey === bucket.key;
+            const dayLabel = shortBucketLabel(bucket.key, { end: isEnd, endLabel });
             return h(
               "div",
               {
                 key: bucket.key,
+                role: "option",
+                tabIndex: 0,
+                "aria-selected": isSelected ? "true" : "false",
+                "aria-label": [
+                  dayLabel,
+                  formatTokens(bucket.total),
+                  ...stackKeys
+                    .filter((k) => bucket.byProvider[k])
+                    .map(
+                      (k) =>
+                        `${providerMeta({ providers }, k).label || k} ${formatTokens(bucket.byProvider[k])}`
+                    ),
+                ]
+                  .filter(Boolean)
+                  .join(", "),
                 className: [
                   "usage-chart-col",
                   isEnd ? "is-today" : "",
                   hitCap ? "is-capped" : "",
+                  isSelected ? "is-selected" : "",
+                  height <= 0 ? "is-empty-col" : "",
                 ]
                   .filter(Boolean)
                   .join(" "),
-                title: [
-                  shortBucketLabel(bucket.key, { end: isEnd, endLabel }),
-                  formatTokens(bucket.total),
-                  ...stackKeys
-                    .filter((k) => bucket.byProvider[k])
-                    .map((k) => `${k}: ${formatTokens(bucket.byProvider[k])}`),
-                  hitCap ? "Hit the daily quota" : "",
-                ]
-                  .filter(Boolean)
-                  .join(" · "),
+                onClick: () => selectBucket(bucket.key),
+                onKeyDown: (event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    selectBucket(bucket.key);
+                  }
+                },
               },
               h(
-                "span",
-                { className: "usage-chart-value" },
-                bucket.total > 0 ? formatTokens(bucket.total) : ""
-              ),
-              h(
                 "div",
-                { className: "usage-chart-bar-wrap" },
-                projHeight
-                  ? h("div", {
-                      className: "usage-chart-projection",
-                      style: { height: `${Math.max(projHeight, height)}%` },
-                    })
-                  : null,
-                height > 0
-                  ? h(
-                      "div",
-                      {
-                        className: "usage-chart-bar",
-                        style: { height: `${height}%` },
-                      },
-                      ...stackKeys.map((key) => {
-                        const n = bucket.byProvider[key] || 0;
-                        if (!n) return null;
-                        return h("div", {
-                          key,
-                          className: `usage-chart-seg is-${providerTone(key)}`,
-                          style: { flexGrow: n, flexShrink: 0, flexBasis: 0 },
-                        });
+                {
+                  className: "usage-chart-stack",
+                  style: stackHeight > 0 ? { height: `${stackHeight}%` } : undefined,
+                },
+                h(
+                  "span",
+                  {
+                    className: [
+                      "usage-chart-value",
+                      isEnd ? "is-today-value" : "",
+                      height <= 0 ? "is-empty" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" "),
+                  },
+                  height > 0 ? formatTokens(bucket.total) : ""
+                ),
+                h(
+                  "div",
+                  { className: "usage-chart-bar-wrap" },
+                  projHeight
+                    ? h("div", {
+                        className: "usage-chart-projection",
+                        style: {
+                          height: `${Math.max(
+                            (projHeight / Math.max(stackHeight, 1)) * 100,
+                            100
+                          )}%`,
+                        },
                       })
-                    )
-                  : h("div", { className: "usage-chart-bar is-empty" })
+                    : null,
+                  height > 0
+                    ? h(
+                        "div",
+                        { className: "usage-chart-bar" },
+                        ...stackKeys.map((key) => {
+                          const n = bucket.byProvider[key] || 0;
+                          if (!n) return null;
+                          return h("div", {
+                            key,
+                            className: `usage-chart-seg is-${providerTone(key)}`,
+                            style: { flexGrow: n, flexShrink: 0, flexBasis: 0 },
+                          });
+                        })
+                      )
+                    : h("div", { className: "usage-chart-bar is-empty" })
+                )
               )
             );
           })
@@ -377,7 +477,12 @@ function StackedChart({ series, cap, projectToday, providers, endLabel = "Today"
           "span",
           {
             key: bucket.key,
-            className: isEnd ? "is-today" : undefined,
+            className: [
+              isEnd ? "is-today" : "",
+              activeKey === bucket.key ? "is-selected" : "",
+            ]
+              .filter(Boolean)
+              .join(" ") || undefined,
           },
           show ? shortBucketLabel(bucket.key, { end: isEnd, endLabel }) : ""
         );
@@ -396,39 +501,38 @@ function StackedChart({ series, cap, projectToday, providers, endLabel = "Today"
             )
           )
         )
-      : null
+      : null,
+    h(
+      "p",
+      { className: "usage-chart-day-hint" },
+      "Click a day — left and right panels follow."
+    )
   );
 }
 
-function LeftRail({ report, projection, onSetBudget, budgetPending }) {
+function LeftRail({ report, focus, projection, onSetBudget, budgetPending }) {
   const policy = report.budget_policy || "hold_new_work";
-  const todayGroups =
-    report.today?.groups ||
-    report.today_groups ||
-    (report.buckets || []).slice(-1)[0]?.groups ||
-    [];
-  const total = report.today
-    ? headlineTotal(report.today.totals)
-    : todayGroups.reduce((s, g) => s + headlineTotal(g), 0) || headlineTotal(report.totals);
+  const focusGroups = focus?.groups || [];
+  const total = headlineTotal(focus?.totals) || focusGroups.reduce((s, g) => s + headlineTotal(g), 0);
   const cap = report.daily_cap || null;
-  const prev = report.today
-    ? headlineTotal(report.today.compare_totals)
-    : (report.buckets || []).slice(-2, -1)[0]?.groups?.reduce((s, g) => s + headlineTotal(g), 0) ||
-      headlineTotal(report.compare?.totals);
+  const prev = headlineTotal(focus?.compareTotals);
   const delta = deltaPercent(total, prev);
   const deltaText = formatDelta(delta);
-  const roster = visibleProviders(report, todayGroups);
-  const todayRows = providerRows({ groups: todayGroups, providers: roster });
+  const roster = visibleProviders(report, focusGroups);
+  const todayRows = providerRows({ groups: focusGroups, providers: roster });
   const { complete } = todayRows;
   const prevByProvider = new Map();
-  for (const g of report.today?.compare_groups || []) {
+  for (const g of focus?.compareGroups || []) {
     prevByProvider.set(g.provider, (prevByProvider.get(g.provider) || 0) + headlineTotal(g));
   }
+  const isToday = focus?.isToday !== false;
+  const spentLabel = isToday ? "Spent today" : `Spent ${focus?.label || ""}`.trim();
+  const deltaSuffix = isToday ? "vs the same time yesterday" : "vs previous day";
 
   return h(
     "aside",
     { className: "usage-rail usage-rail-left" },
-    h("div", { className: "usage-kicker" }, "Spent today"),
+    h("div", { className: "usage-kicker" }, spentLabel),
     h(
       "div",
       { className: "usage-headline" },
@@ -440,15 +544,15 @@ function LeftRail({ report, projection, onSetBudget, budgetPending }) {
     h(QuotaBar, {
       spent: total,
       cap: cap || total,
-      delta: deltaText ? `${deltaText} vs the same time yesterday` : null,
+      delta: deltaText ? `${deltaText} ${deltaSuffix}` : null,
     }),
-    projection?.confident && projection.exhaustsAt
+    isToday && projection?.confident && projection.exhaustsAt
       ? h(
           "p",
           { className: "usage-projection-note is-warn" },
           `On track to run out at ${formatExhaust(projection.exhaustsAt)}`
         )
-      : projection?.confident
+      : isToday && projection?.confident
         ? h(
             "p",
             { className: "usage-projection-note" },
@@ -541,9 +645,6 @@ function LeftRail({ report, projection, onSetBudget, budgetPending }) {
               key: value,
               type: "button",
               className: policy === value ? "is-active" : "",
-              // Disabled with no cap set, because neither policy can fire: the
-              // control would accept a choice that changes nothing, which reads
-              // as broken rather than as inapplicable.
               disabled: !cap || budgetPending || !onSetBudget,
               title: cap ? undefined : "Set a daily quota first",
               onClick: () => onSetBudget?.({ policy: value }),
@@ -555,9 +656,6 @@ function LeftRail({ report, projection, onSetBudget, budgetPending }) {
       h(
         "p",
         { className: "usage-policy-note" },
-        // Says what actually happens, not what the mockup promised. Neither
-        // policy interrupts a turn that is already running — the relay has no
-        // primitive for that — so "stop everything" has to mean "start nothing".
         policy === "stop_everything"
           ? "Nothing new starts, yours included. Turns already running finish."
           : "New autonomous work waits for tomorrow. You can still send messages yourself."
@@ -578,7 +676,14 @@ function formatExhaust(msFromWindowStart) {
   return `${String(h24).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
-function CenterDay({ report, series, projection }) {
+function CenterDay({
+  report,
+  series,
+  projection,
+  selectedKey,
+  onSelectDay,
+  showTopTasks = true,
+}) {
   const windowTotal = series.reduce((s, b) => s + b.total, 0);
   const avg = series.length ? windowTotal / series.length : 0;
   const dayCount = series.length || 14;
@@ -600,8 +705,10 @@ function CenterDay({ report, series, projection }) {
       cap: report.daily_cap,
       projectToday: projection,
       providers: visibleProviders(report),
+      selectedKey,
+      onSelect: onSelectDay,
     }),
-    (report.top_tasks || []).length
+    showTopTasks && (report.top_tasks || []).length
       ? h(
           "div",
           { className: "usage-tasks" },
@@ -643,21 +750,25 @@ function CenterDay({ report, series, projection }) {
   );
 }
 
-function RightRail({ report }) {
-  const attrTotals = report.today?.totals || report.totals;
+function RightRail({ report, focus }) {
+  const isToday = focus?.isToday !== false;
+  const attrTotals = focus?.totals || report.today?.totals || report.totals;
   const cache = cachedShare(attrTotals);
   const waste =
-    report.waste ||
-    (attrTotals?.failed_total
-      ? {
-          failed_total: attrTotals.failed_total,
-          share:
-            headlineTotal(attrTotals) > 0
-              ? Math.round((attrTotals.failed_total / headlineTotal(attrTotals)) * 100)
-              : 0,
-        }
-      : null);
-  const teams = report.by_team || [];
+    isToday
+      ? report.waste ||
+        (attrTotals?.failed_total
+          ? {
+              failed_total: attrTotals.failed_total,
+              share:
+                headlineTotal(attrTotals) > 0
+                  ? Math.round((attrTotals.failed_total / headlineTotal(attrTotals)) * 100)
+                  : 0,
+            }
+          : null)
+      : null;
+  const teams = isToday ? report.by_team || [] : [];
+  const scopeLabel = isToday ? "Today" : focus?.label || "";
   return h(
     "aside",
     { className: "usage-rail usage-rail-right" },
@@ -665,47 +776,53 @@ function RightRail({ report }) {
       "div",
       { className: "usage-kicker" },
       "Attribution",
-      report.today ? h("span", { className: "usage-kicker-scope" }, "Today") : null
+      scopeLabel ? h("span", { className: "usage-kicker-scope" }, scopeLabel) : null
     ),
-    (() => {
-      const roles = (report.by_role || []).filter(
-        (row) => row.role || (report.by_role || []).length > 1
-      );
-      if (!roles.length) {
-        return h(
+    isToday
+      ? (() => {
+          const roles = (report.by_role || []).filter(
+            (row) => row.role || (report.by_role || []).length > 1
+          );
+          if (!roles.length) {
+            return h(
+              "p",
+              { className: "usage-partial-note" },
+              "No turns carry a role yet — only team runs do."
+            );
+          }
+          return h(
+            "div",
+            null,
+            h("div", { className: "usage-section-label" }, "By role"),
+            h(
+              "ul",
+              { className: "usage-role-list" },
+              ...roles.map((row) =>
+                h(
+                  "li",
+                  { key: row.role || "unattributed", className: "usage-role-row" },
+                  h(
+                    "div",
+                    { className: "usage-role-head" },
+                    h("span", null, roleLabel(row.role)),
+                    h("span", null, `${formatTokens(row.total)} · ${row.share}%`)
+                  ),
+                  h(
+                    "div",
+                    { className: "usage-role-track" },
+                    h("div", { className: "usage-role-fill", style: { width: `${row.share}%` } })
+                  ),
+                  row.note ? h("div", { className: "usage-role-note" }, row.note) : null
+                )
+              )
+            )
+          );
+        })()
+      : h(
           "p",
           { className: "usage-partial-note" },
-          "No turns carry a role yet — only team runs do."
-        );
-      }
-      return h(
-        "div",
-        null,
-        h("div", { className: "usage-section-label" }, "By role"),
-        h(
-          "ul",
-          { className: "usage-role-list" },
-          ...roles.map((row) =>
-            h(
-              "li",
-              { key: row.role || "unattributed", className: "usage-role-row" },
-              h(
-                "div",
-                { className: "usage-role-head" },
-                h("span", null, roleLabel(row.role)),
-                h("span", null, `${formatTokens(row.total)} · ${row.share}%`)
-              ),
-              h(
-                "div",
-                { className: "usage-role-track" },
-                h("div", { className: "usage-role-fill", style: { width: `${row.share}%` } })
-              ),
-              row.note ? h("div", { className: "usage-role-note" }, row.note) : null
-            )
-          )
-        )
-      );
-    })(),
+          "Role, team, and retry insights are only available for today. Provider and cache below follow the day you selected."
+        ),
     teams.length
       ? h(
           "div",
@@ -981,6 +1098,8 @@ export function UsageReportScreen({
   locked = false,
   onSetBudget,
   budgetPending = false,
+  /** Pin chart selection (SSR / tests). Live UI leaves this null. */
+  selectedDayKey = null,
 }) {
   // First, ahead of loading and error: those branches describe a fetch this
   // build should never have made. A locked screen has nothing to say about the
@@ -1112,12 +1231,42 @@ export function UsageReportScreen({
         )
       : bucket === "week" || bucket === "month"
         ? h(WeekView, { report, mode: bucket })
-        : h(
-            "div",
-            { className: "usage-grid" },
-            h(LeftRail, { report, projection, onSetBudget, budgetPending }),
-            h(CenterDay, { report, series: daySeries, projection }),
-            h(RightRail, { report })
-          )
+        : h(DayUsageGrid, {
+            report,
+            series: daySeries,
+            projection,
+            onSetBudget,
+            budgetPending,
+            selectedDayKey,
+          })
+  );
+}
+
+/** Day grid: one selected day drives left spend + right attribution together. */
+function DayUsageGrid({
+  report,
+  series,
+  projection,
+  onSetBudget,
+  budgetPending,
+  selectedDayKey = null,
+}) {
+  const [pickedKey, setPickedKey] = useState(null);
+  // Tests can pin a day via selectedDayKey; the chart click path uses pickedKey.
+  const selectedKey = selectedDayKey ?? pickedKey;
+  const focus = dayFocus(report, series, selectedKey);
+  return h(
+    "div",
+    { className: "usage-grid" },
+    h(LeftRail, { report, focus, projection, onSetBudget, budgetPending }),
+    h(CenterDay, {
+      report,
+      series,
+      projection,
+      selectedKey: focus.key,
+      onSelectDay: setPickedKey,
+      showTopTasks: focus.isToday,
+    }),
+    h(RightRail, { report, focus })
   );
 }

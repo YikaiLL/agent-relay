@@ -320,3 +320,40 @@ export function priceAgeNote(asOf, now = Date.now()) {
     ? "over a year old — update sealwire for current prices"
     : `${months} months old — update sealwire for current prices`;
 }
+
+/**
+ * Round gridline values that track the chart scale.
+ *
+ * Hard-coding 2–10M looked fine when a day topped out near that band; on a
+ * ~750M chart those same ticks all sit in the bottom 1% of the plot and pile
+ * into the date labels. Step from a 1/2/5 decade near max/3, skip the x-label
+ * band (<8%) and the ceiling (>95%) for ordinary ticks, and always keep the
+ * user-set cap — even when it sits in that bottom band after a lowered quota,
+ * and when an ordinary step sits next to it (drop that step so the dashed
+ * line is not labeled with the wrong round number).
+ */
+export function yAxisTicks(max, cap) {
+  if (!(max > 0) || !Number.isFinite(max)) return [];
+  const target = max / 3;
+  const exp = Math.pow(10, Math.floor(Math.log10(Math.max(target, 1))));
+  let step = exp;
+  for (const mult of [1, 2, 5, 10]) {
+    if (mult * exp >= target * 0.45) {
+      step = mult * exp;
+      break;
+    }
+  }
+  const nice = [];
+  for (let v = step; v < max * 0.95; v += step) {
+    if (v / max >= 0.08) nice.push(v);
+  }
+  if (cap && Number.isFinite(cap) && cap > 0 && cap <= max) {
+    // Keep the user-set quota label; drop any ordinary tick that would sit
+    // next to it and read as the wrong number (e.g. 4M beside a 4.1M line).
+    for (let i = nice.length - 1; i >= 0; i -= 1) {
+      if (Math.abs(nice[i] - cap) < step * 0.2) nice.splice(i, 1);
+    }
+    nice.push(cap);
+  }
+  return [...new Set(nice)].sort((a, b) => a - b);
+}

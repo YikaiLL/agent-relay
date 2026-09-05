@@ -123,6 +123,11 @@ test("collapsed sidebar on Tasks does not reserve an empty right-rail column", (
     /body\.sidebar-collapsed\s+\.app-shell-with-rail\[data-view="review"\]/,
     "review has the same no-app-rail contract"
   );
+  assert.match(
+    styles,
+    /body\.sidebar-collapsed\s+\.app-shell-with-rail\[data-view="usage"\][^\{]*\{[^}]*grid-template-columns:\s*0\s+minmax\(0,\s*1fr\)/,
+    "collapsed Usage must not keep a ghost 320px right-rail track"
+  );
 });
 
 test("collapsed rail grid template keeps the sidebar column intact", () => {
@@ -253,7 +258,7 @@ test("mobile media query overrides view-scoped collapsed Tasks/Teams/Review grid
   // reset. Without matching view selectors inside the mobile block, a phone
   // inherits `0 1fr` / `sidebar 1fr` instead of a single column.
   const block = extractMobileMediaBlock();
-  for (const view of ["tasks", "teams", "review"]) {
+  for (const view of ["tasks", "teams", "review", "usage"]) {
     assert.match(
       block,
       new RegExp(

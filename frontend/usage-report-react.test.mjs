@@ -8,7 +8,8 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { USAGE_FIXTURE } from "./shared/usage-fixture.js";
-import { UsageReportScreen } from "./shared/usage-report-react.js";
+import { UsageReportScreen, dayFocus } from "./shared/usage-report-react.js";
+import { stackedSeries } from "./shared/usage-model.js";
 
 const h = React.createElement;
 
@@ -270,4 +271,81 @@ test("maps ledger role ids to the names the design uses", () => {
   assert.match(html, />Reviewer</);
   assert.doesNotMatch(html, />tl</);
   assert.doesNotMatch(html, />dev</);
+});
+
+test("selecting a past day updates left spend and right attribution together", () => {
+  const report = {
+    enabled: true,
+    daily_cap: 5_000_000,
+    providers: [
+      { key: "claude_code", label: "Claude", reports_usage: true },
+      { key: "codex", label: "Codex", reports_usage: true },
+    ],
+    totals: { total: 5_000_000, cached_input: 400_000, input: 2_000_000, output: 2_600_000 },
+    today: {
+      since: 1,
+      until: 2,
+      totals: {
+        total: 2_900_000,
+        cached_input: 1_100_000,
+        input: 900_000,
+        output: 900_000,
+      },
+      groups: [
+        { provider: "claude_code", total: 1_600_000 },
+        { provider: "codex", total: 1_300_000 },
+      ],
+      compare_totals: { total: 3_000_000 },
+      compare_groups: [],
+    },
+    by_role: [{ role: "Tester", total: 1_000_000, share: 34 }],
+    by_team: [{ team: "Infra", total: 1_100_000, share: 38 }],
+    top_tasks: [{ title: "Only today", team_run_id: "t1", total: 100_000, status: "done" }],
+    buckets: [
+      {
+        key: "2026-08-13",
+        groups: [
+          {
+            provider: "claude_code",
+            total: 750_000,
+            cached_input: 50_000,
+            input: 400_000,
+            output: 300_000,
+          },
+        ],
+      },
+      {
+        key: "2026-08-26",
+        groups: [
+          { provider: "claude_code", total: 1_600_000 },
+          { provider: "codex", total: 1_300_000 },
+        ],
+      },
+    ],
+  };
+  const series = stackedSeries({ buckets: report.buckets });
+  const past = dayFocus(report, series, "2026-08-13");
+  assert.equal(past.isToday, false);
+  assert.equal(past.totals.total, 750_000);
+  assert.equal(past.groups[0].provider, "claude_code");
+
+  const todayHtml = renderToStaticMarkup(
+    h(UsageReportScreen, { report, bucket: "day" })
+  );
+  assert.match(todayHtml, /Spent today/);
+  assert.match(todayHtml, /By role/);
+  assert.match(todayHtml, /Only today/);
+  assert.match(todayHtml, /1\.1M/); // cache from today
+
+  const pastHtml = renderToStaticMarkup(
+    h(UsageReportScreen, { report, bucket: "day", selectedDayKey: "2026-08-13" })
+  );
+  assert.match(pastHtml, /Spent 8\/13/);
+  assert.match(pastHtml, /750K|750k|0\.8M|750/);
+  assert.match(pastHtml, /only available for today/);
+  assert.doesNotMatch(pastHtml, /By role/);
+  assert.doesNotMatch(pastHtml, /Only today/);
+  // Cache follows the selected day (50k cached on 8/13), not today's 1.1M.
+  assert.match(pastHtml, /usage-cache-num[^>]*>50k</);
+  assert.doesNotMatch(pastHtml, /usage-cache-num[^>]*>1\.1M</);
 });
