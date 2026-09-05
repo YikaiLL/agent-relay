@@ -167,7 +167,7 @@ struct SeatQuestion<'a> {
 fn live_seat_questions(relay: &RelayState) -> Vec<SeatQuestion<'_>> {
     let mut found: Vec<SeatQuestion<'_>> = relay
         .team_runs_snapshot()
-        .filter(|run| !run.status.is_terminal())
+        .filter(|run| run.is_live_in_current_build())
         .filter_map(|run| {
             let awaiting = run.awaiting.as_ref()?;
             let request = relay.pending_ask_user_questions.get(&awaiting.request_id)?;
@@ -181,6 +181,22 @@ fn live_seat_questions(relay: &RelayState) -> Vec<SeatQuestion<'_>> {
     // Oldest first.
     found.sort_by_key(|question| question.request.requested_at);
     found
+}
+
+fn has_explicit_run_id(args: &Value) -> bool {
+    args.get("run_id")
+        .and_then(Value::as_str)
+        .is_some_and(|run_id| !run_id.trim().is_empty())
+}
+
+fn active_run_preflight_can_defer_to_target(
+    name: &str,
+    args: &Value,
+    facts: &WorkspaceFacts,
+) -> bool {
+    facts.known_runs > 0
+        && has_explicit_run_id(args)
+        && matches!(name, "widen_scope" | "rerun_sub_tasks")
 }
 
 /// One tool, as MCP wants to see it.
@@ -204,7 +220,7 @@ impl AppState {
                 relay.orchestrator_proposals.len(),
                 relay
                     .team_runs_snapshot()
-                    .filter(|run| !run.status.is_terminal())
+                    .filter(|run| run.is_live_in_current_build())
                     .count(),
                 relay.team_runs_snapshot().count(),
                 live_seat_questions(&relay).len(),
@@ -246,13 +262,27 @@ impl AppState {
     /// when several are going.
     async fn one_live_run(&self, run_id: Option<&str>) -> Result<String, String> {
         let relay = self.relay.read().await;
+        if let Some(wanted) = run_id {
+            let run = relay
+                .team_run(wanted)
+                .ok_or_else(|| "there is no task with that id".to_string())?;
+            if let Some(reason) = run.non_executing_backend_reason() {
+                return Err(reason.to_string());
+            }
+            if run.status.is_terminal() {
+                return Err(format!(
+                    "this task already finished as {}",
+                    run.status.as_str()
+                ));
+            }
+            return Ok(run.id.clone());
+        }
         let mut live = relay
             .team_runs_snapshot()
-            .filter(|run| !run.status.is_terminal())
-            .filter(|run| run_id.is_none_or(|wanted| run.id == wanted))
+            .filter(|run| run.is_live_in_current_build())
             .map(|run| run.id.clone());
         match (live.next(), live.next()) {
-            (None, _) => Err("there is no task with that id".to_string()),
+            (None, _) => Err("there is no active task".to_string()),
             (Some(_), Some(_)) => Err("more than one task is going; name the run_id".to_string()),
             (Some(id), None) => Ok(id),
         }
@@ -292,6 +322,15 @@ impl AppState {
                     .team_runs_snapshot()
                     .find(|run| run.id == seat_run_id)
                     .ok_or_else(|| "this task is gone".to_string())?;
+                if let Some(reason) = run.non_executing_backend_reason() {
+                    return Err(reason.to_string());
+                }
+                if run.status.is_terminal() {
+                    return Err(format!(
+                        "this task already finished as {}",
+                        run.status.as_str()
+                    ));
+                }
                 Ok(task_definition_block(&run.id, &run.spec))
             }
             _ => Err(format!("{name} is not something the team may call")),
@@ -315,7 +354,9 @@ impl AppState {
         // serve the call says so — naming what is missing, not just refusing.
         let facts = self.orchestrator_tool_facts().await;
         if let Some(reason) = orchestrator_tools::blocked_reason(name, &facts) {
-            return Err(format!("{name}: {reason}"));
+            if !active_run_preflight_can_defer_to_target(name, args, &facts) {
+                return Err(format!("{name}: {reason}"));
+            }
         }
 
         match orchestrator_tools::parse_call(name, args)? {
@@ -540,6 +581,7 @@ answers keyed by the question text above)",
             }
             ToolCall::TaskStatus { run_id } => {
                 let relay = self.relay.read().await;
+                let live_questions = live_seat_questions(&relay);
                 let lines: Vec<String> = relay
                     .team_runs_snapshot()
                     .filter(|run| run_id.as_deref().is_none_or(|wanted| run.id == wanted))
@@ -574,7 +616,12 @@ answers keyed by the question text above)",
                                 block.push_str(first_line_bounded(summary));
                             }
                         }
-                        if let Some(awaiting) = run.awaiting.as_ref() {
+                        if let Some(awaiting) = run.awaiting.as_ref().filter(|awaiting| {
+                            live_questions.iter().any(|question| {
+                                question.run.id == run.id
+                                    && question.request.request_id == awaiting.request_id
+                            })
+                        }) {
                             block.push_str(&format!(
                                 "\n  WAITING ON YOU: {} asked something ({}) — \
 pending_questions to read it",
@@ -733,6 +780,14 @@ mod tests {
         app.set_beta_features_enabled(true).await;
         std::mem::forget((_p, _o));
         app
+    }
+
+    fn cloud_backend() -> relay_api::orchestration::OrchestrationBackendRef {
+        relay_api::orchestration::OrchestrationBackendRef::Cloud {
+            protocol_version: relay_api::orchestration::CURRENT_PROTOCOL_VERSION,
+            driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
+            cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+        }
     }
 
     fn role(name: &str, seat: Option<&str>, blurb: &str) -> crate::teams::TeamCatalogRole {
@@ -1157,6 +1212,77 @@ mod tests {
         (app, "run-note".to_string())
     }
 
+    async fn insert_inert_run(app: &AppState, cwd: &str, run_id: &str) {
+        let mut run = relay_api::team::TeamRun::new(
+            run_id.to_string(),
+            crate::state::TaskSpec {
+                title: "Future task".to_string(),
+                agreed_scope: "Future backend only.".to_string(),
+                ..Default::default()
+            },
+            cwd.to_string(),
+            "device-1".to_string(),
+        );
+        run.status = relay_api::team::TeamRunStatus::Paused;
+        run.orchestration_backend = cloud_backend();
+        app.relay.write().await.insert_team_run(run);
+    }
+
+    #[tokio::test]
+    async fn inert_runs_do_not_count_as_active_or_make_live_mutations_ambiguous() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, live_id) = app_with_a_live_run(&cwd).await;
+        insert_inert_run(&app, &cwd, "run-future").await;
+
+        let facts = app.orchestrator_tool_facts().await;
+        assert_eq!(facts.active_runs, 1);
+        assert_eq!(facts.known_runs, 2);
+
+        app.call_orchestrator_tool(
+            "message_team",
+            &json!({ "text": "Carry this note." }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("the inert run must not make the live target ambiguous");
+
+        let live = app.team_run_snapshot(&live_id).await.expect("live run");
+        assert_eq!(live.pending_user_notes, vec!["Carry this note."]);
+        let inert = app
+            .team_run_snapshot("run-future")
+            .await
+            .expect("inert run");
+        assert!(
+            inert.pending_user_notes.is_empty(),
+            "the mutation must not land on an inert record"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_orchestrator_mutation_on_inert_run_reports_backend_reason() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = ready_app(&cwd).await;
+        insert_inert_run(&app, &cwd, "run-future").await;
+
+        let error = app
+            .call_orchestrator_tool(
+                "widen_scope",
+                &json!({ "run_id": "run-future", "addition": "Also local files." }),
+                Some("device-1".to_string()),
+            )
+            .await
+            .expect_err("inert runs must refuse mutations with the backend reason");
+        assert!(error.contains("Cloud orchestration"), "{error}");
+
+        let run = app.team_run_snapshot("run-future").await.expect("run");
+        assert_eq!(
+            run.spec.agreed_scope, "Future backend only.",
+            "a refused mutation must not rewrite the visible record"
+        );
+    }
+
     /// The point of pausing is to look at what came out and then say what next.
     /// Without somewhere to put that, the only way to redirect a team was to
     /// start a whole new task.
@@ -1306,6 +1432,35 @@ mod tests {
         assert!(
             card.spec_updates.is_empty(),
             "nothing was asked for, so nothing may be rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_reopen_refuses_inert_finished_run_before_staging_card() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = ready_app(&cwd).await;
+        insert_inert_run(&app, &cwd, "run-future").await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run("run-future", |run| {
+                run.status = relay_api::team::TeamRunStatus::Done;
+            });
+        }
+
+        let error = app
+            .call_orchestrator_tool(
+                "propose_reopen",
+                &json!({ "run_id": "run-future", "text": "Try that again." }),
+                Some("device-1".to_string()),
+            )
+            .await
+            .expect_err("staging a reopen card for an inert run is a false success");
+        assert!(error.contains("Cloud orchestration"), "{error}");
+
+        assert!(
+            app.snapshot().await.orchestrator_proposals.is_empty(),
+            "a refused inert reopen must not stage a card"
         );
     }
 
@@ -1938,6 +2093,45 @@ it a turn ago"
         );
     }
 
+    async fn park_an_inert_seat(app: &AppState, cwd: &str, run_id: &str, request_id: &str) {
+        use relay_api::team::{AwaitingUser, TaskSpec, TeamRun, TeamRunStatus};
+
+        let mut relay = app.relay.write().await;
+        let mut run = TeamRun::new(
+            run_id.to_string(),
+            TaskSpec {
+                title: "Future backend question".to_string(),
+                ..TaskSpec::default()
+            },
+            cwd.to_string(),
+            "device-1".to_string(),
+        );
+        run.status = TeamRunStatus::AwaitingUser;
+        run.orchestration_backend = cloud_backend();
+        run.awaiting = Some(AwaitingUser {
+            thread_id: "thread-future".to_string(),
+            request_id: request_id.to_string(),
+            role: "dev".to_string(),
+            asked_at: 1,
+        });
+        relay.insert_team_run(run);
+        relay.pending_ask_user_questions.insert(
+            request_id.to_string(),
+            crate::state::relay::PendingAskUserQuestion {
+                request_id: request_id.to_string(),
+                tool_use_id: "tu-future".to_string(),
+                thread_id: "thread-future".to_string(),
+                requested_at: 1,
+                questions: vec![crate::protocol::AskUserQuestionView {
+                    question: "Which future path?".to_string(),
+                    header: "Future".to_string(),
+                    multi_select: false,
+                    options: Vec::new(),
+                }],
+            },
+        );
+    }
+
     async fn offered(app: &AppState) -> Vec<String> {
         app.list_orchestrator_tools()
             .await
@@ -1989,6 +2183,34 @@ it a turn ago"
             .await
             .expect_err("answering would steer a drained thread");
         assert!(err.contains("nothing is waiting"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn inert_runs_question_is_not_offered_or_answerable() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = ready_app(&cwd).await;
+        park_an_inert_seat(&app, &cwd, "run-future", "req-future").await;
+
+        let facts = app.orchestrator_tool_facts().await;
+        assert_eq!(facts.active_runs, 0);
+        assert_eq!(facts.known_runs, 1);
+        assert_eq!(facts.parked_questions, 0);
+
+        let err = app
+            .call_orchestrator_tool("pending_questions", &json!({}), Some("d".to_string()))
+            .await
+            .expect_err("an inert question must not be offered");
+        assert!(err.contains("nothing is waiting"), "{err}");
+
+        let status = app
+            .call_orchestrator_tool("task_status", &json!({}), Some("d".to_string()))
+            .await
+            .expect("task_status still shows the record");
+        assert!(
+            !status.contains("WAITING ON YOU"),
+            "task_status must not advertise an unanswerable inert question: {status}"
+        );
     }
 
     /// The status line and the question list must not be able to disagree: one

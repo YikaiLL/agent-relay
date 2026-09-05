@@ -34,7 +34,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{unix_now, WorkflowVerdict};
+use crate::{
+    orchestration::{DriverProgress, OrchestrationBackendRef},
+    unix_now, WorkflowVerdict,
+};
 
 /// Hard ceiling on review rounds per sub-task. The product rule is "at most two
 /// rounds, one is fine"; this clamps whatever a caller asks for.
@@ -676,6 +679,19 @@ pub struct TeamRun {
     pub spec: TaskSpec,
     pub sub_tasks: Vec<SubTask>,
 
+    /// Immutable orchestration backend selected for this run.
+    ///
+    /// Existing and current T1-T3 runs default to `LegacyEmbedded`. Future Cloud
+    /// and local-sidecar runs may be decoded by this public model, but this relay
+    /// build cannot drive them without the later transport/executor tasks.
+    #[serde(default)]
+    pub orchestration_backend: OrchestrationBackendRef,
+    /// Durable cursor/progress counters for the future command journal. T1-T3
+    /// persists them only; the live embedded driver is not migrated onto this
+    /// bookkeeping yet.
+    #[serde(default)]
+    pub driver_progress: DriverProgress,
+
     /// Named team this run belongs to. Written into the token ledger at spend
     /// time. `None` only for runs started before team identity existed.
     pub team_id: Option<String>,
@@ -830,6 +846,144 @@ impl TeamRun {
             requested_at: now,
             updated_at: now,
             ..Self::default()
+        }
+    }
+
+    /// Whether execution has begun in any observable way.
+    ///
+    /// Backend selection must happen before this flips. The predicate is wider
+    /// than `status != Queued` because old or hand-written records may be missing
+    /// one field while already naming threads, sub-tasks, progress, or results.
+    pub fn orchestration_execution_started(&self) -> bool {
+        self.status != TeamRunStatus::Queued
+            || self.phase != TeamPhase::Intake
+            || !self.tl_thread_id.is_empty()
+            || !self.tl_succession.is_empty()
+            || !self.run_owned_thread_ids.is_empty()
+            || self.mr_dev_thread_id.is_some()
+            || !self.sub_tasks.is_empty()
+            || self.driver_progress.state_revision != 0
+            || self.driver_progress.last_command_seq != 0
+            || self.driver_progress.last_event_seq != 0
+            || self.driver_progress.in_flight_command_id.is_some()
+            || self.complex.is_some()
+            || self.design_verdict.is_some()
+            || self.mr_verdict.is_some()
+            || !self.unresolved.is_empty()
+            || self.head_commit.is_some()
+            || self.awaiting.is_some()
+            || self.pause_requested
+            || self.stopping
+            || self.error.is_some()
+    }
+
+    /// Select the run backend before execution begins.
+    pub fn set_orchestration_backend(
+        &mut self,
+        backend: OrchestrationBackendRef,
+    ) -> Result<bool, &'static str> {
+        if self.orchestration_backend == backend {
+            return Ok(false);
+        }
+        if self.orchestration_execution_started() {
+            return Err("orchestration backend cannot change after execution begins");
+        }
+        self.orchestration_backend = backend;
+        self.updated_at = unix_now();
+        Ok(true)
+    }
+
+    pub fn is_executable_by_current_build(&self) -> bool {
+        self.orchestration_backend.is_executable_by_current_build()
+    }
+
+    pub fn is_live_in_current_build(&self) -> bool {
+        self.is_executable_by_current_build() && !self.status.is_terminal()
+    }
+
+    pub fn non_executing_backend_reason(&self) -> Option<&'static str> {
+        self.orchestration_backend.non_executing_reason()
+    }
+
+    /// Reconcile a run whose driver is gone after process restart.
+    ///
+    /// The restore path has no live driver left to finish a transition. Paused
+    /// runs stay paused; pause-settling and parked-question runs land in a
+    /// recoverable pause; executable legacy runs that were otherwise active are
+    /// interrupted; unsupported backend records that were otherwise active fail
+    /// closed while preserving their backend pin and prior diagnostics.
+    pub fn reconcile_after_restore(&mut self) -> bool {
+        if self.status.is_terminal() {
+            return false;
+        }
+
+        let settled_before = (
+            self.pause_requested,
+            self.stopping,
+            self.awaiting.clone(),
+            self.error.clone(),
+        );
+        if let Some(reason) = self.non_executing_backend_reason() {
+            self.append_restore_error(reason);
+        }
+
+        match self.status {
+            TeamRunStatus::Paused => {
+                self.pause_requested = false;
+                self.stopping = false;
+                self.awaiting = None;
+                let changed = settled_before
+                    != (
+                        self.pause_requested,
+                        self.stopping,
+                        self.awaiting.clone(),
+                        self.error.clone(),
+                    );
+                if changed {
+                    self.updated_at = unix_now();
+                }
+                changed
+            }
+            TeamRunStatus::PausePending => {
+                self.settle_paused(
+                    "the relay restarted while the team was pausing",
+                    TeamPauseKind::Boundary,
+                );
+                true
+            }
+            TeamRunStatus::AwaitingUser => {
+                self.rollback_current_round();
+                self.settle_paused(
+                    "the relay restarted while the team was waiting on your answer; that step will be re-run",
+                    TeamPauseKind::Boundary,
+                );
+                true
+            }
+            _ if self.is_executable_by_current_build() => self.mark_interrupted_if_stranded(),
+            _ => {
+                self.pause_requested = false;
+                self.stopping = false;
+                self.awaiting = None;
+                self.status = TeamRunStatus::Failed;
+                self.updated_at = unix_now();
+                true
+            }
+        }
+    }
+
+    fn append_restore_error(&mut self, reason: &str) {
+        match self.error.as_mut() {
+            Some(error) if error.contains(reason) => {}
+            Some(error) if error.trim().is_empty() => {
+                *error = reason.to_string();
+            }
+            Some(error) => {
+                error.push_str("; ");
+                error.push_str(reason);
+            }
+            None => {
+                self.error = Some(reason.to_string());
+            }
         }
     }
 
@@ -1461,6 +1615,275 @@ mod tests {
             let decoded: TeamRunStatus = serde_json::from_str(&encoded).expect("deserialize");
             assert_eq!(decoded, status, "round trip failed for {}", status.as_str());
             assert_eq!(encoded, format!("\"{}\"", status.as_str()));
+        }
+    }
+
+    #[test]
+    fn new_team_runs_are_legacy_embedded_with_empty_driver_progress() {
+        let run = TeamRun::new(
+            "r".to_string(),
+            TaskSpec::default(),
+            "/tmp/wt".to_string(),
+            "device".to_string(),
+        );
+        assert_eq!(
+            run.orchestration_backend,
+            OrchestrationBackendRef::LegacyEmbedded
+        );
+        assert_eq!(run.driver_progress.state_revision, 0);
+        assert_eq!(run.driver_progress.last_command_seq, 0);
+        assert_eq!(run.driver_progress.last_event_seq, 0);
+        assert!(run.driver_progress.in_flight_command_id.is_none());
+    }
+
+    #[test]
+    fn legacy_json_defaults_to_legacy_embedded_backend() {
+        let run: TeamRun = serde_json::from_str(r#"{"id":"r","status":"paused"}"#)
+            .expect("legacy run must decode");
+        assert_eq!(
+            run.orchestration_backend,
+            OrchestrationBackendRef::LegacyEmbedded
+        );
+        assert_eq!(run.driver_progress, Default::default());
+    }
+
+    #[test]
+    fn current_build_liveness_is_executable_legacy_and_non_terminal() {
+        let mut run = TeamRun::new(
+            "r".to_string(),
+            TaskSpec::default(),
+            "/tmp/wt".to_string(),
+            "device".to_string(),
+        );
+        for status in [
+            TeamRunStatus::Queued,
+            TeamRunStatus::Running,
+            TeamRunStatus::PausePending,
+            TeamRunStatus::Paused,
+            TeamRunStatus::AwaitingUser,
+            TeamRunStatus::Blocked,
+            TeamRunStatus::Resolving,
+        ] {
+            run.status = status;
+            assert!(run.is_executable_by_current_build(), "{status:?}");
+            assert!(run.is_live_in_current_build(), "{status:?}");
+        }
+        for status in [
+            TeamRunStatus::Done,
+            TeamRunStatus::Escalated,
+            TeamRunStatus::Failed,
+            TeamRunStatus::Interrupted,
+            TeamRunStatus::Cancelled,
+        ] {
+            run.status = status;
+            assert!(run.is_executable_by_current_build(), "{status:?}");
+            assert!(!run.is_live_in_current_build(), "{status:?}");
+        }
+
+        run.status = TeamRunStatus::Paused;
+        run.orchestration_backend = OrchestrationBackendRef::Cloud {
+            protocol_version: crate::orchestration::CURRENT_PROTOCOL_VERSION,
+            driver_version: crate::orchestration::DriverVersion::new("driver.1").unwrap(),
+            cloud_run_id: crate::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+        };
+        assert!(!run.is_executable_by_current_build());
+        assert!(!run.is_live_in_current_build());
+    }
+
+    #[test]
+    fn explicit_malformed_backend_refs_become_non_executing() {
+        for backend_json in ["null", "{}"] {
+            let run: TeamRun = serde_json::from_str(&format!(
+                r#"{{"id":"r","status":"paused","orchestration_backend":{backend_json}}}"#
+            ))
+            .expect("malformed backend ref must not drop the run");
+            assert_eq!(
+                run.orchestration_backend,
+                OrchestrationBackendRef::unknown_non_executing(),
+                "explicit malformed backend must fail closed: {backend_json}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_can_only_change_before_execution_begins() {
+        let mut run = TeamRun::new(
+            "r".to_string(),
+            TaskSpec::default(),
+            "/tmp/wt".to_string(),
+            "device".to_string(),
+        );
+        let cloud = OrchestrationBackendRef::Cloud {
+            protocol_version: crate::orchestration::CURRENT_PROTOCOL_VERSION,
+            driver_version: crate::orchestration::DriverVersion::new("driver.1").unwrap(),
+            cloud_run_id: crate::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+        };
+        assert!(run.set_orchestration_backend(cloud.clone()).unwrap());
+        assert_eq!(run.orchestration_backend, cloud);
+
+        run.set_status(TeamRunStatus::Running);
+        let sidecar = OrchestrationBackendRef::LocalSidecar {
+            protocol_version: crate::orchestration::CURRENT_PROTOCOL_VERSION,
+            driver_version: crate::orchestration::DriverVersion::new("driver.2").unwrap(),
+        };
+        assert!(run.set_orchestration_backend(sidecar).is_err());
+        assert_eq!(run.orchestration_backend, cloud);
+    }
+
+    #[test]
+    fn future_backend_records_become_non_executing_without_losing_the_run() {
+        let mut run: TeamRun = serde_json::from_str(
+            r#"{
+                "id":"r",
+                "status":"paused",
+                "in_flight_thread":"thread-sensitive",
+                "orchestration_backend":{"kind":"quantum_cloud","future_field":"ignored"}
+            }"#,
+        )
+        .expect("unknown backend kind must not fail the whole run");
+        assert_eq!(
+            run.orchestration_backend.original_unknown_kind(),
+            Some("quantum_cloud")
+        );
+        run.error = Some("older unrelated failure".to_string());
+        assert!(run.reconcile_after_restore());
+        assert_eq!(run.status, TeamRunStatus::Paused);
+        let error = run.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("older unrelated failure"),
+            "the original restore error must survive: {:?}",
+            run.error
+        );
+        assert!(
+            error.contains("does not understand"),
+            "the backend-pin reason must be appended: {:?}",
+            run.error
+        );
+        assert_eq!(run.in_flight_thread.as_deref(), Some("thread-sensitive"));
+        assert!(run.status.is_resumable());
+        assert!(!run.is_executable_by_current_build());
+        assert!(!run.is_live_in_current_build());
+    }
+
+    #[test]
+    fn future_backend_pause_pending_records_settle_to_recoverable_pause() {
+        let mut run: TeamRun = serde_json::from_str(
+            r#"{
+                "id":"r",
+                "status":"pause_pending",
+                "pause_requested":true,
+                "stopping":true,
+                "in_flight_thread":"thread-sensitive",
+                "error":"stop was already draining",
+                "orchestration_backend":{"kind":"quantum_cloud"}
+            }"#,
+        )
+        .expect("unknown backend kind must not fail the whole run");
+
+        assert!(run.reconcile_after_restore());
+        assert_eq!(run.status, TeamRunStatus::Paused);
+        assert!(run.status.is_resumable());
+        assert!(!run.is_live_in_current_build());
+        assert!(!run.pause_requested);
+        assert!(!run.stopping);
+        assert!(run.in_flight_thread.is_none());
+        assert_eq!(
+            run.pause_reason.as_deref(),
+            Some("the relay restarted while the team was pausing")
+        );
+        assert_eq!(run.pause_kind, Some(TeamPauseKind::Boundary));
+        let error = run.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("stop was already draining"),
+            "the prior stop/error reason must survive: {:?}",
+            run.error
+        );
+        assert!(
+            error.contains("does not understand"),
+            "the backend-pin reason must be appended: {:?}",
+            run.error
+        );
+    }
+
+    #[test]
+    fn future_backend_awaiting_user_records_roll_back_and_settle_to_pause() {
+        let mut run: TeamRun = serde_json::from_str(
+            r#"{
+                "id":"r",
+                "status":"awaiting_user",
+                "phase":"sub_tasks",
+                "error":"question was pending",
+                "awaiting":{
+                    "thread_id":"dev-1",
+                    "request_id":"ask-1",
+                    "role":"dev",
+                    "asked_at":1
+                },
+                "sub_tasks":[{
+                    "id":"s1",
+                    "title":"one",
+                    "status":"implementing",
+                    "rounds_used":1
+                }],
+                "orchestration_backend":{"kind":"quantum_cloud"}
+            }"#,
+        )
+        .expect("unknown backend kind must not fail the whole run");
+
+        assert!(run.reconcile_after_restore());
+        assert_eq!(run.status, TeamRunStatus::Paused);
+        assert!(run.status.is_resumable());
+        assert!(!run.is_live_in_current_build());
+        assert!(run.awaiting.is_none());
+        assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Pending);
+        assert_eq!(run.sub_tasks[0].rounds_used, 1);
+        assert_eq!(
+            run.pause_reason.as_deref(),
+            Some(
+                "the relay restarted while the team was waiting on your answer; that step will be re-run"
+            )
+        );
+        assert_eq!(run.pause_kind, Some(TeamPauseKind::Boundary));
+        let error = run.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("question was pending"),
+            "the prior awaiting-user reason must survive: {:?}",
+            run.error
+        );
+        assert!(
+            error.contains("does not understand"),
+            "the backend-pin reason must be appended: {:?}",
+            run.error
+        );
+    }
+
+    #[test]
+    fn non_paused_future_backend_records_restore_terminal_but_keep_backend_reason() {
+        for status in ["queued", "running", "blocked", "resolving"] {
+            let mut run: TeamRun = serde_json::from_str(&format!(
+                r#"{{
+                    "id":"r",
+                    "status":"{status}",
+                    "orchestration_backend":{{"kind":"quantum_cloud"}}
+                }}"#,
+            ))
+            .expect("unknown backend kind must not fail the whole run");
+            run.error = Some("older unrelated failure".to_string());
+
+            assert!(run.reconcile_after_restore());
+            assert_eq!(run.status, TeamRunStatus::Failed, "{status}");
+            let error = run.error.as_deref().unwrap_or_default();
+            assert!(
+                error.contains("older unrelated failure"),
+                "the original restore error must survive for {status}: {:?}",
+                run.error
+            );
+            assert!(
+                error.contains("does not understand"),
+                "the backend-pin reason must be appended for {status}: {:?}",
+                run.error
+            );
+            assert!(!run.status.is_resumable(), "{status}");
         }
     }
 
