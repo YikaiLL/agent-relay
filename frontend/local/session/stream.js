@@ -155,6 +155,13 @@ export function createStreamController(ctx) {
       // merged with `stream::select` — so the newest snapshot can arrive BEFORE this
       // notice. With no further state change afterwards, nothing would ever refetch.
       // Drive the fetch directly instead.
+      //
+      // Settle FIRST: renderedTranscriptFromWindow treats a non-"full" entry as
+      // untrusted and falls back to the array's copy, which for a still-pending
+      // delta is the stale pre-delta text — invalidating before that delta
+      // settles paints a rollback. Mirrors remote's scheduleTranscriptGapRepair
+      // (session-ops.js:619-630).
+      settleTranscriptProjection(state);
       invalidateTranscriptWindowForRepair(state);
       void ensureConversationTranscript?.(state.session);
       // Whatever text is already pending must not sit out the coalescing

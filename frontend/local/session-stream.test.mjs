@@ -252,6 +252,83 @@ test("transcript_stream_lagged brings a pending render forward instead of leavin
   assert.equal(renders.length, 1, "the absorbed window timer must not render a second time");
 });
 
+// P1: the test above never loads a hydration window, so the delta it applies
+// lands directly in state.session.transcript and cannot exercise the deferred
+// window->array projection at all — see transcript/store.js's "Deferred
+// window->array projection" section. This one loads a real window, so the
+// delta is pending ONLY there when the lagged notice fires, the same shape as
+// remote's scheduleTranscriptGapRepair (session-ops.js:619-630).
+test("transcript_stream_lagged settles the pending window delta before invalidating, so the immediate render carries the newest text", () => {
+  let fetchCalls = 0;
+  const ensureConversationTranscript = () => {
+    fetchCalls += 1;
+    return Promise.resolve();
+  };
+  const { clock, controller, renders, state, transcriptFlushScheduler } = makeController({
+    ensureConversationTranscript,
+  });
+
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationOrder = ["agent-1"];
+  state.transcriptHydrationEntries = new Map([
+    [
+      "agent-1",
+      {
+        item_id: "agent-1",
+        kind: "agent_text",
+        status: "running",
+        text: "hello",
+        tool: null,
+        entry_seq: null,
+        content_state: "full",
+      },
+    ],
+  ]);
+  state.session.transcript[0].text = "hello";
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: " world",
+    item_id: "agent-1",
+    revision: 6,
+    text_offset: 5,
+    thread_id: "thread-1",
+  });
+
+  // Preconditions: the delta reached the window (O(1) write) but the O(n)
+  // projection back onto the array is deferred — this is the state a naive
+  // test (like the one above) can never produce.
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").text,
+    "hello world",
+    "precondition: the delta landed in the window"
+  );
+  assert.equal(
+    state.session.transcript[0].text,
+    "hello",
+    "precondition: the array projection is still pending"
+  );
+  assert.equal(renders.length, 0, "precondition: the delta is still coalescing");
+
+  controller.applySessionStreamEvent("transcript_stream_lagged", { dropped: 3 });
+
+  assert.equal(renders.length, 1, "the lagged notice must flush immediately");
+  assert.equal(
+    renders[0].transcript[0].text,
+    "hello world",
+    "the immediate render must carry the newest text — invalidating before the pending delta settles " +
+      "makes the projection fall back to the array's stale pre-delta copy instead"
+  );
+  assert.equal(fetchCalls, 1, "the refetch must still have been requested");
+  assert.equal(
+    transcriptFlushScheduler.stats().pending,
+    false,
+    "the coalesced timer must be absorbed by the immediate flush"
+  );
+
+  clock.tick(TRANSCRIPT_FLUSH_MAX_WINDOW_MS);
+  assert.equal(renders.length, 1, "the absorbed window timer must not render a second time later");
+});
+
 // P1 (review): a terminal entry patch used to end at the same coalescing
 // queueTranscriptRender() as an ordinary streaming delta, so a completion /
 // failure / error / cancellation sat behind the 100-300ms window instead of
