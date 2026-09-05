@@ -3017,13 +3017,34 @@ mod tests {
             ),
         ];
 
+        let mut covered_kinds = Vec::new();
         for (command, fixture) in commands {
+            let expected_kind = match &command {
+                DriverCommand::RequireWorkspace {} => "require_workspace",
+                DriverCommand::StartThread { .. } => "start_thread",
+                DriverCommand::ResumeOrStartThread { .. } => "resume_or_start_thread",
+                DriverCommand::RunTemplate { .. } => "run_template",
+                DriverCommand::CheckpointCommit {} => "checkpoint_commit",
+                DriverCommand::CollectDiff { .. } => "collect_diff",
+                DriverCommand::MergeBase { .. } => "merge_base",
+                DriverCommand::Commit { .. } => "commit",
+                DriverCommand::PauseAtBoundary {} => "pause_at_boundary",
+                DriverCommand::SettleRun { .. } => "settle_run",
+            };
             let encoded = serde_json::to_string(&command).expect("serialize command");
             assert_eq!(encoded, fixture);
+            let fixture_value: serde_json::Value =
+                serde_json::from_str(fixture).expect("decode command fixture value");
+            assert_eq!(
+                fixture_value.get("kind").and_then(|value| value.as_str()),
+                Some(expected_kind)
+            );
+            covered_kinds.push(expected_kind);
             let decoded: DriverCommand =
                 serde_json::from_str(fixture).expect("decode command fixture");
             assert_eq!(decoded, command);
         }
+        assert_eq!(covered_kinds.as_slice(), EXPECTED_DRIVER_COMMAND_KINDS);
     }
 
     #[test]
@@ -3129,12 +3150,33 @@ mod tests {
             ),
         ];
 
+        let mut covered_kinds = Vec::new();
         for (event, fixture) in events {
+            let expected_kind = match &event {
+                DriverEvent::CommandAccepted {} => "command_accepted",
+                DriverEvent::CommandRejected { .. } => "command_rejected",
+                DriverEvent::WorkspaceReady {} => "workspace_ready",
+                DriverEvent::ThreadReady { .. } => "thread_ready",
+                DriverEvent::TurnFinished { .. } => "turn_finished",
+                DriverEvent::DiffCollected { .. } => "diff_collected",
+                DriverEvent::MergeBaseResolved { .. } => "merge_base_resolved",
+                DriverEvent::CommitRecorded { .. } => "commit_recorded",
+                DriverEvent::CursorAdvanced { .. } => "cursor_advanced",
+                DriverEvent::RunSettled { .. } => "run_settled",
+            };
             let encoded = serde_json::to_string(&event).expect("serialize event");
             assert_eq!(encoded, fixture);
+            let fixture_value: serde_json::Value =
+                serde_json::from_str(fixture).expect("decode event fixture value");
+            assert_eq!(
+                fixture_value.get("kind").and_then(|value| value.as_str()),
+                Some(expected_kind)
+            );
+            covered_kinds.push(expected_kind);
             let decoded: DriverEvent = serde_json::from_str(fixture).expect("decode event fixture");
             assert_eq!(decoded, event);
         }
+        assert_eq!(covered_kinds.as_slice(), EXPECTED_DRIVER_EVENT_KINDS);
     }
 
     #[test]

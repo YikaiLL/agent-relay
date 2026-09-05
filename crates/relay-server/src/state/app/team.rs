@@ -2198,13 +2198,12 @@ over on resume"
         {
             let _gate = self.team_drive_gate.lock().await;
             // Repeated under the gate: a stop can land in the awaits between the
-            // early check above and here (`request_stop` sets its flags before
-            // ever taking this same gate) — `team_turn_preflight` below does NOT
-            // catch it, because a graceful/draining stop leaves the run
+            // early check above and here. `request_stop` mutates its flags under
+            // this same gate, and `team_turn_preflight` below does NOT catch a
+            // graceful/draining stop by itself because it leaves the run
             // `PausePending`, which is neither terminal nor settled-without-driver.
-            // Once we hold the gate a concurrent stop either already landed its
-            // flags (so this sees them) or is queued behind us — either way this
-            // refusal is what closes the race, whether or not it settles here.
+            // Once we hold the gate a concurrent stop either already completed
+            // its gated mutation (so this sees it) or is queued behind us.
             if let Some(reason) = self.reviewer_turn_refusal(run_id, slot).await {
                 return TeamTurnOutcome::Failed(reason);
             }

@@ -91,6 +91,13 @@ identity fields it already knows how to validate (`original_kind`,
 `protocol_version`, `driver_version`, `cloud_run_id`); unsupported future
 payload fields are dropped rather than preserved as arbitrary JSON.
 
+The current archival lifecycle for inert unsupported-backend runs is explicit:
+if a paused inert run loses its worktree, restore/validation changes it to a
+diagnostic `Blocked` state; executable blocked-run resolution refuses to resume
+that inert record in this build; explicit `Cancelled` archival is the supported
+current-build exit and releases local provider seats. All diagnostic prose and
+seat-release work stay local.
+
 `sealwire-private` and private deployments:
 
 - Driver state machine, scheduling, retry/review/fix policy, and template
@@ -113,6 +120,9 @@ with explicit events, artifacts, and allowlisted templates.
 For methods that return `TeamPortError`, `Blocked(String)` and `Failed(String)`
 carry free-form local diagnostic prose. Those strings are not protocol rejection
 codes and must not cross the Cloud content-blind boundary.
+`TeamPortError::Settled` remains the prose-free race result: it means another
+state transition already settled the run while the mechanism was waiting, and
+it carries no diagnostic string.
 
 | Method | Current inputs/outputs | Sensitive surface | Classification |
 |---|---|---|---|
