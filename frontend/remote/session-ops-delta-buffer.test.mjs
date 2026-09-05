@@ -285,6 +285,46 @@ test("a duplicate re-delivery against the buffered view is a no-op", async () =>
   );
 });
 
+// P2 (review): the four offset outcomes were only exercised against the
+// array-fallback path (freshRemoteSession); the loaded-window O(1) path
+// (freshRemoteSessionWithWindow) needs its own coverage for each outcome too
+// — the two paths read/write different state, so a regression in one is
+// invisible to a test against the other.
+test("with a loaded hydration window, a duplicate re-delivery is a no-op", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSessionWithWindow();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 6,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-1").text,
+    "Hello world",
+    "the duplicate must be recognized against the window's own cached text, not double-applied"
+  );
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(state.session.transcript[0].text, "Hello world");
+});
+
 // A run of rejected deltas for the same item (duplicates, then a genuine
 // gap) must neither corrupt the array nor let a later, unrelated flush count
 // them as a rebuild — each is read-and-decided fresh against the CURRENT
@@ -438,6 +478,50 @@ test("a byte mismatch against the buffered view schedules repair instead of corr
   delete window.__transcriptGapRepairCount;
 });
 
+test("with a loaded hydration window, a byte mismatch schedules repair instead of corrupting text", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSessionWithWindow();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+  window.__transcriptGapRepairCount = 0;
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " wor",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  // Overlaps the window's cached " wor" (offset 6..9 is "or ") with different bytes.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 6,
+    revision: 7,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "XX",
+    delta_kind: "agent_text",
+    text_offset: 6,
+  });
+
+  assert.equal(window.__transcriptGapRepairCount, 1, "the mismatch must be caught against the window's own cached text");
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-1").text,
+    "Hello wor",
+    "the window's pre-mismatch text must survive — the mismatched delta itself must not apply"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-1").content_state,
+    "full",
+    "a rejected delta must not itself touch content_state — only the async repair fetch may downgrade it"
+  );
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(state.session.transcript[0].text, "Hello wor");
+  delete window.__transcriptGapRepairCount;
+});
+
 test("a gap against the buffered view schedules repair instead of corrupting text", async () => {
   activeBrowser || installBrowserStubs();
   const state = await freshRemoteSession();
@@ -467,6 +551,41 @@ test("a gap against the buffered view schedules repair instead of corrupting tex
   });
 
   assert.equal(window.__transcriptGapRepairCount, 1);
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(state.session.transcript[0].text, "Hello wor");
+  delete window.__transcriptGapRepairCount;
+});
+
+test("with a loaded hydration window, a gap schedules repair instead of corrupting text", async () => {
+  activeBrowser || installBrowserStubs();
+  const state = await freshRemoteSessionWithWindow();
+  const { applyTranscriptDelta, flushRemoteTranscriptRenderForTest } = await import("./session-ops.js");
+  window.__transcriptGapRepairCount = 0;
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 5,
+    revision: 6,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: " wor",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+  // have = 9 (window's cached text); offset 15 is beyond it.
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    base_revision: 6,
+    revision: 7,
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "ld!",
+    delta_kind: "agent_text",
+    text_offset: 15,
+  });
+
+  assert.equal(window.__transcriptGapRepairCount, 1);
+  assert.equal(state.transcriptHydrationEntries.get("item-1").text, "Hello wor");
   flushRemoteTranscriptRenderForTest();
   assert.equal(state.session.transcript[0].text, "Hello wor");
   delete window.__transcriptGapRepairCount;

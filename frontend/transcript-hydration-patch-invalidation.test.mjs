@@ -71,16 +71,66 @@ test("invalidateTranscriptWindowEntryForPatch downgrades content_state and blank
   assert.equal(entry.status, "running", "the patch's OWN fields never land in the window — only the caller's array carries them");
 });
 
-test("invalidateTranscriptWindowEntryForPatch is a no-op (and does not re-blank text) for an entry that is already non-full", () => {
+test("invalidateTranscriptWindowEntryForPatch is a true no-op for an entry that is already blanked and non-full", () => {
   const state = loadedWindowState("thread-1", [
-    { item_id: "item-1", kind: "agent_text", text: "partial", status: "running", turn_id: "turn-1", tool: null, content_state: "omitted" },
+    { item_id: "item-1", kind: "agent_text", text: "", status: "running", turn_id: "turn-1", tool: null, content_state: "omitted" },
   ]);
 
   const changed = invalidateTranscriptWindowEntryForPatch(state, "thread-1", { item_id: "item-1", status: "completed" });
 
   assert.equal(changed, false);
-  assert.equal(state.transcriptHydrationEntries.get("item-1").text, "partial", "already-untrusted text is left alone");
   assert.equal(state.transcriptHydrationEntries.get("item-1").content_state, "omitted");
+});
+
+// P1 (review): a status-only patch (completion with no body of its own) used
+// to no-op against a PREVIEW/OMITTED entry, on the theory that it was already
+// untrusted. But "untrusted" only gates renderedTranscriptFromWindow's own
+// projection — it does nothing to stop applyTranscriptDeltaToWindow's merge
+// branch (line ~906 above), which reads the cached TEXT regardless of
+// content_state. Left in place, a truncated preview's stale text becomes the
+// base a later delta's offset is checked against; if that later delta's
+// offset happens to match the stale length (a coalesced/re-sent chunk, or
+// just the next chunk of the real stream picking up where the truncated
+// preview left off), the merge accepts it as a contiguous append and marks
+// the result CONTENT_STATE_FULL — silently making the preview's truncated
+// prefix authoritative and permanently suppressing the real hydration fetch.
+// Blanking the text here (not just downgrading content_state) closes that:
+// the next delta then sees `have = 0` against a non-zero offset, which is a
+// gap, not a match.
+test("a status-only patch against a TRUNCATED (preview) entry must blank its stale text too, or a later delta can silently promote it to full", () => {
+  const state = loadedWindowState("thread-1", [
+    {
+      item_id: "item-1",
+      kind: "agent_text",
+      text: "The quick brown fox truncated at some point...",
+      status: "running",
+      turn_id: "turn-1",
+      tool: null,
+      content_state: "preview",
+    },
+  ]);
+
+  const changed = invalidateTranscriptWindowEntryForPatch(state, "thread-1", {
+    item_id: "item-1",
+    status: "completed",
+  });
+
+  assert.equal(changed, true);
+  const entry = state.transcriptHydrationEntries.get("item-1");
+  assert.equal(entry.text, "", "stale preview text must not survive as a future delta's offset base");
+  assert.equal(entry.content_state, "preview");
+
+  // Prove the failure mode this closes: a delta whose offset matches the
+  // OLD preview text's length must now be refused as a gap instead of
+  // silently accepted and promoted to full.
+  const applied = applyTranscriptDeltaToWindow(state, {
+    item_id: "item-1",
+    thread_id: "thread-1",
+    delta: " continued",
+    text_offset: 48,
+  });
+  assert.equal(applied, false, "must be refused as a gap, not merged onto the stale pre-patch text");
+  assert.equal(state.transcriptHydrationEntries.get("item-1").content_state, "preview", "must not have been promoted to full");
 });
 
 test("renderedTranscriptFromWindow falls back to the array's current entry once the window copy is invalidated", () => {

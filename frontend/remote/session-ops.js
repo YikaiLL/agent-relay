@@ -736,17 +736,47 @@ async function repairActiveTranscriptTail(threadId, targetRevision) {
   // The repaired tail replaces the array directly, same as local's tail
   // repair — but if the window happens to be loaded for this same thread,
   // its cached copies are now stale relative to what was just fetched.
-  // Mark them non-authoritative so the ordinary re-hydration gate refetches
-  // them, the same signal a lagged stream raises.
-  // The repaired tail replaces the array directly, same as local's tail
-  // repair — but if the window happens to be loaded for this same thread,
-  // its cached copies are now stale relative to what was just fetched.
-  // Mark them non-authoritative so the ordinary re-hydration gate refetches
-  // them, the same signal a lagged stream raises.
   if (transcriptWindowIsLoaded(state, threadId)) {
+    // Distrust everything first — covers whatever the bounded tail page did
+    // NOT reach (`olderKept`, above), the same signal a lagged stream raises.
     invalidateTranscriptWindowForRepair(state);
+    // Then resync exactly what the repair DID reach. `repairedTail` is
+    // freshly fetched, authoritative content — a hydration/snapshot-merge
+    // case the plan sanctions writing directly (.sealwire/PLAN.md, "Invalidate;
+    // do not write" only bans a PATCH, which carries no body, from writing).
+    // Downgrading to preview without ALSO updating the cached text left the
+    // window holding the PRE-repair (wrong, shorter) text at `full`-adjacent
+    // trust; the next delta's offset check reads that stale length as `have`
+    // (applyTranscriptDelta, above), so a delta already valid against the
+    // just-repaired array was wrongly reported as a second offset_gap.
+    syncTranscriptWindowWithRepairedEntries(state, threadId, repairedTail);
   }
   commit(nextSession);
+}
+
+// Only touches items the window already tracks — never adds a new id or
+// mutates `transcriptHydrationOrder`, so a partial Map write here can never
+// make an unloaded window look loaded (the same invariant
+// invalidateTranscriptWindowEntryForPatch holds for a patch).
+function syncTranscriptWindowWithRepairedEntries(state, threadId, repairedEntries) {
+  if (state.transcriptHydrationThreadId !== threadId) {
+    return;
+  }
+  const entries = state.transcriptHydrationEntries;
+  if (!(entries instanceof Map)) {
+    return;
+  }
+  for (const entry of repairedEntries) {
+    const itemId = entry?.item_id;
+    if (!itemId || !entries.has(itemId)) {
+      continue;
+    }
+    entries.set(itemId, {
+      ...entries.get(itemId),
+      ...entry,
+      content_state: "full",
+    });
+  }
 }
 
 export function applyTranscriptEvent(event) {

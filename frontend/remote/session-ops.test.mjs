@@ -5427,7 +5427,7 @@ test("applySessionSnapshot settles before merging — a pending delta and a snap
   );
 });
 
-test("repairActiveTranscriptTail invalidates the loaded window so re-hydration does not trust a copy the repair just overwrote", async () => {
+test("repairActiveTranscriptTail resyncs the loaded window to the repaired text instead of leaving a stale trusted copy", async () => {
   activeBrowser = installBrowserStubs();
   const sentPayloads = [];
   const { state, saveRemoteAuth } = await import("./state.js");
@@ -5518,11 +5518,261 @@ test("repairActiveTranscriptTail invalidates the loaded window so re-hydration d
 
   await waitFor(() => state.realSession?.transcript?.[0]?.text === "Hello world");
   assert.equal(sentPayloads.length, 1);
+  // The item IS covered by the repaired page, so its window copy must be
+  // resynced to the repaired text and re-marked full — not merely downgraded
+  // to preview while still holding the pre-repair, now-wrong-length text (a
+  // stale copy there would falsely fail the NEXT delta's offset check; see
+  // "a delta immediately after a tail repair..." below).
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-1")?.text,
+    "Hello world",
+    "the window's cached copy must be resynced to the just-repaired text, not left holding the pre-repair body"
+  );
   assert.equal(
     state.transcriptHydrationEntries.get("item-1")?.content_state,
-    "preview",
-    "the window's cached copy must be downgraded — repair rewrote the array directly and the window is now stale relative to it"
+    "full",
+    "content covered by the repair is authoritative — the same as any hydration/snapshot merge"
   );
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-1")?.status,
+    "completed",
+    "the repaired entry's own fields (status, etc.) must land in the window too, not just its text"
+  );
+
+  clearSessionRuntime();
+  state.socket = null;
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+});
+
+// The resync above must not become a blanket "trust everything again": an
+// item the bounded repair page does NOT reach (still tracked in the window
+// from before, e.g. retained older history) has nothing authoritative to
+// resync from, so it must stay invalidated — the original safety net
+// invalidateTranscriptWindowForRepair provides.
+test("repairActiveTranscriptTail still invalidates a window entry the repair page does not cover", async () => {
+  activeBrowser = installBrowserStubs();
+  const sentPayloads = [];
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+  const { applySessionSnapshot, applyTranscriptDelta, clearSessionRuntime } =
+    await import("./session-ops.js");
+  const { remoteQueryClient } = await import("./query-client.js");
+
+  clearSessionRuntime();
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-repair-partial-coverage",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-partial" });
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+
+  applySessionSnapshot({
+    active_thread_id: "thread-partial-coverage",
+    active_turn_id: "turn-1",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript_truncated: false,
+    transcript_revision: 5,
+    transcript: [
+      { item_id: "item-older", kind: "agent_text", status: "completed", text: "Older", turn_id: "turn-0", tool: null },
+      { item_id: "item-1", kind: "agent_text", status: "running", text: "Hello", turn_id: "turn-1", tool: null },
+    ],
+  });
+  state.transcriptHydrationThreadId = "thread-partial-coverage";
+  state.transcriptHydrationEntries = new Map([
+    ["item-older", { ...state.session.transcript[0], content_state: "full" }],
+    ["item-1", { ...state.session.transcript[1], content_state: "full" }],
+  ]);
+  state.transcriptHydrationOrder = ["item-older", "item-1"];
+
+  state.socket = {
+    readyState: 1,
+    send(frameText) {
+      const frame = JSON.parse(frameText);
+      sentPayloads.push(frame.payload);
+      setImmediate(async () => {
+        await handleRemoteBrokerPayload({
+          kind: "remote_action_result",
+          action_id: frame.payload.action_id,
+          action: "fetch_thread_transcript",
+          ok: true,
+          snapshot: {},
+          thread_transcript: {
+            thread_id: "thread-partial-coverage",
+            revision: 8,
+            // The bounded tail page reaches only item-1 — item-older is
+            // outside its window and keeps its place in the array untouched.
+            entries: [
+              { item_id: "item-1", kind: "agent_text", text: "Hello world", status: "completed", turn_id: "turn-1", tool: null },
+            ],
+            prev_cursor: "cursor-before-item-older",
+          },
+        });
+      });
+    },
+  };
+
+  applyTranscriptDelta({
+    thread_id: "thread-partial-coverage",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "!!",
+    delta_kind: "agent_text",
+    text_offset: 99,
+  });
+
+  await waitFor(() => state.realSession?.transcript?.find((e) => e.item_id === "item-1")?.text === "Hello world");
+  assert.equal(sentPayloads.length, 1);
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-1")?.content_state,
+    "full",
+    "the repaired item resyncs to full"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-older")?.content_state,
+    "preview",
+    "an item outside the repair page's coverage must still be invalidated, not left trusted"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-older")?.text,
+    "Older",
+    "invalidation for an uncovered item still only downgrades content_state, matching the lagged-stream case — there is nothing authoritative to resync it FROM"
+  );
+
+  clearSessionRuntime();
+  state.socket = null;
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+});
+
+// P1 (review): repairActiveTranscriptTail only downgraded the window's cached
+// content_state after a repair; it left the STALE (pre-repair) text in place
+// and the window stayed "loaded". The very next delta's offset check
+// (applyTranscriptDelta, session-ops.js) reads that stale, now-too-short text
+// as `have` — even though the array was JUST corrected to the true, longer
+// authoritative text by the repair that ran a moment ago. A delta that is
+// perfectly valid against the repaired array was therefore wrongly reported
+// as ANOTHER offset_gap, forcing a second, unnecessary repair round-trip.
+test("a delta immediately after a tail repair is checked against the REPAIRED text, not the pre-repair stale window copy", async () => {
+  activeBrowser = installBrowserStubs();
+  const sentPayloads = [];
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+  const { applySessionSnapshot, applyTranscriptDelta, clearSessionRuntime, flushRemoteTranscriptRenderForTest } =
+    await import("./session-ops.js");
+  const { remoteQueryClient } = await import("./query-client.js");
+
+  clearSessionRuntime();
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-repair-window-2",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-2" });
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+
+  applySessionSnapshot({
+    active_thread_id: "thread-repair-followup",
+    active_turn_id: "turn-1",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript_truncated: false,
+    transcript_revision: 5,
+    transcript: [
+      { item_id: "item-1", kind: "agent_text", status: "running", text: "Hello", turn_id: "turn-1", tool: null },
+    ],
+  });
+  state.transcriptHydrationThreadId = "thread-repair-followup";
+  state.transcriptHydrationEntries = new Map([
+    ["item-1", { ...state.session.transcript[0], content_state: "full" }],
+  ]);
+  state.transcriptHydrationOrder = ["item-1"];
+
+  state.socket = {
+    readyState: 1,
+    send(frameText) {
+      const frame = JSON.parse(frameText);
+      sentPayloads.push(frame.payload);
+      setImmediate(async () => {
+        await handleRemoteBrokerPayload({
+          kind: "remote_action_result",
+          action_id: frame.payload.action_id,
+          action: "fetch_thread_transcript",
+          ok: true,
+          snapshot: {},
+          thread_transcript: {
+            thread_id: "thread-repair-followup",
+            revision: 8,
+            entries: [
+              { item_id: "item-1", kind: "agent_text", text: "Hello world", status: "running", turn_id: "turn-1", tool: null },
+            ],
+            prev_cursor: null,
+          },
+        });
+      });
+    },
+  };
+
+  // A genuine offset gap forces the tail repair.
+  applyTranscriptDelta({
+    thread_id: "thread-repair-followup",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "!!",
+    delta_kind: "agent_text",
+    text_offset: 99,
+  });
+
+  await waitFor(() => state.realSession?.transcript?.[0]?.text === "Hello world");
+  assert.equal(sentPayloads.length, 1, "the first delta's gap must trigger exactly one repair fetch");
+
+  // A delta that is perfectly valid against the JUST-REPAIRED array (11
+  // chars, "Hello world") must be accepted immediately, not treated as a
+  // second gap.
+  applyTranscriptDelta({
+    thread_id: "thread-repair-followup",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "!!",
+    delta_kind: "agent_text",
+    text_offset: 11,
+  });
+  flushRemoteTranscriptRenderForTest();
+
+  assert.equal(
+    sentPayloads.length,
+    1,
+    "a delta valid against the repaired array must not trigger a second repair fetch"
+  );
+  assert.equal(state.session.transcript[0].text, "Hello world!!");
 
   clearSessionRuntime();
   state.socket = null;

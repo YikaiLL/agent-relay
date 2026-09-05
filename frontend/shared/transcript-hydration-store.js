@@ -996,12 +996,22 @@ export function applyTranscriptDeltaToWindow(state, delta) {
 /// offset is a genuine fresh restart of the stream and correctly starts
 /// clean.
 ///
-/// A no-op unless the window is already loaded for `threadId` AND already
-/// tracks this item as `full` — an unhydrated window must never be created
-/// by a patch alone, and there is nothing to invalidate for an item the
-/// window has never seen (or already knows is non-authoritative): that is
-/// exactly the case renderedTranscriptFromWindow's own array-fallback for a
-/// window-missing item covers, without any write here.
+/// A no-op unless the window is already loaded for `threadId` and already
+/// tracks this item — an unhydrated window must never be created by a patch
+/// alone, and there is nothing to invalidate for an item the window has
+/// never seen: that is exactly the case renderedTranscriptFromWindow's own
+/// array-fallback for a window-missing item covers, without any write here.
+///
+/// Blanks the cached text regardless of the entry's CURRENT content_state —
+/// including preview/omitted, not just full. Gating this on "already full"
+/// (a prior version of this function did) leaves a preview entry's stale,
+/// truncated text sitting in the window; that text is still what
+/// applyTranscriptDeltaToWindow's merge branch reads as `have` for the next
+/// delta, so a later delta whose offset happens to match the stale length is
+/// accepted as a contiguous append and the merge promotes the result to
+/// `full` — silently making the truncated preview authoritative and
+/// permanently suppressing the real hydration fetch. A no-op is only correct
+/// once the cache is ALREADY blank (nothing left to protect).
 export function invalidateTranscriptWindowEntryForPatch(state, threadId, patchedEntry) {
   const itemId = patchedEntry?.item_id;
   if (!itemId || !transcriptWindowIsLoaded(state, threadId)) {
@@ -1009,7 +1019,7 @@ export function invalidateTranscriptWindowEntryForPatch(state, threadId, patched
   }
   const entries = state.transcriptHydrationEntries;
   const existing = entries.get(itemId);
-  if (!existing || contentStateOf(existing) !== CONTENT_STATE_FULL) {
+  if (!existing || (!existing.text && contentStateOf(existing) !== CONTENT_STATE_FULL)) {
     return false;
   }
   entries.set(itemId, { ...existing, text: "", content_state: CONTENT_STATE_PREVIEW });
