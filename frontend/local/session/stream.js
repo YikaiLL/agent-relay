@@ -6,13 +6,18 @@ import {
   invalidateTranscriptWindowForRepair,
   markTranscriptWindowProjectionPending,
   mergeTranscriptHydrationPage,
-  resolveDeltaAppend,
   settleTranscriptProjection,
   transcriptWindowIsLoaded,
   __recordTranscriptFullRebuild,
   __readTranscriptFullRebuildCount,
   __resetTranscriptFullRebuildCount,
 } from "../transcript/store.js";
+import {
+  normalizeTranscriptDeltaKind,
+  reduceTranscriptDeltaEvent,
+  reduceTranscriptEntryPatchEvent,
+  transcriptEventThreadId,
+} from "../../shared/transcript-event-reducer.js";
 
 // Re-exported so existing test imports (`from "./stream.js"`) keep working —
 // the counter itself now lives in transcript/store.js, since that is where
@@ -414,20 +419,6 @@ export function createStreamController(ctx) {
       }
       return;
     }
-    // Monotonic. A delta already covered by the initial snapshot legitimately arrives
-    // afterwards (the stream subscribes before the snapshot is rendered), and taking its
-    // revision verbatim would walk the cursor BACKWARDS — making later snapshots look
-    // stale and breaking the freshness checks that depend on it.
-    const currentRevision = Number.isSafeInteger(state.session.transcript_revision)
-      ? state.session.transcript_revision
-      : null;
-    const eventRevision = Number.isSafeInteger(event.revision) ? event.revision : null;
-    const nextRevision =
-      eventRevision == null
-        ? state.session.transcript_revision
-        : currentRevision == null
-          ? eventRevision
-          : Math.max(currentRevision, eventRevision);
 
     // The hydration window, when loaded, is the ONE place the delta is reconciled: it
     // owns the text_offset bookkeeping that makes re-delivery idempotent — and it is
@@ -438,42 +429,34 @@ export function createStreamController(ctx) {
     // state.session.transcript trails the window by up to one render until then;
     // every reader that needs the newest text reads the window directly.
     if (transcriptWindowIsLoaded(state, currentThreadId)) {
-      const textLengthBefore = (state.transcriptHydrationEntries.get(event.item_id)?.text ?? "").length;
-      // Peek whether this delta will be refused (a gap or byte mismatch)
-      // BEFORE calling appendTranscriptDelta, which downgrades the window
-      // entry's content_state to preview IN PLACE on refusal
-      // (transcript-hydration-store.js's applyTranscriptDeltaToWindow).
+      const existingWindowEntry = state.transcriptHydrationEntries.get(event.item_id);
+      const outcome = reduceTranscriptDeltaEvent({
+        session: state.session,
+        event,
+        currentThreadId,
+        currentEntry: existingWindowEntry,
+        hasCurrentEntry: Boolean(existingWindowEntry),
+        buildTranscript: false,
+      });
+      if (outcome.kind === "noop") {
+        return;
+      }
+      const textLengthBefore = outcome.textLengthBefore ?? (existingWindowEntry?.text ?? "").length;
+      // The reducer says whether this delta will be refused before the existing
+      // window mutator downgrades content_state in place.
       // Settle FIRST when it will: an earlier valid append for this thread
       // may still be pending only in the window (queueTranscriptRender below
       // defers the array projection), and downgrading before that settles
       // makes the projection's non-"full" fallback read the stale pre-append
       // array — the same rollback transcript_stream_lagged had, just reached
-      // through an ordinary per-item gap instead of a bulk notice. Mirrors
-      // remote's applyTranscriptDelta, which pre-resolves via
-      // resolveDeltaAppend and never lets a refused delta reach the window
-      // write undetected.
-      //
-      // Computed once and reused below for the repair tail. `=== null` is the
-      // only refusal (a gap or byte mismatch); `""` is a duplicate we already
-      // hold — a falsy check would treat both alike and refetch on every
-      // re-delivered chunk.
+      // through an ordinary per-item gap instead of a bulk notice.
       //
       // An item the window has never tracked at all is a SECOND refusal shape
-      // resolveDeltaAppend never sees: applyTranscriptDeltaToWindow's own
+      // the existing-entry offset check never sees: applyTranscriptDeltaToWindow's own
       // "unknown item" branch stores a nonzero-offset first delta as an empty
       // preview (the opening text went missing), never `full` — functionally
-      // identical to a refused append, just reached with no existing text to
-      // reconcile against. `startsAtZero` mirrors that branch's own check so
-      // this can't drift from what it actually decides.
-      const existingWindowEntry = state.transcriptHydrationEntries.get(event.item_id);
-      const startsAtZero =
-        event.text_offset == null
-        || (Number.isSafeInteger(event.text_offset) && event.text_offset === 0);
-      const resolvedAppend = existingWindowEntry
-        ? resolveDeltaAppend(existingWindowEntry.text ?? "", event.delta ?? "", event.text_offset)
-        : undefined;
-      const isRefusal = existingWindowEntry ? resolvedAppend === null : !startsAtZero;
-      if (isRefusal) {
+      // identical to a refused append, just reached with no existing text.
+      if (outcome.kind === "needs_repair") {
         settleTranscriptProjection(state);
         // Bumped BEFORE the repair fetch below starts, so a hydration fetch
         // already in flight for this thread (captured its epoch earlier, in
@@ -493,11 +476,11 @@ export function createStreamController(ctx) {
           textLengthAfter,
         });
       }
-      const nextSession = {
-        ...state.session,
-        transcript_revision: nextRevision,
-      };
-      if (isRefusal) {
+      const nextSession = { ...state.session };
+      if (outcome.eventRevision != null) {
+        nextSession.transcript_revision = outcome.nextRevision;
+      }
+      if (outcome.kind === "needs_repair") {
         // A true refusal, not a duplicate — this item's window entry was just
         // downgraded to preview IN PLACE above (or, for a brand-new item,
         // created directly as one), so there is nothing left to project for
@@ -523,28 +506,18 @@ export function createStreamController(ctx) {
     // No window yet (deltas can arrive before the first hydration). Reconcile against
     // the rendered transcript directly, with the SAME offset rules — otherwise the live
     // tail would either vanish before hydration or double-append on re-delivery.
-    const entryIndex = state.session.transcript.findIndex(
-      (candidate) => candidate?.item_id === event.item_id
-    );
-    const deltaText = event.delta ?? "";
-    const startsAtZero =
-      event.text_offset == null
-      || (Number.isSafeInteger(event.text_offset) && event.text_offset === 0);
-    const appendText =
-      entryIndex >= 0
-        ? resolveDeltaAppend(
-          state.session.transcript[entryIndex].text ?? "",
-          deltaText,
-          event.text_offset
-        )
-        : (startsAtZero ? deltaText : null);
-    if (appendText === "") {
+    const outcome = reduceTranscriptDeltaEvent({
+      session: state.session,
+      event,
+      currentThreadId,
+    });
+    if (outcome.kind === "noop" || outcome.kind === "duplicate") {
       // Duplicate — idempotent no-op, same as the loaded-window path's
       // resolvedAppend === "" case. Hydration is authoritative for the real
       // text; splicing a re-delivered chunk here would corrupt it.
       return;
     }
-    if (appendText == null) {
+    if (outcome.kind === "needs_repair") {
       // A true refusal (a gap/mismatch, or a missing head for a brand-new
       // item) — NOT a duplicate. This branch used to treat both the same and
       // silently return, on the assumption hydration is "authoritative" and
@@ -557,10 +530,10 @@ export function createStreamController(ctx) {
       // loaded-window path's epoch bump (above) exists to close, just
       // reached through the one call site that skipped it (P1 review).
       state.transcriptRefusalEpoch = (state.transcriptRefusalEpoch || 0) + 1;
-      state.session = {
-        ...state.session,
-        transcript_revision: nextRevision,
-      };
+      state.session = { ...state.session };
+      if (outcome.eventRevision != null) {
+        state.session.transcript_revision = outcome.nextRevision;
+      }
       // Same repair the loaded-window path fires. Its merge bootstraps the
       // window from empty if it's still unloaded when the fetch resolves —
       // this IS how a cold thread's gap actually gets repaired, not a
@@ -570,35 +543,6 @@ export function createStreamController(ctx) {
       return;
     }
 
-    const textLengthBefore =
-      entryIndex >= 0 ? (state.session.transcript[entryIndex].text ?? "").length : 0;
-    const nextTranscript = entryIndex >= 0
-      ? state.session.transcript.map((entry, index) =>
-          index === entryIndex
-            ? {
-              ...entry,
-              entry_seq: Number.isSafeInteger(event.entry_seq) && !Number.isSafeInteger(entry.entry_seq)
-                ? event.entry_seq
-                : entry.entry_seq,
-              kind: entry.kind || normalizeLocalDeltaKind(event.delta_kind || event.entry_kind),
-              status: "running",
-              text: `${entry.text ?? ""}${appendText}`,
-              turn_id: entry.turn_id || event.turn_id || null,
-            }
-            : entry
-        )
-      : [
-          ...state.session.transcript,
-          {
-            entry_seq: Number.isSafeInteger(event.entry_seq) ? event.entry_seq : null,
-            item_id: event.item_id,
-            kind: normalizeLocalDeltaKind(event.delta_kind || event.entry_kind),
-            status: "running",
-            text: appendText,
-            tool: null,
-            turn_id: event.turn_id || null,
-          },
-        ];
     // Same full-rebuild shape as the deferred window projection
     // (settleTranscriptProjection), just bounded (max_transcript_entries: 8)
     // rather than deferred — counted for the same reason: visibility into
@@ -608,21 +552,14 @@ export function createStreamController(ctx) {
       itemId: event.item_id,
       threadId: currentThreadId,
       turnId: event.turn_id || null,
-      textLengthBefore,
-      textLengthAfter: textLengthBefore + appendText.length,
+      textLengthBefore: outcome.textLengthBefore,
+      textLengthAfter: outcome.textLengthAfter,
     });
-    queueTranscriptRender(
-      {
-        ...state.session,
-        transcript: nextTranscript,
-        transcript_revision: nextRevision,
-      },
-      appendText.length
-    );
+    queueTranscriptRender(outcome.nextSession, outcome.appendText.length);
   }
 
   function normalizeLocalDeltaKind(kind) {
-    return kind === "command_output" ? "command" : kind || "agent_text";
+    return normalizeTranscriptDeltaKind(kind);
   }
 
   function applyLocalTranscriptEntryPatch(event, { defaultStatus = null } = {}) {
@@ -633,20 +570,14 @@ export function createStreamController(ctx) {
     // are about to discard defeats the whole point of deferring it to the
     // flush.
     const currentThreadId = state.session?.active_thread_id || null;
-    const eventThreadId = event.thread_id || event.active_thread_id || event.entry?.thread_id || null;
+    const eventThreadId = transcriptEventThreadId(event);
     if (eventThreadId && currentThreadId && eventThreadId !== currentThreadId) {
       return;
     }
-    const entry = event.entry || {
-      item_id: event.item_id,
-      entry_seq: event.entry_seq,
-      kind: event.entry_kind,
-      status: event.status,
-      text: event.text,
-      tool: event.tool,
-      turn_id: event.turn_id,
-    };
-    if (!entry?.item_id || !Array.isArray(state.session?.transcript)) {
+    if (!state.session || !Array.isArray(state.session.transcript)) {
+      return;
+    }
+    if (!(event.entry?.item_id || event.item_id)) {
       return;
     }
     // Only now is this function committed to reading state.session.transcript
@@ -657,12 +588,17 @@ export function createStreamController(ctx) {
     // chokepoint's own settle is a no-op — this rebuild's array already
     // carries both the delta and this patch.
     settleTranscriptProjection(state);
-    const patchedEntry = {
-      ...entry,
-      kind: entry.kind || event.entry_kind || null,
-      status: entry.status || defaultStatus || "completed",
-      turn_id: entry.turn_id || event.turn_id || null,
-    };
+    const outcome = reduceTranscriptEntryPatchEvent({
+      session: state.session,
+      event,
+      currentThreadId,
+      defaultStatus,
+      windowLoaded: transcriptWindowIsLoaded(state, currentThreadId),
+    });
+    if (outcome.kind !== "accepted_patch") {
+      return;
+    }
+    const patchedEntry = outcome.entryPatch;
     // Also invalidate the window's own copy, not just rebuild the array
     // below: it can never safely carry this patch's fields itself (see
     // invalidateTranscriptWindowEntryForPatch), so a later delta re-arming
@@ -671,47 +607,8 @@ export function createStreamController(ctx) {
     // this thread's array as the fallback source for exactly that reason. A
     // no-op when the window isn't loaded yet, or doesn't yet track this item.
     applyEntryPatchToWindow(state, currentThreadId, patchedEntry);
-    const entryIndex = state.session.transcript.findIndex(
-      (candidate) => candidate?.item_id === patchedEntry.item_id
-    );
-    // True when applyEntryPatchToWindow just no-op'd because the window has
-    // never tracked this item at all. renderedTranscriptFromWindow's own
-    // array-fallback means the array rebuild below is never silently dropped
-    // by a later settle, so the window still not knowing this item exists is
-    // not a data-loss risk — see the comment below on why it must STAY that
-    // way rather than being taught about it via this patch.
-    const patchIntroducesUntrackedItem = entryIndex < 0 && transcriptWindowIsLoaded(state, currentThreadId);
-    const nextTranscript = entryIndex >= 0
-      ? state.session.transcript.map((candidate, index) =>
-          index === entryIndex
-            ? {
-              ...candidate,
-              ...patchedEntry,
-              kind: patchedEntry.kind || candidate.kind || "agent_text",
-              text: patchedEntry.text ?? candidate.text ?? null,
-              tool: patchedEntry.tool ?? candidate.tool ?? null,
-              turn_id: patchedEntry.turn_id || candidate.turn_id || null,
-            }
-            : candidate
-        )
-      : [
-          ...state.session.transcript,
-          {
-            text: patchedEntry.text ?? "",
-            tool: patchedEntry.tool ?? null,
-            ...patchedEntry,
-            kind: patchedEntry.kind || "agent_text",
-          },
-        ];
-    const nextSession = {
-      ...state.session,
-      transcript: nextTranscript,
-      transcript_revision: Number.isSafeInteger(event.revision)
-        ? event.revision
-        : state.session.transcript_revision,
-    };
-    if (patchIntroducesUntrackedItem) {
-      // state.session (still pre-patch here), NOT nextSession: a patch has no
+    if (outcome.patchIntroducesUntrackedItem) {
+      // state.session (still pre-patch here), NOT outcome.nextSession: a patch has no
       // content_state field, so exposing this item's fabricated array entry to
       // hydration's tail merge would default the missing field to "full" and
       // poison the window with an empty-but-"full" entry — permanently
@@ -729,11 +626,11 @@ export function createStreamController(ctx) {
     // snapshot turn-state change — so this must paint at once, not wait out
     // the coalescing window (.sealwire/PLAN.md). Mirrors remote's
     // commitLiveSession(nextSession, { immediate: entryPatch.status !== "running" }).
-    if (patchedEntry.status !== "running") {
-      state.session = nextSession;
+    if (outcome.terminal) {
+      state.session = outcome.nextSession;
       transcriptFlushScheduler.flushNow("transcript_entry_patch");
     } else {
-      queueTranscriptRender(nextSession);
+      queueTranscriptRender(outcome.nextSession);
     }
   }
 

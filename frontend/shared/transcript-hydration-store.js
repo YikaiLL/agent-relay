@@ -1,3 +1,8 @@
+import {
+  normalizeTranscriptDeltaKind,
+  resolveDeltaAppend,
+} from "./transcript-event-reducer.js";
+
 export function createClearedTranscriptHydrationPatch() {
   return {
     transcriptHydrationBaseSnapshot: null,
@@ -835,45 +840,7 @@ function toTranscriptEntry(entry) {
   };
 }
 
-/// How much of `deltaText` is genuinely new, given the text we already hold.
-///
-/// Agent-text deltas carry `text_offset`: the length of the entry BEFORE this delta.
-/// That turns re-delivery into a decidable question instead of a guess, which matters
-/// because the SSE stream subscribes to deltas before it renders the initial snapshot —
-/// so a chunk can legitimately arrive twice (once inside the snapshot, once buffered).
-///
-/// Returns the substring to append, `""` for a pure duplicate, or `null` when the delta
-/// must be refused (a gap, or bytes that disagree with what we hold).
-///
-/// Deltas without an offset (command output — the relay inserts separators server-side)
-/// keep the append-only behavior; there is nothing to reconcile against.
-export function resolveDeltaAppend(haveText, deltaText, textOffset) {
-  const offset =
-    typeof textOffset === "number" && Number.isSafeInteger(textOffset) && textOffset >= 0
-      ? textOffset
-      : null;
-  if (offset == null) {
-    return deltaText;
-  }
-  const have = haveText.length;
-  if (have < offset) {
-    // Earlier text is missing: appending here would splice the stream out of order.
-    return null;
-  }
-  const overlapLen = Math.min(have - offset, deltaText.length);
-  if (
-    overlapLen > 0
-    && haveText.slice(offset, offset + overlapLen) !== deltaText.slice(0, overlapLen)
-  ) {
-    // Same range, different bytes — our copy has diverged. Length alone cannot prove
-    // an overlap is the SAME text, so compare it.
-    return null;
-  }
-  if (have >= offset + deltaText.length) {
-    return "";
-  }
-  return deltaText.slice(have - offset);
-}
+export { resolveDeltaAppend };
 
 /// Mark every entry in the loaded window as a preview, so the re-hydration gate treats
 /// our copies as non-authoritative and refetches them.
@@ -924,7 +891,7 @@ export function applyTranscriptDeltaToWindow(state, delta) {
   }
 
   const deltaText = delta.delta ?? "";
-  const kind = delta.delta_kind === "command_output" ? "command" : delta.delta_kind || "agent_text";
+  const kind = normalizeTranscriptDeltaKind(delta.delta_kind);
   const existing = entries.get(itemId);
   if (existing) {
     const haveText = existing.text ?? "";

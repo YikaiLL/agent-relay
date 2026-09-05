@@ -1,0 +1,398 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
+
+import { projectViewOnlySession } from "../local/view-only-thread.js";
+import { VIEW_ONLY_CONTROLLER_DEVICE_ID } from "./session-view-model.js";
+
+function createElementStub() {
+  return {
+    value: "",
+    textContent: "",
+    innerHTML: "",
+    disabled: false,
+    hidden: false,
+    className: "",
+    dataset: {},
+    addEventListener() {},
+    setAttribute() {},
+    focus() {},
+    querySelectorAll() {
+      return [];
+    },
+    closest() {
+      return null;
+    },
+  };
+}
+
+function installRemoteBrowserStubs() {
+  if (globalThis.window?.__sessionViewModelTestStub) {
+    return;
+  }
+  const storage = new Map();
+  const localStorage = {
+    getItem(key) {
+      return storage.has(key) ? storage.get(key) : null;
+    },
+    setItem(key, value) {
+      storage.set(key, String(value));
+    },
+    removeItem(key) {
+      storage.delete(key);
+    },
+  };
+  const timers = new Map();
+  let nextTimerId = 1;
+  const windowObject = {
+    __sessionViewModelTestStub: true,
+    localStorage,
+    location: { href: "https://remote.example.test/" },
+    history: { replaceState() {} },
+    atob(value) {
+      return Buffer.from(value, "base64").toString("binary");
+    },
+    btoa(value) {
+      return Buffer.from(value, "binary").toString("base64");
+    },
+    crypto: webcrypto,
+    indexedDB: { open() { return {}; } },
+    setTimeout(callback) {
+      const id = nextTimerId++;
+      timers.set(id, callback);
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+  };
+  globalThis.window = windowObject;
+  globalThis.document = {
+    querySelector() {
+      return createElementStub();
+    },
+  };
+  globalThis.WebSocket = { OPEN: 1 };
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { platform: "Test Browser" },
+  });
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: webcrypto,
+  });
+  Object.defineProperty(globalThis, "indexedDB", {
+    configurable: true,
+    value: windowObject.indexedDB,
+  });
+}
+
+async function surfaceCases() {
+  installRemoteBrowserStubs();
+  const [{ projectRemoteViewedSession, clearSessionRuntime }, { state }] = await Promise.all([
+    import("../remote/session-ops.js"),
+    import("../remote/state.js"),
+  ]);
+  clearSessionRuntime();
+
+  return [
+    {
+      name: "Local",
+      makeViewedThread: localViewedThread,
+      reprojectSource(_displayedSession, viewedThread) {
+        return viewedThread;
+      },
+      project({ liveSession, viewedThreadId, viewedThread }) {
+        return projectViewOnlySession(liveSession, {
+          viewThreadId: viewedThreadId,
+          viewOnlyThread: viewedThread,
+        });
+      },
+      expectedProjectedRevision(liveSession) {
+        return liveSession.transcript_revision;
+      },
+    },
+    {
+      name: "Remote",
+      makeViewedThread: remoteViewedThread,
+      reprojectSource(displayedSession) {
+        return displayedSession;
+      },
+      project({ liveSession, viewedThreadId, viewedThread }) {
+        state.threads = [
+          {
+            id: "viewed",
+            cwd: "/viewed/cwd",
+            provider: "viewed-provider",
+            status: "active",
+          },
+          {
+            id: "wrong",
+            cwd: "/wrong/cwd",
+            provider: "wrong-provider",
+            status: "idle",
+          },
+        ];
+        return projectRemoteViewedSession(liveSession, viewedThreadId, viewedThread);
+      },
+      expectedProjectedRevision(_liveSession, viewedThread) {
+        return viewedThread?.transcript_revision ?? 0;
+      },
+    },
+  ];
+}
+
+function liveSession(activeThreadId = "live", overrides = {}) {
+  return {
+    active_thread_id: activeThreadId,
+    active_turn_id: `turn-${activeThreadId}`,
+    active_controller_device_id: "device-live",
+    active_controller_last_seen_at: 100,
+    active_flags: ["connected"],
+    controller_lease_expires_at: 200,
+    current_cwd: "/live/cwd",
+    thread_workspace_cwd: "/live/worktree",
+    current_status: "active",
+    current_phase: "thinking",
+    current_tool: null,
+    provider: "live-provider",
+    model: "live-model",
+    reasoning_effort: "high",
+    approval_policy: "on-request",
+    sandbox: "workspace-write",
+    pending_approvals: [
+      { request_id: "approval-live", thread_id: activeThreadId },
+      { request_id: "approval-viewed", thread_id: "viewed" },
+    ],
+    pending_ask_user_questions: [
+      { request_id: "ask-live", thread_id: activeThreadId },
+      { request_id: "ask-viewed", thread_id: "viewed" },
+    ],
+    transcript: [{ item_id: `${activeThreadId}-entry`, text: "live" }],
+    transcript_revision: 11,
+    transcript_truncated: false,
+    thread_activity: [],
+    server_time: 10,
+    ...overrides,
+  };
+}
+
+function localViewedThread(threadId = "viewed", overrides = {}) {
+  return {
+    threadId,
+    entries: [{ item_id: `${threadId}-entry`, text: "viewed" }],
+    olderCursor: "older-cursor",
+    cwd: "/viewed/cwd",
+    threadWorkspaceCwd: "/viewed/worktree",
+    provider: "viewed-provider",
+    settings: {
+      model: "viewed-model",
+      reasoning_effort: "low",
+      approval_policy: "never",
+      sandbox: "read-only",
+    },
+    currentStatus: "notLoaded",
+    activeTurnId: null,
+    currentPhase: null,
+    currentTool: null,
+    lastProgressAt: null,
+    lastRefreshServerTime: 20,
+    status: "active",
+    availableModels: [{ id: "viewed-model" }],
+    settingsWritable: true,
+    ...overrides,
+  };
+}
+
+function remoteViewedThread(threadId = "viewed", overrides = {}) {
+  return {
+    active_thread_id: threadId,
+    transcript: [{ item_id: `${threadId}-entry`, text: "viewed" }],
+    transcript_revision: 21,
+    transcript_truncated: true,
+    view_last_refresh_server_time: 20,
+    thread_state: {
+      current_cwd: "/viewed/cwd",
+      thread_workspace_cwd: "/viewed/worktree",
+      provider: "viewed-provider",
+      model: "viewed-model",
+      reasoning_effort: "low",
+      approval_policy: "never",
+      sandbox: "read-only",
+      current_status: "notLoaded",
+      active_turn_id: null,
+      current_phase: null,
+      current_tool: null,
+      last_progress_at: null,
+      available_models: [{ id: "viewed-model" }],
+      settings_writable: true,
+      reviewers: [{ reviewer_thread_id: "reviewer-viewed", parent_thread_id: threadId }],
+    },
+    ...overrides,
+  };
+}
+
+function normalizeDisplayedSession(session, live) {
+  return {
+    identity: session === live ? "live" : "projected",
+    activeThreadId: session?.active_thread_id ?? null,
+    activeTurnId: session?.active_turn_id ?? null,
+    controllerId: session?.active_controller_device_id ?? null,
+    currentStatus: session?.current_status ?? null,
+    currentPhase: session?.current_phase ?? null,
+    currentTool: session?.current_tool ?? null,
+    cwd: session?.current_cwd ?? null,
+    workspaceCwd: session?.thread_workspace_cwd ?? null,
+    provider: session?.provider ?? null,
+    model: session?.model ?? null,
+    truncated: Boolean(session?.transcript_truncated),
+    viewOnly: Boolean(session?.view_only),
+    transcriptIds: (session?.transcript || []).map((entry) => entry?.item_id),
+    approvals: (session?.pending_approvals || []).map((entry) => entry?.request_id),
+    questions: (session?.pending_ask_user_questions || []).map((entry) => entry?.request_id),
+  };
+}
+
+test("Local and Remote adapters share normalized displayed-session decisions", async (t) => {
+  for (const surface of await surfaceCases()) {
+    await t.test(surface.name, () => {
+      const noPinLive = liveSession("live");
+      const noPin = surface.project({
+        liveSession: noPinLive,
+        viewedThreadId: "viewed",
+        viewedThread: null,
+      });
+      assert.equal(noPin, noPinLive, "no pin/viewed payload keeps the live identity");
+      assert.deepEqual(normalizeDisplayedSession(noPin, noPinLive), {
+        identity: "live",
+        activeThreadId: "live",
+        activeTurnId: "turn-live",
+        controllerId: "device-live",
+        currentStatus: "active",
+        currentPhase: "thinking",
+        currentTool: null,
+        cwd: "/live/cwd",
+        workspaceCwd: "/live/worktree",
+        provider: "live-provider",
+        model: "live-model",
+        truncated: false,
+        viewOnly: false,
+        transcriptIds: ["live-entry"],
+        approvals: ["approval-live", "approval-viewed"],
+        questions: ["ask-live", "ask-viewed"],
+      });
+
+      const stalePayloadAfterRelease = surface.project({
+        liveSession: noPinLive,
+        viewedThreadId: null,
+        viewedThread: surface.makeViewedThread("viewed"),
+      });
+      assert.equal(
+        stalePayloadAfterRelease,
+        noPinLive,
+        "a stale viewed payload without an explicit viewed-thread id cannot project"
+      );
+
+      const viewed = surface.makeViewedThread("viewed");
+      const matchingLive = liveSession("live");
+      const matching = surface.project({
+        liveSession: matchingLive,
+        viewedThreadId: "viewed",
+        viewedThread: viewed,
+      });
+      assert.notEqual(matching, matchingLive, "matching background view projects");
+      assert.equal(matching.transcript, surface.name === "Local" ? viewed.entries : viewed.transcript);
+      assert.equal(matching.transcript_revision, surface.expectedProjectedRevision(matchingLive, viewed));
+      assert.deepEqual(normalizeDisplayedSession(matching, matchingLive), {
+        identity: "projected",
+        activeThreadId: "viewed",
+        activeTurnId: null,
+        controllerId: VIEW_ONLY_CONTROLLER_DEVICE_ID,
+        currentStatus: "notLoaded",
+        currentPhase: null,
+        currentTool: null,
+        cwd: "/viewed/cwd",
+        workspaceCwd: "/viewed/worktree",
+        provider: "viewed-provider",
+        model: "viewed-model",
+        truncated: true,
+        viewOnly: true,
+        transcriptIds: ["viewed-entry"],
+        approvals: ["approval-viewed"],
+        questions: ["ask-viewed"],
+      });
+
+      const wrongThread = surface.project({
+        liveSession: matchingLive,
+        viewedThreadId: "viewed",
+        viewedThread: surface.makeViewedThread("wrong"),
+      });
+      assert.equal(wrongThread, matchingLive, "wrong-thread viewed data is a stale no-op");
+
+      const liveChanged = liveSession("live-2", {
+        active_turn_id: "turn-live-2",
+        transcript: [{ item_id: "live-2-entry", text: "new live" }],
+        transcript_revision: 12,
+        server_time: 21,
+        thread_activity: [{ thread_id: "viewed", phase: "tool", tool: "bash" }],
+      });
+      const background = surface.project({
+        liveSession: liveChanged,
+        viewedThreadId: "viewed",
+        viewedThread: surface.reprojectSource(matching, viewed),
+      });
+      assert.deepEqual(
+        normalizeDisplayedSession(background, liveChanged),
+        {
+          identity: "projected",
+          activeThreadId: "viewed",
+          activeTurnId: "view:viewed",
+          controllerId: VIEW_ONLY_CONTROLLER_DEVICE_ID,
+          currentStatus: "notLoaded",
+          currentPhase: "tool",
+          currentTool: "bash",
+          cwd: "/viewed/cwd",
+          workspaceCwd: "/viewed/worktree",
+          provider: "viewed-provider",
+          model: "viewed-model",
+          truncated: true,
+          viewOnly: true,
+          transcriptIds: ["viewed-entry"],
+          approvals: ["approval-viewed"],
+          questions: ["ask-viewed"],
+        },
+        "background view remains pinned while live thread changes"
+      );
+
+      const releasedLive = liveSession("viewed", {
+        active_turn_id: "turn-viewed-live",
+        current_status: "active",
+        transcript: [{ item_id: "viewed-live-entry", text: "live again" }],
+      });
+      const released = surface.project({
+        liveSession: releasedLive,
+        viewedThreadId: "viewed",
+        viewedThread: surface.reprojectSource(background, viewed),
+      });
+      assert.equal(released, releasedLive, "when the viewed thread becomes live, the adapter releases to live");
+      assert.deepEqual(normalizeDisplayedSession(released, releasedLive), {
+        identity: "live",
+        activeThreadId: "viewed",
+        activeTurnId: "turn-viewed-live",
+        controllerId: "device-live",
+        currentStatus: "active",
+        currentPhase: "thinking",
+        currentTool: null,
+        cwd: "/live/cwd",
+        workspaceCwd: "/live/worktree",
+        provider: "live-provider",
+        model: "live-model",
+        truncated: false,
+        viewOnly: false,
+        transcriptIds: ["viewed-live-entry"],
+        approvals: ["approval-live", "approval-viewed"],
+        questions: ["ask-live", "ask-viewed"],
+      });
+    });
+  }
+});

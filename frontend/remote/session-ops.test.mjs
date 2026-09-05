@@ -3176,6 +3176,43 @@ test("a completed transcript entry flushes immediately, but a merely-started one
   clearSessionRuntime();
 });
 
+test("a completed transcript entry without entry_kind renders as agent text", async () => {
+  activeBrowser || installBrowserStubs();
+
+  const { state } = await import("./state.js");
+  const {
+    applyTranscriptEvent,
+    clearSessionRuntime,
+    flushRemoteTranscriptRenderForTest,
+  } = await import("./session-ops.js");
+  flushRemoteTranscriptRenderForTest();
+  clearSessionRuntime();
+
+  state.realSession = {
+    active_thread_id: "thread-live",
+    transcript_revision: 1,
+    transcript: [],
+  };
+  state.session = state.realSession;
+
+  applyTranscriptEvent({
+    kind: "transcript_entry_completed",
+    thread_id: "thread-live",
+    item_id: "item-live",
+    status: "completed",
+    text: "done",
+    turn_id: "turn-live",
+    revision: 2,
+  });
+
+  const entry = state.session.transcript.at(-1);
+  assert.equal(entry.kind, "agent_text");
+  assert.equal(entry.text, "done");
+  assert.equal(state.session.transcript_revision, 2);
+
+  clearSessionRuntime();
+});
+
 // P2: completion/approval/AskUserQuestion all had this same-tick,
 // one-render, pending-timer-cancellation proof; a failed/error entry patch
 // did not. Remote has no dedicated "error" event kind — a turn/tool error
