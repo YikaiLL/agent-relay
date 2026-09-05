@@ -1064,6 +1064,11 @@ over on resume"
 
     /// Archive an inert run by marking it cancelled without pretending this
     /// build can drain or complete its backend.
+    ///
+    /// This is the unsupported-backend lifecycle escape: Resume and blocked
+    /// recovery stay diagnostic refusals in this build, while an explicit
+    /// mark-cancel gives the user a current-build exit and releases any local
+    /// seats that were restored with the record.
     async fn mark_non_executable_team_run_cancelled(
         &self,
         run_id: &str,
@@ -1091,6 +1096,14 @@ over on resume"
             if changed {
                 relay.notify();
             }
+        }
+        let should_release = outcome
+            .as_ref()
+            .map(|status| *status == TeamRunStatus::Cancelled)
+            .unwrap_or(false);
+        drop(relay);
+        if should_release {
+            self.release_seats_when_settled(run_id, TeamRunStatus::Cancelled);
         }
         outcome
     }

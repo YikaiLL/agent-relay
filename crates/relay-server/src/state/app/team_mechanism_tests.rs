@@ -171,6 +171,26 @@ async fn wait_until_condition(label: &str, mut ready: impl FnMut() -> bool) {
     .unwrap_or_else(|_| panic!("{label}"));
 }
 
+async fn wait_for_released_threads(
+    provider: &ReviewTestProvider,
+    expected: &[String],
+) -> Vec<String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let released = provider.released_threads().await;
+            if expected
+                .iter()
+                .all(|thread_id| released.contains(thread_id))
+            {
+                return released;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected provider releases for {expected:?}"))
+}
+
 #[tokio::test]
 async fn start_team_run_records_legacy_backend_before_driver_spawn() {
     let (_repo, root) = init_team_repo().await;
@@ -570,6 +590,146 @@ async fn inert_records_can_be_archived_but_not_marked_done() {
         .await
         .expect("mark_done should acknowledge an already-done inert row as a no-op");
     assert_eq!(status, crate::state::TeamRunStatus::Done);
+}
+
+#[tokio::test]
+async fn mark_cancelled_archives_inert_blocked_run_and_releases_provider_seats() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let codex = providers.get("codex").unwrap().clone();
+    let run_id = "team-cloud-archive-release".to_string();
+    {
+        let mut run = crate::state::TeamRun::new(
+            run_id.clone(),
+            crate::state::TaskSpec::default(),
+            root.clone(),
+            "device-1".to_string(),
+        );
+        run.tl_provider = "codex".to_string();
+        run.dev_provider = "codex".to_string();
+        run.reviewer_provider = "codex".to_string();
+        app.relay.write().await.insert_team_run(run);
+    }
+
+    let tl_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Tl,
+    )
+    .await
+    .expect("tl provider-backed thread");
+    let dev_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Dev,
+    )
+    .await
+    .expect("dev provider-backed thread");
+    let reviewer_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Reviewer,
+    )
+    .await
+    .expect("reviewer provider-backed thread");
+    {
+        let mut relay = app.relay.write().await;
+        relay.update_team_run(&run_id, |run| {
+            run.tl_thread_id = tl_thread.clone();
+            run.phase = relay_api::team::TeamPhase::SubTasks;
+            run.sub_tasks.push(crate::state::SubTask {
+                id: "st-1".to_string(),
+                title: "Parser".to_string(),
+                brief: "write the parser".to_string(),
+                status: crate::state::SubTaskStatus::Pending,
+                dev_thread_id: Some(dev_thread.clone()),
+                reviewer_thread_id: Some(reviewer_thread.clone()),
+                ..Default::default()
+            });
+        });
+        relay.notify();
+    }
+
+    let backend = cloud_backend();
+    let backend_reason = backend.non_executing_reason().unwrap().to_string();
+    let owned = {
+        let mut relay = app.relay.write().await;
+        let mut run = relay
+            .remove_team_run(&run_id)
+            .expect("test run should be recorded");
+        let owned = run.owned_thread_ids();
+        assert_eq!(
+            owned.len(),
+            3,
+            "the fixture should own the TL, dev, and reviewer seats"
+        );
+        run.status = crate::state::TeamRunStatus::Paused;
+        run.orchestration_backend = backend;
+        run.error = Some(backend_reason.clone());
+        relay.insert_team_run(run);
+        relay.notify();
+        owned
+    };
+    assert!(
+        codex.released_threads().await.is_empty(),
+        "making the run inert is only restore modelling; archival is what releases seats"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove temporary task worktree");
+    app.validate_paused_team_runs().await;
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run(&run_id)
+        .cloned()
+        .expect("run remains visible after validation");
+    assert_eq!(run.status, crate::state::TeamRunStatus::Blocked);
+    let error = run.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("no longer exists"),
+        "missing worktree validation should make an inert pause diagnostically blocked: {error}"
+    );
+    assert!(
+        error.contains(backend_reason.as_str()),
+        "the blocked diagnostic should retain the unsupported-backend reason: {error}"
+    );
+
+    let resolve_error = app
+        .resolve_blocked_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect_err("blocked recovery cannot execute an inert backend");
+    assert!(
+        resolve_error.contains(backend_reason.as_str()),
+        "blocked recovery should refuse the inert backend before pretending to drain: {resolve_error}"
+    );
+
+    let status = app
+        .mark_team_run(
+            Some(run_id.clone()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect("mark_cancelled is the current-build archival escape for inert runs");
+    assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+
+    let released = wait_for_released_threads(&codex, &owned).await;
+    for thread_id in &owned {
+        assert!(
+            released.contains(thread_id),
+            "explicit archival should release every restored local seat: {thread_id} missing from {released:?}"
+        );
+    }
+    assert_eq!(
+        app.relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.status),
+        Some(crate::state::TeamRunStatus::Cancelled)
+    );
 }
 
 #[tokio::test]
