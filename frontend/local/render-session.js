@@ -274,6 +274,63 @@ function setTranscriptHistorySync(handler) {
   transcriptHistorySync = typeof handler === "function" ? handler : null;
 }
 
+// transcriptOptions carries a few collection fields (readLocalUiState
+// defensively copies its Sets/Maps, buildExpandedTranscriptDetailEntries
+// always builds a fresh Map) that are reallocated every render even when
+// nothing changed, so a reference check alone would never see "nothing
+// changed" here. Compared by value for the collection shapes transcriptOptions
+// actually carries; everything else (primitives, and the two handlers hoisted
+// in createSessionRenderer below) compares by reference.
+function transcriptOptionValueEqual(a, b) {
+  if (Object.is(a, b)) {
+    return true;
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
+  }
+  if (a instanceof Set && b instanceof Set) {
+    if (a.size !== b.size) {
+      return false;
+    }
+    for (const value of a) {
+      if (!b.has(value)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (a instanceof Map && b instanceof Map) {
+    if (a.size !== b.size) {
+      return false;
+    }
+    for (const [key, value] of a) {
+      if (!b.has(key) || !Object.is(b.get(key), value)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+// Reuses the PREVIOUS transcriptOptions object when every field is equal to
+// this render's, so React.memo on each transcript entry actually short-
+// circuits on a render tick that didn't touch anything it reads, instead of
+// re-rendering the whole transcript because the options object is a fresh
+// literal every time.
+function stableTranscriptOptions(previous, next) {
+  if (previous) {
+    const nextKeys = Object.keys(next);
+    if (
+      nextKeys.length === Object.keys(previous).length
+      && nextKeys.every((key) => transcriptOptionValueEqual(previous[key], next[key]))
+    ) {
+      return previous;
+    }
+  }
+  return next;
+}
+
 export function createSessionRenderer({
   state,
   renderAllowedRoots,
@@ -1446,6 +1503,18 @@ export function createSessionRenderer({
     });
   }
 
+  // Hoisted once per renderer instance rather than defined inline in
+  // transcriptOptions below: both only ever close over `state` (stable for
+  // this renderer's whole lifetime), so a fresh closure every render would
+  // do nothing but defeat stableTranscriptOptions's reference check on these
+  // two fields.
+  function handleEnsureFileChangeDetail(itemId) {
+    void state.controller?.ensureFileChangeDetail?.(itemId);
+  }
+  function handleSubmitAskUserAnswers(requestId, answers) {
+    void state.controller?.submitAskUserQuestionAnswer?.(requestId, answers);
+  }
+
   function renderTranscript(session, approval) {
     const viewingConversation = isViewingConversation(session);
     const entries = session.transcript || [];
@@ -1644,45 +1713,44 @@ export function createSessionRenderer({
         }),
         entries,
         hydrationLoading: shouldShowTranscriptLoading(session, state),
-        transcriptOptions: {
-          currentCwd: session?.current_cwd || state.selectedCwd || "",
-          detailEntries: transcriptDetailEntries,
-          // Hide rollback/reapply on a read-only view-only thread (the apply
-          // endpoint resolves the item against the relay's REAL active thread, so
-          // acting from a saved-thread view would mutate the wrong/live thread),
-          // and while the active thread is itself under review.
-          enableFileChangeActions:
-            !session.view_only &&
-            !isReviewInProgressForThread(session, session.active_thread_id) &&
-            !isWorkflowInProgressForThread(session, session.active_thread_id),
-          expandedKeys: localUi.transcriptExpandedItemIds,
-          loadingItemIds: localUi.transcriptLoadingItemIds,
-          // Enables the per-message "Fork from here" affordance on turn-final
-          // agent messages. Saved/view-only threads included: forking reads a
-          // thread's history into a NEW session, it never writes to the thread
-          // you are looking at.
-          canFork: canForkInSession(session),
-          // Stamps each agent message with the mark of whoever wrote it. Read off
-          // the session being VIEWED (a read-only projection carries its own
-          // provider), so a saved codex thread never renders under Claude's logo.
-          provider: session?.provider || "",
-          onEnsureFileChangeDetail: (itemId) => {
-            void state.controller?.ensureFileChangeDetail?.(itemId);
-          },
-          // Suppress the answer entry while the active thread is owned by
-          // review/workflow; these orchestrators are non-interactive.
-          pendingAskUserQuestions: isReviewInProgressForThread(
-            session,
-            session.active_thread_id
-          ) || isWorkflowInProgressForThread(session, session.active_thread_id)
-            ? []
-            : session?.pending_ask_user_questions || [],
-          onSubmitAskUserAnswers: (requestId, answers) => {
-            void state.controller?.submitAskUserQuestionAnswer?.(requestId, answers);
-          },
-          askUserSubmittingRequestId: localUi.askUserSubmittingRequestId || "",
-          askUserErrors: localUi.askUserErrors instanceof Map ? localUi.askUserErrors : new Map(),
-        },
+        transcriptOptions: (state.localTranscriptOptionsCache = stableTranscriptOptions(
+          state.localTranscriptOptionsCache || null,
+          {
+            currentCwd: session?.current_cwd || state.selectedCwd || "",
+            detailEntries: transcriptDetailEntries,
+            // Hide rollback/reapply on a read-only view-only thread (the apply
+            // endpoint resolves the item against the relay's REAL active thread, so
+            // acting from a saved-thread view would mutate the wrong/live thread),
+            // and while the active thread is itself under review.
+            enableFileChangeActions:
+              !session.view_only &&
+              !isReviewInProgressForThread(session, session.active_thread_id) &&
+              !isWorkflowInProgressForThread(session, session.active_thread_id),
+            expandedKeys: localUi.transcriptExpandedItemIds,
+            loadingItemIds: localUi.transcriptLoadingItemIds,
+            // Enables the per-message "Fork from here" affordance on turn-final
+            // agent messages. Saved/view-only threads included: forking reads a
+            // thread's history into a NEW session, it never writes to the thread
+            // you are looking at.
+            canFork: canForkInSession(session),
+            // Stamps each agent message with the mark of whoever wrote it. Read off
+            // the session being VIEWED (a read-only projection carries its own
+            // provider), so a saved codex thread never renders under Claude's logo.
+            provider: session?.provider || "",
+            onEnsureFileChangeDetail: handleEnsureFileChangeDetail,
+            // Suppress the answer entry while the active thread is owned by
+            // review/workflow; these orchestrators are non-interactive.
+            pendingAskUserQuestions: isReviewInProgressForThread(
+              session,
+              session.active_thread_id
+            ) || isWorkflowInProgressForThread(session, session.active_thread_id)
+              ? []
+              : session?.pending_ask_user_questions || [],
+            onSubmitAskUserAnswers: handleSubmitAskUserAnswers,
+            askUserSubmittingRequestId: localUi.askUserSubmittingRequestId || "",
+            askUserErrors: localUi.askUserErrors instanceof Map ? localUi.askUserErrors : new Map(),
+          }
+        )),
       })
     );
 
