@@ -320,9 +320,10 @@ function rateLimitFailureKind(rateLimitInfo) {
  *   turn can span several (a subagent on a cheaper model, a fallback after a
  *   refusal), and without this the relay has to guess from the thread's
  *   configured model, which puts a Haiku subagent's tokens under Opus.
- * - `total_cost_usd` — the provider's own price for the turn. The relay never
- *   computes cost locally: per-model pricing changes, and on a subscription
- *   plan there is no per-token bill at all.
+ * - `total_cost_usd` — the SDK's client-side list-price estimate. It is a
+ *   fallback when the relay cannot price a complete group from its vendored
+ *   table, not authoritative billing data (and on a subscription plan there
+ *   may be no per-token bill at all).
  *
  * PRIVACY: every field here is a NUMBER or a model id. Nothing derived from
  * conversation content crosses this boundary — `done` rides the relay's event

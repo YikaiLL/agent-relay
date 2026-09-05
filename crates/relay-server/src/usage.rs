@@ -73,8 +73,12 @@ fn u64_at(value: &Value, key: &str) -> u64 {
 
 /// Parse one Codex `TokenUsageBreakdown`.
 fn codex_breakdown(value: &Value) -> TokenUsage {
-    let input = u64_at(value, "inputTokens");
     let cached_input = u64_at(value, "cachedInputTokens");
+    // Codex reports `cachedInputTokens` as a subset of `inputTokens` — its
+    // `totalTokens` is input + output, not input + cached + output. Normalize
+    // to this module's cross-provider contract, where `input` is only the
+    // uncached remainder and every billable bucket is disjoint.
+    let input = u64_at(value, "inputTokens").saturating_sub(cached_input);
     let output = u64_at(value, "outputTokens");
     let reasoning_output = u64_at(value, "reasoningOutputTokens");
     let total = u64_at(value, "totalTokens");

@@ -1,6 +1,7 @@
 //! The token ledger: an append-only SQLite table beside `session.json`.
 
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -10,11 +11,11 @@ use tracing::{info, warn};
 
 use relay_api::{CommentSide, LineAnchor, ReviewAuthorKind, ReviewComment, ReviewCommentStatus};
 
-use super::TokenUsage;
+use super::{pricing, TokenUsage};
 
 /// Bumped only by adding a numbered migration below. `user_version` is a plain
 /// integer SQLite keeps in the file header, so this needs no table of its own.
-const LEDGER_SCHEMA_VERSION: i64 = 8;
+const LEDGER_SCHEMA_VERSION: i64 = 9;
 
 /// A single billable observation, ready to be written.
 #[derive(Debug, Clone, Default)]
@@ -183,7 +184,7 @@ impl UsageStore {
 
     /// Total usage in a half-open window, grouped by `(provider, model)`.
     pub(crate) fn by_provider_model(&self, since: u64, until: u64) -> Vec<ProviderModelUsage> {
-        self.query(
+        let mut rows = self.query(
             "SELECT provider, model,
                     SUM(input), SUM(cached_input), SUM(cache_write),
                     SUM(output), SUM(reasoning_output), SUM(total),
@@ -200,16 +201,20 @@ impl UsageStore {
                     model: row.get(1)?,
                     usage: usage_from_row(row, 2)?,
                     cost_usd: priced_cost(row, 8, 9)?,
+                    costed_turns: row.get::<_, i64>(9)? as u64,
+                    estimated_cost_usd: None,
                     turns: row.get::<_, i64>(10)? as u64,
                     day: None,
                 })
             },
-        )
+        );
+        self.apply_event_list_prices(&mut rows, since, until, "NULL");
+        rows
     }
 
     /// The same grouping, bucketed by local calendar day.
     pub(crate) fn by_day(&self, since: u64, until: u64) -> Vec<ProviderModelUsage> {
-        self.query(
+        let mut rows = self.query(
             "SELECT provider, model,
                     SUM(input), SUM(cached_input), SUM(cache_write),
                     SUM(output), SUM(reasoning_output), SUM(total),
@@ -227,17 +232,26 @@ impl UsageStore {
                     model: row.get(1)?,
                     usage: usage_from_row(row, 2)?,
                     cost_usd: priced_cost(row, 8, 9)?,
+                    costed_turns: row.get::<_, i64>(9)? as u64,
+                    estimated_cost_usd: None,
                     turns: row.get::<_, i64>(10)? as u64,
                     day: row.get(11)?,
                 })
             },
-        )
+        );
+        self.apply_event_list_prices(
+            &mut rows,
+            since,
+            until,
+            "date(at, 'unixepoch', 'localtime')",
+        );
+        rows
     }
 
     /// Same as [`Self::by_day`], but one bucket per local ISO-ish week
     /// (`YYYY-Www` via SQLite `%Y-W%W`).
     pub(crate) fn by_week(&self, since: u64, until: u64) -> Vec<ProviderModelUsage> {
-        self.query(
+        let mut rows = self.query(
             "SELECT provider, model,
                     SUM(input), SUM(cached_input), SUM(cache_write),
                     SUM(output), SUM(reasoning_output), SUM(total),
@@ -255,16 +269,25 @@ impl UsageStore {
                     model: row.get(1)?,
                     usage: usage_from_row(row, 2)?,
                     cost_usd: priced_cost(row, 8, 9)?,
+                    costed_turns: row.get::<_, i64>(9)? as u64,
+                    estimated_cost_usd: None,
                     turns: row.get::<_, i64>(10)? as u64,
                     day: row.get(11)?,
                 })
             },
-        )
+        );
+        self.apply_event_list_prices(
+            &mut rows,
+            since,
+            until,
+            "strftime('%Y-W%W', at, 'unixepoch', 'localtime')",
+        );
+        rows
     }
 
     /// Same as [`Self::by_day`], but one bucket per local hour (`YYYY-MM-DDTHH`).
     pub(crate) fn by_hour(&self, since: u64, until: u64) -> Vec<ProviderModelUsage> {
-        self.query(
+        let mut rows = self.query(
             "SELECT provider, model,
                     SUM(input), SUM(cached_input), SUM(cache_write),
                     SUM(output), SUM(reasoning_output), SUM(total),
@@ -282,11 +305,20 @@ impl UsageStore {
                     model: row.get(1)?,
                     usage: usage_from_row(row, 2)?,
                     cost_usd: priced_cost(row, 8, 9)?,
+                    costed_turns: row.get::<_, i64>(9)? as u64,
+                    estimated_cost_usd: None,
                     turns: row.get::<_, i64>(10)? as u64,
                     day: row.get(11)?,
                 })
             },
-        )
+        );
+        self.apply_event_list_prices(
+            &mut rows,
+            since,
+            until,
+            "strftime('%Y-%m-%dT%H', at, 'unixepoch', 'localtime')",
+        );
+        rows
     }
 
     /// Window totals with no grouping — the report headline.
@@ -547,7 +579,7 @@ impl UsageStore {
     /// Same as [`Self::by_day`], but one bucket per local calendar month
     /// (`YYYY-MM`).
     pub(crate) fn by_month(&self, since: u64, until: u64) -> Vec<ProviderModelUsage> {
-        self.query(
+        let mut rows = self.query(
             "SELECT provider, model,
                     SUM(input), SUM(cached_input), SUM(cache_write),
                     SUM(output), SUM(reasoning_output), SUM(total),
@@ -565,11 +597,20 @@ impl UsageStore {
                     model: row.get(1)?,
                     usage: usage_from_row(row, 2)?,
                     cost_usd: priced_cost(row, 8, 9)?,
+                    costed_turns: row.get::<_, i64>(9)? as u64,
+                    estimated_cost_usd: None,
                     turns: row.get::<_, i64>(10)? as u64,
                     day: row.get(11)?,
                 })
             },
-        )
+        );
+        self.apply_event_list_prices(
+            &mut rows,
+            since,
+            until,
+            "strftime('%Y-%m', at, 'unixepoch', 'localtime')",
+        );
+        rows
     }
 
     /// Usage rolled up by team run (and provider), for "today's most expensive
@@ -780,6 +821,64 @@ impl UsageStore {
         )
         .map(|v| v.max(0) as u64)
         .unwrap_or_else(|_| ts.saturating_sub(ts % 86_400))
+    }
+
+    /// Price each ledger event before folding it into a report group.
+    ///
+    /// Long-context tiers are metered per request. Applying the price table to
+    /// the SQL `SUM(...)` above would push any busy day or week over 200k even
+    /// when none of its individual prompts crossed the threshold. A group is
+    /// locally priced only when every event has a rate card; otherwise the
+    /// report can decide whether a complete SDK estimate is a safe fallback.
+    fn apply_event_list_prices(
+        &self,
+        rows: &mut [ProviderModelUsage],
+        since: u64,
+        until: u64,
+        bucket_expression: &str,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        // `bucket_expression` is always one of the hard-coded SQLite calendar
+        // expressions at the call sites above; it never contains user input.
+        let sql = format!(
+            "SELECT provider, model, input, cached_input, cache_write, output, \
+                    {bucket_expression} AS bucket_key
+             FROM token_event
+             WHERE at >= ?1 AND at < ?2"
+        );
+        let event_costs = self.query(&sql, since, until, |row| {
+            let provider: String = row.get(0)?;
+            let model: Option<String> = row.get(1)?;
+            let cost = pricing::estimate_cost(
+                &provider,
+                model.as_deref(),
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+                row.get::<_, i64>(4)? as u64,
+                row.get::<_, i64>(5)? as u64,
+            );
+            Ok((provider, model, row.get::<_, Option<String>>(6)?, cost))
+        });
+
+        let mut grouped: HashMap<(String, Option<String>, Option<String>), Option<f64>> =
+            HashMap::new();
+        for (provider, model, bucket, cost) in event_costs {
+            let sum = grouped
+                .entry((provider, model, bucket))
+                .or_insert(Some(0.0));
+            *sum = match (*sum, cost) {
+                (Some(total), Some(cost)) => Some(total + cost),
+                _ => None,
+            };
+        }
+
+        for row in rows {
+            row.estimated_cost_usd = grouped
+                .remove(&(row.provider.clone(), row.model.clone(), row.day.clone()))
+                .flatten();
+        }
     }
 
     fn query<T, F>(&self, sql: &str, since: u64, until: u64, map: F) -> Vec<T>
@@ -1139,6 +1238,12 @@ pub(crate) struct ProviderModelUsage {
     /// `None` when no row in this group carried a provider-computed cost.
     /// Distinct from `Some(0.0)`, which means "priced, and free".
     pub(crate) cost_usd: Option<f64>,
+    /// Rows in this group carrying a provider/SDK cost. A provider sum is only
+    /// a complete fallback when this equals `turns`.
+    pub(crate) costed_turns: u64,
+    /// Local list-price estimate summed after pricing each event separately.
+    /// `None` means at least one event had no matching rate card.
+    pub(crate) estimated_cost_usd: Option<f64>,
     pub(crate) turns: u64,
     /// Local-calendar day, `YYYY-MM-DD`, when the query bucketed by day.
     pub(crate) day: Option<String>,
@@ -1545,6 +1650,36 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         }
         conn.execute_batch("PRAGMA user_version = 8;")
             .map_err(|error| format!("stamp user_version 8: {error}"))?;
+    }
+
+    if version < 9 {
+        // Through v8, Codex's inclusive `inputTokens` was stored directly in
+        // `input` while its cached subset was also stored in `cached_input`.
+        // Reports therefore charged cache reads at full input price and then a
+        // second time at the cache-read price. Make the buckets disjoint, as
+        // TokenUsage has always promised; provider totals remain unchanged.
+        let has_token_event: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'token_event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if has_token_event > 0 {
+            conn.execute_batch(
+                "BEGIN;
+                 UPDATE token_event
+                 SET input = max(0, input - cached_input)
+                 WHERE provider = 'codex';
+                 PRAGMA user_version = 9;
+                 COMMIT;",
+            )
+            .map_err(|error| format!("migrate to 9: {error}"))?;
+        } else {
+            conn.execute_batch("PRAGMA user_version = 9;")
+                .map_err(|error| format!("stamp user_version 9: {error}"))?;
+        }
     }
 
     Ok(())

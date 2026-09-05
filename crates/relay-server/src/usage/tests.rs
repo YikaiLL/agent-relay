@@ -145,6 +145,89 @@ fn codex_baselines_are_per_thread() {
     );
 }
 
+/// Codex reports cached input as a BREAKDOWN of `inputTokens`, not another
+/// additive bucket. The provider total makes that relationship explicit:
+/// `totalTokens == inputTokens + outputTokens`, even when most input was cached.
+///
+/// Keeping the inclusive value in `input` would charge those cache hits once at
+/// the full input rate and again at the discounted cache-read rate.
+#[test]
+fn codex_cached_input_is_removed_from_inclusive_input() {
+    let usage = codex_breakdown(&json!({
+        "inputTokens": 1_000,
+        "cachedInputTokens": 900,
+        "outputTokens": 100,
+        "reasoningOutputTokens": 80,
+        "totalTokens": 1_100,
+    }));
+
+    assert_eq!(
+        usage.input, 100,
+        "only the uncached remainder is full-price input"
+    );
+    assert_eq!(usage.cached_input, 900);
+    assert_eq!(usage.output, 100);
+    assert_eq!(usage.reasoning_output, 80);
+    assert_eq!(usage.total, 1_100);
+    assert_eq!(
+        usage.sum_of_parts(),
+        usage.total,
+        "the normalized billable buckets must add back to the provider total"
+    );
+}
+
+#[test]
+fn codex_tracker_differences_normalized_cached_input_componentwise() {
+    let mut tracker = CodexUsageTracker::new();
+    let notification = |turn: &str, input: u64, cached: u64| {
+        json!({
+            "threadId": "cached-thread",
+            "turnId": turn,
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 1_000,
+                    "cachedInputTokens": 900,
+                    "outputTokens": 0,
+                    "totalTokens": 1_000,
+                },
+                "total": {
+                    "inputTokens": input,
+                    "cachedInputTokens": cached,
+                    "outputTokens": 0,
+                    "totalTokens": input,
+                },
+            }
+        })
+    };
+
+    let first = tracker
+        .observe(&notification("turn-1", 1_000, 900))
+        .expect("first turn");
+    let second = tracker
+        .observe(&notification("turn-2", 2_000, 1_800))
+        .expect("second turn");
+
+    for usage in [first.usage, second.usage] {
+        assert_eq!(usage.input, 100);
+        assert_eq!(usage.cached_input, 900);
+        assert_eq!(usage.total, 1_000);
+        assert_eq!(usage.sum_of_parts(), usage.total);
+    }
+}
+
+#[test]
+fn malformed_codex_cache_larger_than_input_cannot_underflow() {
+    let usage = codex_breakdown(&json!({
+        "inputTokens": 100,
+        "cachedInputTokens": 200,
+        "outputTokens": 10,
+        "totalTokens": 110,
+    }));
+
+    assert_eq!(usage.input, 0);
+    assert_eq!(usage.cached_input, 200);
+}
+
 /// For Anthropic usage, `input_tokens` is the UNCACHED REMAINDER, not the
 /// prompt. The real prompt is `input + cache_read + cache_creation`.
 ///

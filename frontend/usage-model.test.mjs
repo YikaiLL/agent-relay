@@ -12,6 +12,7 @@ import {
   projectWindow,
   providerRows,
   reportState,
+  rollupCost,
   rollupByProvider,
   stackedSeries,
 } from "./shared/usage-model.js";
@@ -125,6 +126,29 @@ test("cost carries its provenance", () => {
 
   const none = costLabel({ cost_usd: null, cost_source: "unavailable" });
   assert.equal(none.text, "—", "unavailable is a dash, never $0.00");
+});
+
+test("cost rollup sums only the requested bucket and keeps the weakest provenance", () => {
+  assert.deepEqual(
+    rollupCost([
+      { cost_usd: 28, cost_source: "provider" },
+      { cost_usd: 10, cost_source: "estimated" },
+      { cost_usd: null, cost_source: "unavailable" },
+    ]),
+    { cost_usd: 38, cost_source: "estimated" }
+  );
+  assert.deepEqual(rollupCost([]), {
+    cost_usd: null,
+    cost_source: "unavailable",
+  });
+  assert.deepEqual(
+    rollupCost([
+      { cost_usd: 10, cost_source: "estimated" },
+      { cost_usd: -2, cost_source: "estimated" },
+    ]),
+    { cost_usd: 8, cost_source: "estimated" },
+    "a malformed negative must not be silently omitted from the visible sum"
+  );
 });
 
 test("an absent cost is a dash rather than zero", () => {

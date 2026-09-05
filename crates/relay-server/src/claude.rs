@@ -1932,9 +1932,10 @@ fn claude_turn_error_item_id(turn_id: Option<&str>) -> String {
 ///   present it is strictly better than `usage`, because a report keyed on the
 ///   thread's configured model would attribute a Haiku subagent's tokens to
 ///   Opus.
-/// - `total_cost_usd` — the provider's own figure. Only meaningful on API-key
-///   billing; on a subscription it is a notional price, but it is *their*
-///   notional price, which is still better than a local price table.
+/// - `total_cost_usd` — the SDK's client-side list-price estimate. It is useful
+///   as a fallback when the relay has no complete local rate card, but it is
+///   not authoritative billing data on either API-key or subscription
+///   authentication.
 ///
 /// Cost is attached to the whole turn, so when splitting by model it is
 /// attributed to the row with the most tokens rather than divided — a split

@@ -77,7 +77,7 @@ function dayBuckets() {
       groups: [
         group("claude_code", "claude-opus-4", claude, {
           cost_usd: +(claude / 1_000_000 * 15).toFixed(2),
-          cost_source: "provider",
+          cost_source: "estimated",
         }),
         group("codex", "gpt-5", codex, {
           cost_usd: +(codex / 1_000_000 * 5).toFixed(2),

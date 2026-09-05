@@ -13,9 +13,8 @@
 //   counting it as 0 would shrink everybody else's share and make the split add
 //   up to a lie. Absence gets `null` and says so.
 //
-//   A cost carries its provenance. Some prices are reported, some are computed
-//   from a local table; a column that mixed them silently would move for
-//   reasons the reader cannot see.
+//   A cost carries its provenance. Estimates can come from an SDK or the local
+//   table; neither is silently promoted into a billed amount.
 
 /**
  * A token count, short enough to sit in a headline.
@@ -167,13 +166,44 @@ export function providerRows({ groups = [], providers = [] } = {}) {
 }
 
 /**
+ * Sum cost rows for one report bucket, preserving the weakest provenance.
+ *
+ * The server returns totals for the entire requested window, but Week/Month
+ * tables describe only their final bucket. Reusing the window total beside a
+ * current-week token total compares different time spans.
+ */
+export function rollupCost(groups = []) {
+  let total = 0;
+  let any = false;
+  let anyEstimated = false;
+  let anyProvider = false;
+
+  for (const group of groups || []) {
+    if (group?.cost_usd === null || group?.cost_usd === undefined) continue;
+    const cost = Number(group.cost_usd);
+    if (!Number.isFinite(cost)) {
+      return { cost_usd: null, cost_source: "unavailable" };
+    }
+    total += cost;
+    any = true;
+    if (group.cost_source === "provider") anyProvider = true;
+    else anyEstimated = true;
+  }
+
+  if (!any) return { cost_usd: null, cost_source: "unavailable" };
+  return {
+    cost_usd: total,
+    cost_source: anyEstimated || !anyProvider ? "estimated" : "provider",
+  };
+}
+
+/**
  * A cost cell, with the provenance in its tooltip.
  *
- * Three states, deliberately distinguishable: no price at all, a price we
- * computed from a local table, and a price the provider billed. `estimated` is
- * returned separately from the text so the caller can mark it visually — a
- * figure that might be an estimate and might be a bill, rendered identically,
- * is worse than either.
+ * Three states remain distinguishable: absent, estimated, and authoritative
+ * provider billing. The current relay emits only the first two; keeping the
+ * last rendering explicit prevents a future billing integration from losing
+ * its stronger provenance.
  */
 export function costLabel({ cost_usd: cost, cost_source: source } = {}) {
   if (source === "unavailable" || cost === null || cost === undefined) {
@@ -184,7 +214,7 @@ export function costLabel({ cost_usd: cost, cost_source: source } = {}) {
     return {
       text: money,
       estimated: true,
-      title: "Estimated from current list prices, not a billed amount.",
+      title: "Estimated from list prices, not a billed amount.",
     };
   }
   return { text: money, estimated: false, title: "Reported by the provider." };

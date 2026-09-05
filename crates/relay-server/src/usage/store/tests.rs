@@ -127,6 +127,83 @@ fn the_inherited_cumulative_claude_rows_are_differenced_in_place() {
     );
 }
 
+/// Rows written through schema v8 kept Codex's inclusive `inputTokens` beside
+/// its cached subset. Normalize the historical rows once, without touching
+/// Claude where the provider already reports uncached input separately.
+#[test]
+fn migration_nine_removes_cached_input_from_legacy_codex_input() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("sealwire.db");
+
+    {
+        let store = open_in(&dir);
+        for (provider, input, cached_input) in [("codex", 1_000, 900), ("claude_code", 100, 900)] {
+            store.record(&TokenEvent {
+                at: 100,
+                provider: provider.to_string(),
+                model: Some("model".to_string()),
+                thread_id: provider.to_string(),
+                usage: TokenUsage {
+                    input,
+                    cached_input,
+                    output: 100,
+                    total: 1_100,
+                    ..TokenUsage::default()
+                },
+                ..TokenEvent::default()
+            });
+        }
+        Connection::open(&path)
+            .expect("open")
+            .execute_batch("PRAGMA user_version = 8;")
+            .expect("rewind to the legacy schema");
+    }
+
+    let _store = open_in(&dir);
+    let conn = Connection::open(&path).expect("reopen");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("query migrated schema version");
+    let codex: (u64, u64, u64) = conn
+        .query_row(
+            "SELECT input, cached_input, total FROM token_event WHERE provider = 'codex'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query codex");
+    let claude: (u64, u64) = conn
+        .query_row(
+            "SELECT input, cached_input FROM token_event WHERE provider = 'claude_code'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query claude");
+
+    assert_eq!(version, 9, "data and schema stamp commit together");
+    assert_eq!(codex, (100, 900, 1_100));
+    assert_eq!(
+        claude,
+        (100, 900),
+        "Claude input is already the uncached remainder"
+    );
+
+    drop(conn);
+    drop(_store);
+    let _reopened = open_in(&dir);
+    let input_after_second_open: u64 = Connection::open(&path)
+        .expect("reopen again")
+        .query_row(
+            "SELECT input FROM token_event WHERE provider = 'codex'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query after second open");
+    assert_eq!(
+        input_after_second_open, 100,
+        "the migration must run exactly once"
+    );
+}
+
 /// **The load-bearing invariant of this whole module.**
 ///
 /// `session.json` fails closed and catastrophically: one bad byte and

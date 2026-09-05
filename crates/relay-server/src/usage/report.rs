@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
-use super::pricing;
 use super::store::{ProviderModelUsage, RoleUsage, TeamUsage, UsageStore, WindowTotals};
 use super::TokenUsage;
 
@@ -438,8 +437,13 @@ fn totals_view(totals: WindowTotals, groups: &[ProviderModelUsage]) -> ReportTot
     }
 }
 
-/// Prefer provider-reported costs; fill gaps from the price table; a mixed
-/// window reports `estimated` (the weaker claim).
+/// Sum report-time list-price estimates, with a complete SDK estimate as the
+/// fallback for a model the local table cannot price.
+///
+/// Neither source is authoritative billing data: Claude's `total_cost_usd` is
+/// itself a client-side list-price estimate. A future real-billing integration
+/// needs an explicit provenance column before this can honestly return
+/// `provider` again.
 fn window_cost(
     totals: &WindowTotals,
     groups: &[ProviderModelUsage],
@@ -448,7 +452,7 @@ fn window_cost(
         return (
             totals.cost_usd,
             if totals.cost_usd.is_some() {
-                "provider"
+                "estimated"
             } else {
                 "unavailable"
             },
@@ -485,20 +489,20 @@ fn window_cost(
 }
 
 fn priced_group(row: &ProviderModelUsage) -> (Option<f64>, &'static str) {
-    if let Some(cost) = row.cost_usd {
-        return (Some(cost), "provider");
+    if let Some(cost) = row.estimated_cost_usd {
+        return (Some(cost), "estimated");
     }
-    match pricing::estimate_cost(
-        &row.provider,
-        row.model.as_deref(),
-        row.usage.input,
-        row.usage.cached_input,
-        row.usage.cache_write,
-        row.usage.output,
-    ) {
-        Some(cost) => (Some(cost), "estimated"),
-        None => (None, "unavailable"),
+
+    // SDK cost is attached to a whole Claude turn, and model-split turns put
+    // that number on only one row. A partial group sum silently makes every
+    // other row free, so use it only when every row in this group was priced.
+    if row.costed_turns == row.turns {
+        if let Some(cost) = row.cost_usd {
+            return (Some(cost), "estimated");
+        }
     }
+
+    (None, "unavailable")
 }
 
 pub(crate) fn effective_total(usage: &TokenUsage) -> u64 {
@@ -855,6 +859,135 @@ mod tests {
         .unwrap();
         assert_eq!(report.totals.cost_source, "estimated");
         assert!(report.totals.cost_usd.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn sdk_reported_cost_does_not_override_the_reproducible_list_estimate() {
+        let (_dir, store) = open();
+        let mut priced = event(1_000, "claude_code", 1_000_000);
+        priced.cost_usd = Some(12.5);
+        store.record(&priced);
+
+        let report = build_report(
+            &store,
+            0,
+            2_000,
+            Bucket::None,
+            false,
+            &["claude_code".into()],
+            &ReportOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.totals.cost_usd, Some(14.25));
+        assert_eq!(report.totals.cost_source, "estimated");
+        assert_eq!(report.buckets[0].groups[0].cost_source, "estimated");
+    }
+
+    #[test]
+    fn long_context_pricing_is_applied_per_event_not_per_report_group() {
+        let (_dir, store) = open();
+        for at in [1_000, 1_100] {
+            store.record(&TokenEvent {
+                at,
+                provider: "claude_code".into(),
+                model: Some("claude-sonnet-4-5".into()),
+                thread_id: format!("thread-{at}"),
+                usage: TokenUsage {
+                    input: 150_000,
+                    total: 150_000,
+                    ..TokenUsage::default()
+                },
+                ..TokenEvent::default()
+            });
+        }
+
+        let report = build_report(
+            &store,
+            0,
+            2_000,
+            Bucket::None,
+            false,
+            &["claude_code".into()],
+            &ReportOptions::default(),
+        )
+        .unwrap();
+
+        let cost = report.totals.cost_usd.expect("priced from the table");
+        assert!(
+            (cost - 0.9).abs() < 1e-9,
+            "two 150k prompts stay at the base tier; got {cost}"
+        );
+    }
+
+    #[test]
+    fn one_sdk_cost_does_not_make_the_rest_of_a_group_free() {
+        let (_dir, store) = open();
+        for (at, sdk_cost) in [(1_000, Some(99.0)), (1_100, None)] {
+            store.record(&TokenEvent {
+                at,
+                provider: "claude_code".into(),
+                model: Some("claude-sonnet-4-5".into()),
+                thread_id: format!("thread-{at}"),
+                usage: TokenUsage {
+                    input: 100_000,
+                    total: 100_000,
+                    ..TokenUsage::default()
+                },
+                cost_usd: sdk_cost,
+                ..TokenEvent::default()
+            });
+        }
+
+        let report = build_report(
+            &store,
+            0,
+            2_000,
+            Bucket::None,
+            false,
+            &["claude_code".into()],
+            &ReportOptions::default(),
+        )
+        .unwrap();
+
+        let cost = report.totals.cost_usd.expect("priced from the table");
+        assert!(
+            (cost - 0.6).abs() < 1e-9,
+            "both 100k events must be priced uniformly; got {cost}"
+        );
+    }
+
+    #[test]
+    fn codex_cache_normalization_is_pinned_to_the_reported_dollars() {
+        let (_dir, store) = open();
+        store.record(&TokenEvent {
+            at: 1_000,
+            provider: "codex".into(),
+            model: Some("gpt-5".into()),
+            thread_id: "thread".into(),
+            usage: TokenUsage {
+                input: 100,
+                cached_input: 900,
+                output: 100,
+                total: 1_100,
+                ..TokenUsage::default()
+            },
+            ..TokenEvent::default()
+        });
+
+        let report = build_report(
+            &store,
+            0,
+            2_000,
+            Bucket::None,
+            false,
+            &["codex".into()],
+            &ReportOptions::default(),
+        )
+        .unwrap();
+
+        let cost = report.totals.cost_usd.expect("gpt-5 is priced");
+        assert!((cost - 0.0012375).abs() < 1e-12, "got {cost}");
     }
 
     #[test]

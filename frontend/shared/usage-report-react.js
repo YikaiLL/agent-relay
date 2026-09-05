@@ -24,6 +24,7 @@ import {
   providerRows,
   priceAgeNote,
   reportState,
+  rollupCost,
   stackedSeries,
   yAxisTicks,
 } from "./usage-model.js";
@@ -902,12 +903,13 @@ function WeekView({ report, mode = "week" }) {
   const buckets = report.buckets || [];
   const series = stackedSeries({ buckets });
   const thisWeek = series.at(-1);
-  const thisTotal = thisWeek?.total || headlineTotal(report.totals);
+  const thisTotal = thisWeek?.total ?? headlineTotal(report.totals);
   const prevTotal =
     series.at(-2)?.total ?? headlineTotal(report.compare?.totals);
   const delta = deltaPercent(thisTotal, prevTotal);
 
   const weekGroups = buckets.at(-1)?.groups || [];
+  const weekCost = costLabel(rollupCost(weekGroups));
   const prevBucketGroups = report.compare?.buckets?.at(-1)?.groups || [];
   const prevByGroup = new Map(
     prevBucketGroups.map((g) => [groupRowKey(g), headlineTotal(g)])
@@ -1024,7 +1026,14 @@ function WeekView({ report, mode = "week" }) {
             h("td", null, "Total"),
             h("td", null, formatTokens(thisTotal)),
             h("td", null, formatDelta(delta) || "—"),
-            h("td", null, costLabel(report.totals).text)
+            h(
+              "td",
+              {
+                className: weekCost.estimated ? "is-estimated" : "",
+                title: weekCost.title,
+              },
+              weekCost.text
+            )
           )
         )
       ),
@@ -1151,7 +1160,7 @@ export function UsageReportScreen({
   });
   const todaySpent = report.today
     ? headlineTotal(report.today.totals)
-    : daySeries.at(-1)?.total || headlineTotal(report.totals);
+    : daySeries.at(-1)?.total ?? headlineTotal(report.totals);
   const elapsedMs = report.today
     ? Math.max(1, (report.today.until - report.today.since) * 1000)
     : 14 * 3600_000;

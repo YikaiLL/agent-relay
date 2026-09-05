@@ -45,6 +45,58 @@ test("week tab swaps the centre for the provider cost table", () => {
   assert.doesNotMatch(html, /Migrations · long diff review/);
 });
 
+test("week total cost comes from this week rather than the six-week report window", () => {
+  const report = {
+    enabled: true,
+    providers: [
+      { key: "claude_code", label: "Claude", reports_usage: true },
+      { key: "codex", label: "Codex", reports_usage: true },
+    ],
+    totals: { total: 60_000_000, cost_usd: 5_200, cost_source: "estimated" },
+    buckets: [
+      {
+        key: "2026-W34",
+        groups: [
+          { provider: "claude_code", total: 50_000_000, cost_usd: 4_900, cost_source: "estimated" },
+        ],
+      },
+      {
+        key: "2026-W35",
+        groups: [
+          { provider: "claude_code", total: 6_000_000, cost_usd: 120, cost_source: "estimated" },
+          { provider: "codex", total: 4_000_000, cost_usd: 30, cost_source: "estimated" },
+        ],
+      },
+    ],
+    by_role: [],
+    by_team: [],
+    top_tasks: [],
+  };
+
+  const html = renderToStaticMarkup(h(UsageReportScreen, { report, bucket: "week" }));
+  assert.match(html, /\$150\.00/);
+  assert.doesNotMatch(html, /\$5200\.00/);
+});
+
+test("an empty current week stays zero instead of falling back to the report window", () => {
+  const report = {
+    enabled: true,
+    providers: [{ key: "codex", label: "Codex", reports_usage: true }],
+    totals: { total: 60_000_000, cost_usd: 500, cost_source: "estimated" },
+    buckets: [
+      { key: "2026-W34", groups: [{ provider: "codex", total: 60_000_000 }] },
+      { key: "2026-W35", groups: [] },
+    ],
+    by_role: [],
+    by_team: [],
+    top_tasks: [],
+  };
+
+  const html = renderToStaticMarkup(h(UsageReportScreen, { report, bucket: "week" }));
+  assert.match(html, />0 so far this week</);
+  assert.doesNotMatch(html, /60M so far this week/);
+});
+
 test("disabled ledger is not an empty day", () => {
   const html = renderToStaticMarkup(
     h(UsageReportScreen, { report: { enabled: false }, bucket: "day" })
