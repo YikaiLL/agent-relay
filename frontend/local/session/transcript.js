@@ -2,7 +2,10 @@ import { transcript } from "../dom.js";
 import { displayedEntriesFrom, displayedThreadIdFrom } from "../displayed-thread.js";
 import { fetchTranscriptEntryDetailViaRequester } from "../../shared/transcript-entry-detail.js";
 import { normalizeThreadTranscriptPage } from "../../shared/transcript-page.js";
-import { createThreadTranscriptPageQueryOptions } from "../../shared/thread-queries.js";
+import {
+  createThreadTranscriptPageQueryOptions,
+  fetchThreadTranscriptPageFresh,
+} from "../../shared/thread-queries.js";
 import { createCachingTranscriptPageFetcher } from "../../shared/caching-transcript-fetcher.js";
 import { localTranscriptPageCache } from "../transcript/page-cache-instance.js";
 import { readLocalUiState } from "../ui-store.js";
@@ -103,6 +106,24 @@ export function createTranscriptController(ctx) {
       : await fetchCachedTranscriptPage({ threadId, before });
 
     return page;
+  }
+
+  // Used by the per-item refusal repair (session/stream.js), NOT by ordinary
+  // hydration — see fetchThreadTranscriptPageFresh's own doc for why a plain
+  // fetchRawTranscriptPage call is not enough on its own: it never touches
+  // this exact `scope`/`surface`/`threadId`/`before` query key, so an
+  // in-flight fetchTranscriptPage call for the same key (a hydration re-arm
+  // racing the repair) keeps owning it and can still hand a LATER caller its
+  // pre-gap answer.
+  async function fetchFreshTranscriptPage(threadId, { before = null } = {}) {
+    return fetchThreadTranscriptPageFresh({
+      before,
+      fetchPage: fetchRawTranscriptPage,
+      queryClient,
+      scope: "local",
+      surface: "local",
+      threadId,
+    });
   }
 
   async function ensureConversationTranscript(session = state.session) {
@@ -318,6 +339,7 @@ export function createTranscriptController(ctx) {
     fetchTranscriptEntryDetail,
     fetchTranscriptPage,
     fetchRawTranscriptPage,
+    fetchFreshTranscriptPage,
     ensureConversationTranscript,
     maybeLoadOlderTranscript,
     resetTranscriptHydrationState,

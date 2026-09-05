@@ -30,13 +30,12 @@ export function createStreamController(ctx) {
     seedDefaults,
     renderSession,
     handleUnauthorized,
-    isViewingConversation,
   } = ctx;
   const applySessionSnapshot = (...args) => ctx.applySessionSnapshot(...args);
   // Resolved lazily: the controller is built before the transcript controller exists.
   const ensureConversationTranscript = (...args) =>
     ctx.ensureConversationTranscript?.(...args);
-  const fetchRawTranscriptPage = (...args) => ctx.fetchRawTranscriptPage?.(...args);
+  const fetchFreshTranscriptPage = (...args) => ctx.fetchFreshTranscriptPage?.(...args);
   const cancelSessionPoll = (...args) => ctx.cancelSessionPoll(...args);
   const cancelStreamReconnect = (...args) => ctx.cancelStreamReconnect(...args);
   const scheduleSessionPoll = (...args) => ctx.scheduleSessionPoll(...args);
@@ -72,17 +71,30 @@ export function createStreamController(ctx) {
   /// `ensureConversationTranscript` silently no-ops — no fetch, ever, for
   /// this signal. Mirrors remote's repairActiveTranscriptTail
   /// (session-ops.js:697), which documents and bypasses the identical gate
-  /// for the identical reason.
+  /// for the identical reason — including starting its fetch
+  /// UNCONDITIONALLY, with no "is the user currently viewing this
+  /// conversation" check of its own. This used to gate on
+  /// `isViewingConversation`, which silently suppressed the repair whenever
+  /// the active thread's own conversation route wasn't the screen on
+  /// screen (e.g. the Tasks screen, or a different session) — the entry
+  /// stayed downgraded forever, since nothing else ever retries a
+  /// client-detected gap (P1 review).
   ///
-  /// Uses fetchRawTranscriptPage, NOT fetchTranscriptPage (session/
-  /// transcript.js) — the latter wraps every call in queryClient.fetchQuery,
-  /// which deduplicates onto an in-flight request for the same key. A tail
-  /// fetch that began BEFORE the gap can then satisfy this repair and hand
-  /// back pre-gap data, with no post-gap request ever issued. The raw
-  /// primitive cannot be deduplicated. Losing the disk-cache write for the
-  /// tail is fine — remote's repair accepts the same trade for the same fix.
+  /// Uses fetchFreshTranscriptPage (session/transcript.js), NOT
+  /// fetchTranscriptPage — the latter wraps every call in
+  /// queryClient.fetchQuery, which deduplicates onto an in-flight request
+  /// for the same key. A tail fetch that began BEFORE the gap can then
+  /// satisfy this repair and hand back pre-gap data, with no post-gap
+  /// request ever issued. fetchFreshTranscriptPage
+  /// (shared/thread-queries.js's fetchThreadTranscriptPageFresh) evicts that
+  /// exact query-cache key before fetching and re-seeds it with the fresh
+  /// result afterward — eviction ALONE is not enough: a LATER hydration
+  /// re-arm racing this repair would otherwise dedupe onto the very request
+  /// this repair is trying to supersede, receive its pre-gap answer under
+  /// an epoch captured AFTER the bump (so isRefusalEpochStale never catches
+  /// it), and re-promote that stale body to `full` (P1 review).
   async function repairActiveTranscriptTail(threadId) {
-    if (!threadId || !isViewingConversation?.({ active_thread_id: threadId })) {
+    if (!threadId) {
       return;
     }
     // Captured BEFORE the fetch, same as the shared hydration driver's own
@@ -95,7 +107,7 @@ export function createStreamController(ctx) {
     const capturedRefusalEpoch = state.transcriptRefusalEpoch;
     let page;
     try {
-      page = await fetchRawTranscriptPage({ threadId, before: null });
+      page = await fetchFreshTranscriptPage(threadId, { before: null });
     } catch (error) {
       logLine(`Transcript repair failed: ${error.message}`);
       return;
@@ -104,9 +116,17 @@ export function createStreamController(ctx) {
       logLine("Transcript repair page response was incomplete.");
       return;
     }
-    // The thread may have moved on (or the window been torn down) while the
-    // fetch was in flight — a legitimate no-op, not a failure to retry.
-    if (state.session?.active_thread_id !== threadId || !transcriptWindowIsLoaded(state, threadId)) {
+    // The thread may have moved on while the fetch was in flight — a
+    // legitimate no-op, not a failure to retry. NOT gated on
+    // transcriptWindowIsLoaded: an unloaded window here is exactly the
+    // cold-hydration case this repair also serves (deltas can arrive before
+    // the first hydration ever loads a window) — the merge below bootstraps
+    // the window from empty, the same way the very first hydration ever
+    // does, and the flush after it settles that bootstrapped window onto
+    // state.session.transcript. Discarding the fetch here instead left a
+    // cold thread's gap permanently unrepaired: the fresh page was already
+    // in hand and thrown away (P1 review).
+    if (state.session?.active_thread_id !== threadId) {
       return;
     }
     if (capturedRefusalEpoch !== state.transcriptRefusalEpoch) {
@@ -541,12 +561,10 @@ export function createStreamController(ctx) {
         ...state.session,
         transcript_revision: nextRevision,
       };
-      // Same repair the loaded-window path fires. Its own merge is a no-op
-      // if the window is still unloaded when the fetch resolves
-      // (repairActiveTranscriptTail's own transcriptWindowIsLoaded guard) —
-      // but not wasted: if hydration loads the window before this resolves,
-      // it still lands the authoritative page, and either way the epoch
-      // bump above is what actually closes the race.
+      // Same repair the loaded-window path fires. Its merge bootstraps the
+      // window from empty if it's still unloaded when the fetch resolves —
+      // this IS how a cold thread's gap actually gets repaired, not a
+      // best-effort extra.
       void repairActiveTranscriptTail(currentThreadId);
       transcriptFlushScheduler.flushNow("transcript_entry_delta_refused");
       return;

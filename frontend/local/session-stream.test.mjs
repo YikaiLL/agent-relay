@@ -18,6 +18,11 @@ import {
   TRANSCRIPT_FLUSH_MAX_WINDOW_MS,
   TRANSCRIPT_FLUSH_MIN_WINDOW_MS,
 } from "../shared/transcript-flush-scheduler.js";
+import { createRelayQueryClient } from "../shared/query-client.js";
+import {
+  createThreadTranscriptPageQueryOptions,
+  fetchThreadTranscriptPageFresh,
+} from "../shared/thread-queries.js";
 
 /**
  * A minimal fake clock: `tick` advances time and fires due timers (in due
@@ -66,7 +71,7 @@ function createDeferred() {
   return { promise, resolve };
 }
 
-function makeController({ ensureConversationTranscript, fetchRawTranscriptPage, isViewingConversation } = {}) {
+function makeController({ ensureConversationTranscript, fetchFreshTranscriptPage, isViewingConversation } = {}) {
   const renders = [];
   const clock = createManualClock();
   const state = {
@@ -118,9 +123,11 @@ function makeController({ ensureConversationTranscript, fetchRawTranscriptPage, 
     cancelSessionPoll() {},
     cancelStreamReconnect() {},
     ensureConversationTranscript,
-    fetchRawTranscriptPage,
-    // Defaults to "yes" — most tests here don't care about the background/
-    // off-screen-thread gate; the tests that DO care override it explicitly.
+    fetchFreshTranscriptPage,
+    // repairActiveTranscriptTail no longer reads this (P1 review — it used
+    // to gate the repair on it, wrongly). Passed through only so a
+    // dedicated regression test can supply `() => false` and prove the
+    // repair fires anyway; every other test's default here is inert.
     isViewingConversation: isViewingConversation || (() => true),
     handleUnauthorized() {},
     logLine() {},
@@ -366,10 +373,10 @@ test("transcript_stream_lagged settles the pending window delta before invalidat
 // content_state — both server-computed signals a client-only window
 // downgrade never touches — so in real code that call is a silent no-op:
 // reproduction showed zero fetchPage calls. Stubbing it hid exactly that.
-// This version stubs one level lower, at fetchRawTranscriptPage (the actual
-// network boundary repairActiveTranscriptTail calls, bypassing both the
-// broken gate AND queryClient's fetchQuery dedupe — see stream.js's doc on
-// that function), and asserts the REAL merge landed: the window entry is
+// This version stubs one level lower, at fetchFreshTranscriptPage (the actual
+// dependency repairActiveTranscriptTail calls, bypassing both the broken
+// gate AND queryClient's fetchQuery dedupe — see stream.js's doc on that
+// function), and asserts the REAL merge landed: the window entry is
 // promoted back to `full` with the fetched page's text, and a second render
 // actually paints it.
 //
@@ -380,7 +387,7 @@ test("transcript_stream_lagged settles the pending window delta before invalidat
 // asserted immediately below, with no tick and no microtask flush.
 test("a gapped delta for an item with an earlier pending append settles and flushes immediately, then repairs with the authoritative page once it lands", async () => {
   const fetchCalls = [];
-  const fetchRawTranscriptPage = ({ threadId, before }) => {
+  const fetchFreshTranscriptPage = (threadId, { before } = {}) => {
     fetchCalls.push({ threadId, before });
     return Promise.resolve({
       thread_id: "thread-1",
@@ -399,7 +406,7 @@ test("a gapped delta for an item with an earlier pending append settles and flus
     });
   };
   const { clock, controller, renders, state, transcriptFlushScheduler } = makeController({
-    fetchRawTranscriptPage,
+    fetchFreshTranscriptPage,
   });
 
   state.transcriptHydrationThreadId = "thread-1";
@@ -454,9 +461,10 @@ test("a gapped delta for an item with an earlier pending append settles and flus
   });
 
   // Fetch initiation is synchronous — repairActiveTranscriptTail calls
-  // fetchRawTranscriptPage before its first await, so this is observable right
-  // away with no clock tick and no microtask flush. Asserted BEFORE either, or
-  // a repair deferred into the coalesced window would pass this test too.
+  // fetchFreshTranscriptPage before its first await, so this is observable
+  // right away with no clock tick and no microtask flush. Asserted BEFORE
+  // either, or a repair deferred into the coalesced window would pass this
+  // test too.
   assert.equal(fetchCalls.length, 1, "a true refusal must trigger exactly one authoritative-tail fetch");
   assert.equal(fetchCalls[0].threadId, "thread-1");
   assert.equal(fetchCalls[0].before, null, "the repair must fetch the LIVE tail, not an older page");
@@ -483,7 +491,7 @@ test("a gapped delta for an item with an earlier pending append settles and flus
 
   // The repair fetch is fire-and-forget (`void repairActiveTranscriptTail(...)`)
   // — flush the microtask queue so its continuation (the merge + render after
-  // `await fetchRawTranscriptPage(...)` resolves) has actually run before asserting.
+  // `await fetchFreshTranscriptPage(...)` resolves) has actually run before asserting.
   await new Promise((resolve) => setTimeout(resolve, 0));
 
   assert.equal(
@@ -508,6 +516,83 @@ test("a gapped delta for an item with an earlier pending append settles and flus
   );
 });
 
+// P1 (review): repairActiveTranscriptTail used to gate its fetch on
+// isViewingConversation, silently suppressing the repair whenever the
+// active thread's own conversation route wasn't the screen currently on
+// screen (e.g. the Tasks screen, or a different session) — the entry stayed
+// downgraded to `preview` forever, since nothing else ever retries a
+// client-detected gap. Every OTHER test in this file relies on
+// makeController's `() => true` default for this gate, which never actually
+// exercised it — acceptance criterion 1 ("initiates a new raw/fresh
+// live-tail network request immediately") has no route carve-out, so this
+// explicitly supplies a FALSE gate and proves the repair fires regardless.
+test("a loaded-window refusal repairs even while the active thread is off the conversation route", async () => {
+  const fetchCalls = [];
+  const fetchFreshTranscriptPage = (threadId, { before } = {}) => {
+    fetchCalls.push({ threadId, before });
+    return Promise.resolve({
+      thread_id: "thread-1",
+      entries: [
+        { item_id: "agent-1", kind: "agent_text", status: "completed", text: "hello world, repaired", tool: null, turn_id: "turn-1" },
+      ],
+      prev_cursor: null,
+    });
+  };
+  const { controller, renders, state } = makeController({
+    fetchFreshTranscriptPage,
+    // The active thread is still the client's live one (the delta below
+    // carries its thread_id and state.session.active_thread_id matches) —
+    // only the UI's current route is elsewhere. That must not matter here.
+    isViewingConversation: () => false,
+  });
+
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationOrder = ["agent-1"];
+  state.transcriptHydrationEntries = new Map([
+    [
+      "agent-1",
+      {
+        item_id: "agent-1",
+        kind: "agent_text",
+        status: "running",
+        text: "hello world",
+        tool: null,
+        entry_seq: null,
+        content_state: "full",
+      },
+    ],
+  ]);
+  state.session.transcript[0].text = "hello world";
+
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "z",
+    item_id: "agent-1",
+    revision: 7,
+    text_offset: 100,
+    thread_id: "thread-1",
+  });
+
+  assert.equal(
+    fetchCalls.length,
+    1,
+    "a loaded-window refusal must repair unconditionally — acceptance criterion 1 has no route carve-out"
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").content_state,
+    "full",
+    "the repair must still land while off-route"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").text,
+    "hello world, repaired",
+    "the repaired text must still become authoritative while off-route"
+  );
+  assert.equal(renders.length, 2, "the repair must still paint once it lands");
+});
+
 // Sibling to the refusal test above: resolveDeltaAppend returns `""` — not
 // `null` — for a pure re-delivery of bytes we already hold. `""` is falsy,
 // so a naive `if (!resolveDeltaAppend(...))` refusal check would treat this
@@ -518,16 +603,16 @@ test("a gapped delta for an item with an earlier pending append settles and flus
 // THAT stub was never called — production stopped calling it for this path
 // in ee08b1ed, so the assertion was observing an unused dependency and would
 // pass even if a duplicate wrongly triggered a repair. Stubs
-// fetchRawTranscriptPage instead, the dependency repairActiveTranscriptTail
+// fetchFreshTranscriptPage instead, the dependency repairActiveTranscriptTail
 // actually calls now.
 test("a duplicate delta for an item already fully held triggers neither a repair fetch nor an immediate render", () => {
   const fetchCalls = [];
-  const fetchRawTranscriptPage = ({ threadId, before }) => {
+  const fetchFreshTranscriptPage = (threadId, { before } = {}) => {
     fetchCalls.push({ threadId, before });
     return Promise.resolve({ thread_id: "thread-1", entries: [], prev_cursor: null });
   };
   const { clock, controller, renders, state, transcriptFlushScheduler } = makeController({
-    fetchRawTranscriptPage,
+    fetchFreshTranscriptPage,
   });
 
   state.transcriptHydrationThreadId = "thread-1";
@@ -583,13 +668,13 @@ test("a duplicate delta for an item already fully held triggers neither a repair
 // P1 (review, round 2): same correction as the sibling test above — stubbing
 // ensureConversationTranscript only proved the stub was called, not that a
 // real fetch (or its merge) ever happens; reproduction showed zero
-// fetchPage calls for this shape too. Stubs fetchRawTranscriptPage instead
+// fetchPage calls for this shape too. Stubs fetchFreshTranscriptPage instead
 // (the dependency repairActiveTranscriptTail actually calls) and asserts the
 // previously-missing item is actually promoted to `full` with real text once
 // the repair lands.
 test("a first delta for a new item with a missing head (nonzero offset) flushes immediately, then repairs once the authoritative page lands", async () => {
   const fetchCalls = [];
-  const fetchRawTranscriptPage = ({ threadId, before }) => {
+  const fetchFreshTranscriptPage = (threadId, { before } = {}) => {
     fetchCalls.push({ threadId, before });
     return Promise.resolve({
       thread_id: "thread-1",
@@ -616,7 +701,7 @@ test("a first delta for a new item with a missing head (nonzero offset) flushes 
     });
   };
   const { clock, controller, renders, state, transcriptFlushScheduler } = makeController({
-    fetchRawTranscriptPage,
+    fetchFreshTranscriptPage,
   });
 
   // The window is loaded for the thread (it already tracks "agent-1"), but
@@ -675,7 +760,7 @@ test("a first delta for a new item with a missing head (nonzero offset) flushes 
   assert.equal(renders.length, 1, "the absorbed window timer must not render a second time later");
 
   // Flush the microtask queue so the fire-and-forget repair's continuation
-  // (the merge + render after `await fetchRawTranscriptPage(...)` resolves)
+  // (the merge + render after `await fetchFreshTranscriptPage(...)` resolves)
   // has actually run before asserting.
   await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -716,8 +801,8 @@ test("a first delta for a new item with a missing head (nonzero offset) flushes 
 // drives two independently-controlled deferreds and asserts the FINAL window
 // state (text + content_state) — never that a function was called, which is
 // what let the original defect through review three times over.
-function setUpRaceState(fetchRawTranscriptPage) {
-  const helpers = makeController({ fetchRawTranscriptPage });
+function setUpRaceState(fetchFreshTranscriptPage) {
+  const helpers = makeController({ fetchFreshTranscriptPage });
   const { state } = helpers;
   state.transcriptHydrationThreadId = "thread-1";
   state.transcriptHydrationOrder = ["agent-1"];
@@ -999,11 +1084,11 @@ test("two successive refusals: an older repair resolving after the newer one mus
   const repair1 = createDeferred();
   const repair2 = createDeferred();
   const fetchCalls = [];
-  const fetchRawTranscriptPage = ({ threadId, before }) => {
+  const fetchFreshTranscriptPage = (threadId, { before } = {}) => {
     fetchCalls.push({ threadId, before });
     return fetchCalls.length === 1 ? repair1.promise : repair2.promise;
   };
-  const { controller, state } = setUpRaceState(fetchRawTranscriptPage);
+  const { controller, state } = setUpRaceState(fetchFreshTranscriptPage);
 
   // First refusal — fires repair1.
   controller.applyLocalTranscriptEntryDelta({
@@ -1062,6 +1147,166 @@ test("two successive refusals: an older repair resolving after the newer one mus
   );
 });
 
+// P1 (review): repairActiveTranscriptTail started a raw repair fetch but
+// left the pre-gap query owning its exact cache key — a hydration re-arm
+// through fetchTranscriptPage (session/transcript.js:92-106) for the SAME
+// key, issued while the repair's own fetch is still in flight, would
+// dedupe onto that old, still-in-flight query and inherit its pre-gap
+// answer. That answer's captured epoch is taken at the RE-ARM's own start —
+// after the bump — so isRefusalEpochStale alone cannot tell it apart from a
+// genuinely fresh fetch; only evicting the query-cache entry before the
+// repair's own fetch (fetchThreadTranscriptPageFresh,
+// shared/thread-queries.js) closes this. Uses a REAL query-core QueryClient
+// (createRelayQueryClient), not a stub, since the bug is in the cache's own
+// dedup behavior, not anything this file could fake convincingly.
+//
+// query-core's removeQueries does not just detach the key for FUTURE
+// readers — Query.destroy() cancels its retryer outright, rejecting the
+// promise every caller (including one from BEFORE the eviction) is holding.
+// So the pre-gap request's own promise below is asserted to REJECT, not to
+// silently resolve with data nobody reads — and the re-arm, issued only
+// AFTER that eviction, is proven to be a genuinely independent fetch rather
+// than something that inherited the dead query somehow.
+test("a hydration re-arm racing the repair does not dedupe onto the pre-gap request it is superseding (real query client)", async () => {
+  const queryClient = createRelayQueryClient();
+  const oldFetchPage = createDeferred();
+  const repairRawFetch = createDeferred();
+  const rearmFetchPage = createDeferred();
+
+  const fetchFreshTranscriptPage = (threadId, { before } = {}) =>
+    fetchThreadTranscriptPageFresh({
+      before,
+      fetchPage: () => repairRawFetch.promise,
+      queryClient,
+      scope: "local",
+      surface: "local",
+      threadId,
+    });
+
+  const { controller, state } = setUpRaceState(fetchFreshTranscriptPage);
+
+  // The PRE-GAP hydration fetch, already in flight — through the real query
+  // client, the exact same key fetchTranscriptPage uses.
+  const oldQueryPromise = queryClient.fetchQuery(
+    createThreadTranscriptPageQueryOptions({
+      before: null,
+      fetchPage: () => oldFetchPage.promise,
+      scope: "local",
+      surface: "local",
+      threadId: "thread-1",
+    })
+  );
+  let oldQueryError = null;
+  const oldQuerySettled = oldQueryPromise.then(
+    () => {
+      oldQueryError = null;
+    },
+    (error) => {
+      oldQueryError = error;
+    }
+  );
+
+  // Gapped delta -> refusal -> repair. fetchFreshTranscriptPage evicts the
+  // tail's exact query-cache key synchronously, before its own raw fetch —
+  // repairActiveTranscriptTail's first (and only, until the raw fetch)
+  // await is inside that call, so this has already happened by the time
+  // applyLocalTranscriptEntryDelta returns control here.
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "z",
+    item_id: "agent-1",
+    revision: 7,
+    text_offset: 100,
+    thread_id: "thread-1",
+  });
+
+  // A LATER hydration re-arm for the SAME key — e.g. ensureConversationTranscript
+  // firing again while the repair's own fetch is still in flight. Without
+  // eviction, this fetchQuery call would find the OLD query still registered
+  // and dedupe onto oldFetchPage's promise instead of starting its own.
+  const rearmQueryPromise = queryClient.fetchQuery(
+    createThreadTranscriptPageQueryOptions({
+      before: null,
+      fetchPage: () => rearmFetchPage.promise,
+      scope: "local",
+      surface: "local",
+      threadId: "thread-1",
+    })
+  );
+
+  await oldQuerySettled;
+  assert.ok(
+    oldQueryError,
+    "the pre-gap request must not resolve successfully once the repair evicts its query-cache entry"
+  );
+  assert.equal(
+    oldQueryError.message,
+    "CancelledError",
+    "eviction must cancel the pre-gap query outright, not just quietly detach it for future readers"
+  );
+
+  // The repair's own fetch resolves with the authoritative post-gap page and
+  // lands in the window.
+  repairRawFetch.resolve({
+    thread_id: "thread-1",
+    entries: [
+      { item_id: "agent-1", kind: "agent_text", status: "completed", text: "hello world, repaired", tool: null, turn_id: "turn-1" },
+    ],
+    prev_cursor: null,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").content_state,
+    "full",
+    "the repair's fresh page must land"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").text,
+    "hello world, repaired",
+    "the repair's fresh text must be authoritative"
+  );
+
+  // Resolving the now-cancelled pre-gap fetch's OWN queryFn must be inert —
+  // nothing is listening to it as authoritative any more.
+  oldFetchPage.resolve({
+    thread_id: "thread-1",
+    entries: [
+      { item_id: "agent-1", kind: "agent_text", status: "running", text: "hello world STALE PRE-GAP BODY THAT MUST NOT WIN" },
+    ],
+    prev_cursor: null,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").content_state,
+    "full",
+    "the repair's content_state must survive the stale pre-gap queryFn resolving late"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").text,
+    "hello world, repaired",
+    "the repair's fresh text must survive the stale pre-gap queryFn resolving late"
+  );
+
+  // Prove the re-arm's fetchQuery call genuinely started its own, live
+  // fetch — not something silently dropped or hung waiting on the dead
+  // query — by resolving ITS OWN underlying fetch and confirming that is
+  // what settles it.
+  rearmFetchPage.resolve({
+    thread_id: "thread-1",
+    entries: [
+      { item_id: "agent-1", kind: "agent_text", status: "completed", text: "hello world, repaired", tool: null, turn_id: "turn-1" },
+    ],
+    prev_cursor: null,
+  });
+  const rearmResult = await rearmQueryPromise;
+  assert.equal(
+    rearmResult?.entries?.[0]?.text,
+    "hello world, repaired",
+    "the re-arm must settle from its OWN independent fetch once that resolves, not the evicted one"
+  );
+});
+
 // P1 (review): every race test above starts from a LOADED window
 // (transcriptWindowIsLoaded === true) — the branch above this one in
 // applyLocalTranscriptEntryDelta. Deltas can arrive before the first
@@ -1076,14 +1321,25 @@ test("two successive refusals: an older repair resolving after the newer one mus
 // one call site that never checked it. Drives the REAL hydrateLocalTranscript
 // driver, same as the loaded-window race tests, and asserts the final window
 // state, not that a function was called.
-test("a gap during COLD hydration (no window loaded yet) still bumps the epoch and discards a pre-gap response", async () => {
+//
+// P1 (review, round 2): this test used to stub the repair's own fetch to
+// resolve with an EMPTY page and only prove the stale pre-gap response was
+// discarded — accepting "the window stays unloaded with stale visible text"
+// as if that were success. repairActiveTranscriptTail's own merge was ALSO
+// gated on transcriptWindowIsLoaded, so even after the epoch fix, a cold
+// thread's fresh repair response landed and was thrown away right alongside
+// the stale one — the gap was never actually repaired. Now proves the
+// opposite of a no-op: the repair's fresh page bootstraps the window from
+// empty and becomes visible in the rendered transcript.
+test("a gap during COLD hydration (no window loaded yet) still bumps the epoch, repairs, and the fresh repair becomes authoritative over the discarded pre-gap response", async () => {
   const preGapFetch = createDeferred();
+  const repairFetch = createDeferred();
   const repairFetchCalls = [];
-  const fetchRawTranscriptPage = ({ threadId, before }) => {
+  const fetchFreshTranscriptPage = (threadId, { before } = {}) => {
     repairFetchCalls.push({ threadId, before });
-    return Promise.resolve({ thread_id: "thread-1", entries: [], prev_cursor: null });
+    return repairFetch.promise;
   };
-  const { controller, renders, state } = makeController({ fetchRawTranscriptPage });
+  const { controller, renders, state } = makeController({ fetchFreshTranscriptPage });
 
   // Genuinely cold: no window loaded for this thread at all (the shape every
   // OTHER test in this file that exercises the window starts from — those all
@@ -1147,9 +1403,10 @@ test("a gap during COLD hydration (no window loaded yet) still bumps the epoch a
   assert.equal(
     repairFetchCalls.length,
     1,
-    "a cold-path gap must still launch the fresh repair — a no-op merge if the window " +
-      "stays unloaded when it resolves is fine, but the attempt must happen"
+    "a cold-path gap must still launch the fresh repair"
   );
+  assert.equal(repairFetchCalls[0].threadId, "thread-1");
+  assert.equal(repairFetchCalls[0].before, null, "the repair must fetch the LIVE tail, not an older page");
   assert.equal(
     state.session.transcript_revision,
     7,
@@ -1161,8 +1418,9 @@ test("a gap during COLD hydration (no window loaded yet) still bumps the epoch a
     "a cold-path refusal must flush immediately too, not sit behind the coalescing window"
   );
 
-  // The pre-gap fetch resolves AFTER the refusal, carrying stale content for
-  // the same item, defaulting content_state to `full` like any raw page.
+  // The pre-gap fetch resolves first, carrying stale content for the same
+  // item, defaulting content_state to `full` like any raw page — it must be
+  // discarded (its captured epoch predates the bump).
   preGapFetch.resolve({
     thread_id: "thread-1",
     entries: [
@@ -1182,6 +1440,49 @@ test("a gap during COLD hydration (no window loaded yet) still bumps the epoch a
     state.transcriptHydrationOrder.length,
     0,
     "a discarded merge must not bootstrap the window from stale content either"
+  );
+
+  // The repair's OWN fetch resolves next, with the authoritative post-gap
+  // text. Its captured epoch matches current (it was captured AFTER the
+  // bump), so it must land — and its merge must not be a no-op just because
+  // the window was never loaded before now: bootstrapping an empty window is
+  // exactly what the very first hydration attempt for any thread does too.
+  repairFetch.resolve({
+    thread_id: "thread-1",
+    entries: [
+      { item_id: "agent-1", kind: "agent_text", status: "completed", text: "hello, repaired", tool: null, turn_id: "turn-1" },
+    ],
+    prev_cursor: null,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(
+    transcriptWindowIsLoaded(state, "thread-1"),
+    true,
+    "the repair must bootstrap the window from empty — a cold thread is exactly the case it also serves"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1")?.content_state,
+    "full",
+    "the repair's fresh page must become authoritative"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1")?.text,
+    "hello, repaired",
+    "the window must hold the repair's fresh text"
+  );
+  assert.equal(
+    renders.length,
+    2,
+    "the landed repair is new information and must paint again, once"
+  );
+  assert.equal(renders[1].transcript.length, 1, "the repair must not duplicate the item in the rendered array");
+  const repairedEntry = renders[1].transcript.find((entry) => entry.item_id === "agent-1");
+  assert.ok(repairedEntry, "the repaired item must actually appear in the rendered transcript, not just the window");
+  assert.equal(
+    repairedEntry.text,
+    "hello, repaired",
+    "the second render must carry the repaired, authoritative text — final fresh authority, not a no-op"
   );
 });
 
