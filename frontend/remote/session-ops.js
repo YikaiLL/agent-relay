@@ -379,7 +379,12 @@ export function applyTranscriptDelta({
   // crates/relay-server/src/protocol.rs:467, :846-849) — a bound that, once
   // crossed, never un-crosses, since a thread's history only grows. So this
   // branch's `n` is capped at 6 by construction; see .sealwire/PLAN.md, "Why
-  // the window is loaded when it matters".
+  // the window is loaded when it matters" — EXCEPT while a background thread
+  // is pinned: the window then follows the PIN, not the live thread, so a
+  // live delta takes this array fallback uncapped for as long as the pin
+  // lasts. Accepted, not a defect — see .sealwire/PLAN.md, "Decided: the
+  // pinned-thread trade-off", and the "pinning a background thread
+  // mid-stream" test (session-ops.test.mjs).
   const windowLoaded = transcriptWindowIsLoaded(state, currentThreadId);
   const viewedThreadId = commit === commitViewedSession ? (currentThreadId || thread_id) : null;
 
