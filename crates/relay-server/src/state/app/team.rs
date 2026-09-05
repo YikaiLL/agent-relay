@@ -3052,17 +3052,30 @@ impl relay_api::TeamPort for AppState {
     }
 
     async fn update_run(&self, run_id: &str, mutation: relay_api::TeamRunMutation) -> bool {
-        let mut relay = self.relay.write().await;
-        let updated = relay.update_team_run(run_id, |run| {
-            mutation(run);
-            // The driver chose this phase before the turn it is recording. A rerun
-            // accepted meanwhile is younger than that choice and outranks it.
-            run.hold_phase_for_waiting_sub_tasks();
-        });
-        if updated {
-            relay.notify();
+        let rejected_existing_run = {
+            let mut relay = self.relay.write().await;
+            let existed = relay.team_run(run_id).is_some();
+            let updated = relay.update_team_run(run_id, |run| {
+                mutation(run);
+                // The driver chose this phase before the turn it is recording. A rerun
+                // accepted meanwhile is younger than that choice and outranks it.
+                run.hold_phase_for_waiting_sub_tasks();
+            });
+            if updated {
+                relay.notify();
+                return true;
+            }
+            existed
+        };
+
+        if rejected_existing_run {
+            self.fail_team_run(
+                run_id,
+                "team driver attempted to change the orchestration backend after execution began",
+            )
+            .await;
         }
-        updated
+        false
     }
 
     async fn update_status(&self, run_id: &str, status: TeamRunStatus) {

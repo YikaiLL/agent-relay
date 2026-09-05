@@ -565,7 +565,7 @@ async fn the_public_host_preserves_a_deliberately_blocked_driver_return() {
 }
 
 #[tokio::test]
-async fn team_port_update_run_reports_and_silences_rejected_backend_retargets() {
+async fn team_port_update_run_records_rejected_backend_retargets() {
     let (_repo, root) = init_team_repo().await;
     let (app, _) = build_review_app(&root, &["codex"]).await;
     {
@@ -593,10 +593,10 @@ async fn team_port_update_run_reports_and_silences_rejected_backend_retargets() 
     .await;
 
     assert!(!updated, "the TeamPort wrapper must surface the rejection");
-    assert_eq!(
+    assert_ne!(
         app.snapshot().await.revision,
         before_revision,
-        "rejected updates must not notify surfaces"
+        "rejected updates must notify surfaces because a failure was recorded"
     );
     let run = app
         .relay
@@ -610,6 +610,14 @@ async fn team_port_update_run_reports_and_silences_rejected_backend_retargets() 
         relay_api::orchestration::OrchestrationBackendRef::LegacyEmbedded
     );
     assert_eq!(run.phase, crate::state::TeamPhase::Intake);
+    assert_eq!(run.status, crate::state::TeamRunStatus::Failed);
+    assert!(
+        run.error
+            .as_deref()
+            .is_some_and(|error| error.contains("orchestration backend after execution began")),
+        "the immutable-backend rejection should be recorded explicitly: {:?}",
+        run.error
+    );
 }
 
 #[tokio::test]

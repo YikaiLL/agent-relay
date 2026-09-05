@@ -2256,17 +2256,21 @@ impl RelayState {
         })
     }
 
-    /// The worktree of the team run that owns `thread_id`.
+    /// The worktree of the non-terminal team run that owns `thread_id`.
     ///
     /// The authority a user action on a team thread is authorized against: the
     /// run's own cwd path-scope, exactly as pause / stop / resume use. A team
     /// thread has no other workspace of its own to check. This is not a lock:
-    /// inert records must stay non-actionable, but their lingering questions
-    /// still need the run's path scope rather than a device-only fallback.
+    /// inert records must stay non-actionable, but their non-terminal lingering
+    /// questions still need the run's path scope rather than a device-only
+    /// fallback. Terminal history is excluded so a stale question from a finished
+    /// run cannot bypass the foreground-session approval gate.
     pub(crate) fn team_run_cwd_for_thread(&self, thread_id: &str) -> Option<String> {
         self.team_runs
             .values()
-            .find(|run| run.owned_thread_ids().iter().any(|id| id == thread_id))
+            .find(|run| {
+                !run.status.is_terminal() && run.owned_thread_ids().iter().any(|id| id == thread_id)
+            })
             .map(|run| run.cwd.clone())
     }
 
@@ -2654,20 +2658,17 @@ impl RelayState {
 
     /// Clone persisted team runs for restore.
     ///
-    /// Four cases, and only the first two are unlike every other run map here:
+    /// Restore delegates to `TeamRun` so every persisted run shape is reconciled
+    /// by one state-machine rule:
     /// - Future or unknown orchestration backends are kept in the session but
-    ///   marked non-executing before any live-driver reconciliation. This relay
-    ///   build cannot safely drive them; `Paused`, `PausePending`, and
-    ///   `AwaitingUser` records keep the same recoverable pause semantics below
-    ///   with an appended backend-pin error.
-    /// - `Paused` restores VERBATIM. It has no driver on purpose; resuming it is
-    ///   the whole feature. `mark_interrupted_if_stranded` enforces the exemption.
-    /// - `PausePending` / `AwaitingUser` settle to `Paused`. Both had a live
-    ///   driver that is now gone, but both are a boundary away from a legitimate
-    ///   pause, so degrading beats discarding. `AwaitingUser` additionally rolls
-    ///   its round back, because the pending question lived only in memory (and
-    ///   the Claude worker died with the relay), so nobody can answer it now.
-    /// - everything else non-terminal reconciles to `Interrupted`, as usual.
+    ///   inert; non-terminal unsupported active records fail closed with an
+    ///   appended backend-pin diagnostic.
+    /// - `Paused` remains recoverable but clears transient pause, stop, and
+    ///   awaiting markers left by the dead process.
+    /// - `PausePending` / `AwaitingUser` settle to `Paused`; `AwaitingUser`
+    ///   additionally rolls its round back because the pending question lived
+    ///   only in memory.
+    /// - other stranded executable legacy records reconcile to `Interrupted`.
     fn restored_team_runs(persisted: &HashMap<String, TeamRun>) -> HashMap<String, TeamRun> {
         persisted
             .iter()
@@ -5808,6 +5809,16 @@ mod tests {
         assert!(
             !relay.is_cwd_team_locked("/tmp/task-future/src"),
             "an inert run must not retain workspace authority"
+        );
+
+        let mut terminal = team_run_with_status("terminal", TeamRunStatus::Done);
+        terminal.cwd = "/tmp/task-terminal".to_string();
+        terminal.tl_thread_id = "tl-terminal".to_string();
+        relay.insert_team_run(terminal);
+        assert_eq!(
+            relay.team_run_cwd_for_thread("tl-terminal"),
+            None,
+            "terminal lingering questions must fall back to foreground-session authorization"
         );
     }
 
