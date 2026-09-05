@@ -2689,6 +2689,46 @@ test("applyTranscriptDelta updates existing transcript entries using text and st
   assert.equal(state.session.transcript[0].kind, "agent_text");
 });
 
+test("applyTranscriptDelta applies offsetless empty deltas on Remote", async () => {
+  activeBrowser || installBrowserStubs();
+
+  const { state } = await import("./state.js");
+  const {
+    applyTranscriptDelta,
+    flushRemoteTranscriptRenderForTest,
+  } = await import("./session-ops.js");
+
+  state.transcriptHydrationThreadId = null;
+  state.session = {
+    active_thread_id: "thread-1",
+    transcript: [
+      {
+        item_id: "item-1",
+        kind: "agent_text",
+        status: "completed",
+        text: "Hello",
+        turn_id: "turn-1",
+        tool: null,
+      },
+    ],
+  };
+  state.realSession = state.session;
+
+  applyTranscriptDelta({
+    thread_id: "thread-1",
+    item_id: "item-1",
+    turn_id: "turn-1",
+    delta: "",
+    delta_kind: "agent_text",
+    revision: 2,
+  });
+
+  flushRemoteTranscriptRenderForTest();
+  assert.equal(state.session.transcript[0].text, "Hello");
+  assert.equal(state.session.transcript[0].status, "running");
+  assert.equal(state.session.transcript_revision, 2);
+});
+
 test("remote transcript deltas notify the React store once per frame", async () => {
   installBrowserStubs();
   const { state, subscribeRemoteState } = await import("./state.js");

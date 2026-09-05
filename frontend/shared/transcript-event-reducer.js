@@ -10,6 +10,7 @@ export function reduceTranscriptDeltaEvent({
   requireEventThreadId = false,
   useDeltaEventKindFallback = false,
   unknownDeltaKindFallback = "preserve",
+  appendEmptyOffsetlessDelta = false,
 } = {}) {
   const itemId = event?.item_id || null;
   const eventThreadId = transcriptEventThreadId(event);
@@ -146,6 +147,22 @@ export function reduceTranscriptDeltaEvent({
       entryIndex,
       unknownItem: !hasEntry,
       detail: { item: itemId, base_revision: baseRevision, current: currentRevision },
+    });
+  }
+
+  if (deltaText === "" && !appendEmptyOffsetlessDelta) {
+    const haveText = hasEntry ? entry?.text ?? "" : "";
+    return deltaNoop("empty_offsetless_delta", {
+      itemId,
+      eventThreadId,
+      currentThreadId,
+      currentRevision,
+      eventRevision,
+      nextRevision,
+      entryIndex,
+      textLengthBefore: haveText.length,
+      textLengthAfter: haveText.length,
+      unknownItem: !hasEntry,
     });
   }
 

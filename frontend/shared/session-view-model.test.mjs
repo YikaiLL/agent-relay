@@ -253,45 +253,90 @@ function normalizeDisplayedSession(session, live) {
   };
 }
 
+function normalizedLiveSession() {
+  return {
+    identity: "live",
+    activeThreadId: "live",
+    activeTurnId: "turn-live",
+    controllerId: "device-live",
+    currentStatus: "active",
+    currentPhase: "thinking",
+    currentTool: null,
+    cwd: "/live/cwd",
+    workspaceCwd: "/live/worktree",
+    provider: "live-provider",
+    model: "live-model",
+    truncated: false,
+    viewOnly: false,
+    transcriptIds: ["live-entry"],
+    approvals: ["approval-live", "approval-viewed"],
+    questions: ["ask-live", "ask-viewed"],
+  };
+}
+
+function normalizedRemoteEmptyViewedSession() {
+  return {
+    identity: "projected",
+    activeThreadId: "viewed",
+    activeTurnId: null,
+    controllerId: VIEW_ONLY_CONTROLLER_DEVICE_ID,
+    currentStatus: "idle",
+    currentPhase: null,
+    currentTool: null,
+    cwd: "/viewed/cwd",
+    workspaceCwd: "",
+    provider: "viewed-provider",
+    model: "",
+    truncated: false,
+    viewOnly: true,
+    transcriptIds: [],
+    approvals: ["approval-viewed"],
+    questions: ["ask-viewed"],
+  };
+}
+
 test("Local and Remote adapters share normalized displayed-session decisions", async (t) => {
   for (const surface of await surfaceCases()) {
     await t.test(surface.name, () => {
-      const noPinLive = liveSession("live");
-      const noPin = surface.project({
-        liveSession: noPinLive,
-        viewedThreadId: "viewed",
+      const noSelectionLive = liveSession("live");
+      const noSelection = surface.project({
+        liveSession: noSelectionLive,
+        viewedThreadId: null,
         viewedThread: null,
       });
-      assert.equal(noPin, noPinLive, "no pin/viewed payload keeps the live identity");
-      assert.deepEqual(normalizeDisplayedSession(noPin, noPinLive), {
-        identity: "live",
-        activeThreadId: "live",
-        activeTurnId: "turn-live",
-        controllerId: "device-live",
-        currentStatus: "active",
-        currentPhase: "thinking",
-        currentTool: null,
-        cwd: "/live/cwd",
-        workspaceCwd: "/live/worktree",
-        provider: "live-provider",
-        model: "live-model",
-        truncated: false,
-        viewOnly: false,
-        transcriptIds: ["live-entry"],
-        approvals: ["approval-live", "approval-viewed"],
-        questions: ["ask-live", "ask-viewed"],
-      });
+      assert.equal(noSelection, noSelectionLive, "no viewed thread selection keeps the live identity");
+      assert.deepEqual(normalizeDisplayedSession(noSelection, noSelectionLive), normalizedLiveSession());
 
       const stalePayloadAfterRelease = surface.project({
-        liveSession: noPinLive,
+        liveSession: noSelectionLive,
         viewedThreadId: null,
         viewedThread: surface.makeViewedThread("viewed"),
       });
       assert.equal(
         stalePayloadAfterRelease,
-        noPinLive,
+        noSelectionLive,
         "a stale viewed payload without an explicit viewed-thread id cannot project"
       );
+
+      const selectedWithoutPayloadLive = liveSession("live");
+      const selectedWithoutPayload = surface.project({
+        liveSession: selectedWithoutPayloadLive,
+        viewedThreadId: "viewed",
+        viewedThread: null,
+      });
+      if (surface.name === "Remote") {
+        assert.deepEqual(
+          normalizeDisplayedSession(selectedWithoutPayload, selectedWithoutPayloadLive),
+          normalizedRemoteEmptyViewedSession(),
+          "Remote preserves its empty read-only projection while the viewed payload is missing"
+        );
+      } else {
+        assert.equal(
+          selectedWithoutPayload,
+          selectedWithoutPayloadLive,
+          "Local has no pin to project until its transcript fetch lands"
+        );
+      }
 
       const viewed = surface.makeViewedThread("viewed");
       const matchingLive = liveSession("live");
@@ -327,7 +372,20 @@ test("Local and Remote adapters share normalized displayed-session decisions", a
         viewedThreadId: "viewed",
         viewedThread: surface.makeViewedThread("wrong"),
       });
-      assert.equal(wrongThread, matchingLive, "wrong-thread viewed data is a stale no-op");
+      if (surface.name === "Remote") {
+        assert.deepEqual(
+          normalizeDisplayedSession(wrongThread, matchingLive),
+          {
+            ...normalizedRemoteEmptyViewedSession(),
+            currentStatus: "notLoaded",
+            workspaceCwd: "/viewed/worktree",
+            model: "viewed-model",
+          },
+          "Remote keeps the requested thread read-only but drops the stale transcript"
+        );
+      } else {
+        assert.equal(wrongThread, matchingLive, "wrong-thread Local pin is a stale no-op");
+      }
 
       const liveChanged = liveSession("live-2", {
         active_turn_id: "turn-live-2",

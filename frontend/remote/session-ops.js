@@ -401,6 +401,7 @@ export function applyTranscriptDelta({
     enforceBaseRevisionWithoutOffset: true,
     useDeltaEventKindFallback: true,
     unknownDeltaKindFallback: "agent_text",
+    appendEmptyOffsetlessDelta: true,
   });
 
   if (outcome.kind === "noop") {
@@ -1020,9 +1021,9 @@ export function projectRemoteViewedSession(realSession, threadId, currentView) {
   const threadState = currentView?.thread_state || currentView || {};
   const viewRefreshTime = viewedRefreshServerTime(currentView);
   const viewMatchesThread = currentView?.active_thread_id === threadId;
-  const viewedThread = currentView
+  const viewedThread = threadId
     ? {
-      threadId: currentView.active_thread_id || null,
+      threadId,
       entries: viewMatchesThread ? currentView.transcript || [] : [],
       transcriptRevision: viewMatchesThread ? currentView.transcript_revision || 0 : 0,
       transcriptTruncated: viewMatchesThread ? Boolean(currentView.transcript_truncated) : false,

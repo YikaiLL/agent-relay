@@ -34,12 +34,18 @@ function createSyncTranscriptFlushScheduler(render) {
   };
 }
 
-function harness({ threadId = "thread-1", itemId = "item-1", text = "Hello world" } = {}) {
+function harness({
+  threadId = "thread-1",
+  itemId = "item-1",
+  text = "Hello world",
+  status = "running",
+  windowLoaded = true,
+} = {}) {
   const entry = {
     item_id: itemId,
     kind: "agent_text",
     text,
-    status: "running",
+    status,
     turn_id: "turn-1",
     tool: null,
     content_state: "full",
@@ -57,6 +63,11 @@ function harness({ threadId = "thread-1", itemId = "item-1", text = "Hello world
     transcriptHydrationSignature: null,
     viewOnlyThread: null,
   };
+  if (!windowLoaded) {
+    state.transcriptHydrationThreadId = null;
+    state.transcriptHydrationEntries = new Map();
+    state.transcriptHydrationOrder = [];
+  }
   const rendered = [];
   const hydrationCalls = [];
   const renderSession = (session) => rendered.push(session);
@@ -170,6 +181,19 @@ test("command output appends once", () => {
 
   assert.equal(h.storedText(), "line 1\nline 2");
   assert.equal(h.renderedText(), "line 1\nline 2");
+});
+
+test("an unhydrated offsetless empty delta is ignored", () => {
+  const h = harness({ text: "done", status: "completed", windowLoaded: false });
+  const originalSession = h.state.session;
+
+  h.deliver({ delta: "", revision: 2 });
+
+  assert.equal(h.state.session, originalSession, "the no-op must not rebuild the session");
+  assert.equal(h.rendered.length, 0, "the no-op must not schedule a render");
+  assert.equal(h.renderedText(), "done");
+  assert.equal(h.state.session.transcript[0].status, "completed");
+  assert.equal(h.state.session.transcript_revision, 1);
 });
 
 // A first delta for an unknown item that does NOT start at 0 means the opening text was

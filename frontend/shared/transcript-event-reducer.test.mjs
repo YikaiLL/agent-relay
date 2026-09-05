@@ -13,6 +13,7 @@ const SURFACES = [
     patchOptions: {},
     staleDeltaKind: "append",
     baseGapKind: "append",
+    emptyOffsetlessDeltaKind: "noop",
     stalePatchKind: "accepted_patch",
   },
   {
@@ -22,6 +23,7 @@ const SURFACES = [
       enforceBaseRevisionWithoutOffset: true,
       useDeltaEventKindFallback: true,
       unknownDeltaKindFallback: "agent_text",
+      appendEmptyOffsetlessDelta: true,
     },
     patchOptions: {
       rejectStaleRevision: true,
@@ -30,6 +32,7 @@ const SURFACES = [
     },
     staleDeltaKind: "noop",
     baseGapKind: "needs_repair",
+    emptyOffsetlessDeltaKind: "append",
     stalePatchKind: "rejected_patch",
   },
 ];
@@ -184,6 +187,22 @@ test("delta reducer fixtures run under Local and Remote surface policies", async
       } else {
         assert.equal(baseGap.reason, "base_revision_gap");
         assert.deepEqual(baseGap.detail, { item: "item-1", base_revision: 7, current: 5 });
+      }
+
+      const emptyOffsetless = reduceDelta(
+        surface,
+        session({
+          transcript: [{ ...session().transcript[0], status: "completed" }],
+        }),
+        delta({ delta: "", text_offset: undefined })
+      );
+      assert.equal(emptyOffsetless.kind, surface.emptyOffsetlessDeltaKind);
+      if (surface.emptyOffsetlessDeltaKind === "noop") {
+        assert.equal(emptyOffsetless.reason, "empty_offsetless_delta");
+        assert.equal(emptyOffsetless.nextSession, undefined);
+      } else {
+        assert.equal(emptyOffsetless.nextSession.transcript[0].text, "Hello");
+        assert.equal(emptyOffsetless.nextSession.transcript[0].status, "running");
       }
 
       const monotonic = reduceDelta(
