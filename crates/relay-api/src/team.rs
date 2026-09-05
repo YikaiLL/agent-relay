@@ -893,35 +893,63 @@ impl TeamRun {
         Ok(true)
     }
 
-    /// Restore-only fallback for records pinned to a backend this public relay
-    /// cannot execute.
+    pub fn is_executable_by_current_build(&self) -> bool {
+        self.orchestration_backend.is_executable_by_current_build()
+    }
+
+    pub fn is_live_in_current_build(&self) -> bool {
+        self.is_executable_by_current_build() && !self.status.is_terminal()
+    }
+
+    pub fn non_executing_backend_reason(&self) -> Option<&'static str> {
+        self.orchestration_backend.non_executing_reason()
+    }
+
+    /// Reconcile a run whose driver is gone after process restart.
     ///
-    /// This must only run after process startup has lost any live driver. It
-    /// keeps deliberately paused or pause-settling runs paused so a future
-    /// compatible build can recover them. Other non-terminal states are made
-    /// terminal so no missing future/backend driver is resumed here. Thread
-    /// markers such as `in_flight_thread` are preserved where no quiescent pause
-    /// can be proven instead of pretending a live provider turn was drained.
-    pub fn mark_restored_non_executing_backend(&mut self) -> bool {
-        let Some(reason) = self.orchestration_backend.non_executing_reason() else {
-            return false;
-        };
+    /// The restore path has no live driver left to finish a transition. Paused
+    /// runs stay paused; pause-settling and parked-question runs land in a
+    /// recoverable pause; executable legacy runs that were otherwise active are
+    /// interrupted; unsupported backend records that were otherwise active fail
+    /// closed while preserving their backend pin and prior diagnostics.
+    pub fn reconcile_after_restore(&mut self) -> bool {
         if self.status.is_terminal() {
             return false;
         }
-        self.append_restore_error(reason);
+
+        let settled_before = (
+            self.pause_requested,
+            self.stopping,
+            self.awaiting.clone(),
+            self.error.clone(),
+        );
+        if let Some(reason) = self.non_executing_backend_reason() {
+            self.append_restore_error(reason);
+        }
+
         match self.status {
             TeamRunStatus::Paused => {
                 self.pause_requested = false;
                 self.stopping = false;
                 self.awaiting = None;
-                self.updated_at = unix_now();
+                let changed = settled_before
+                    != (
+                        self.pause_requested,
+                        self.stopping,
+                        self.awaiting.clone(),
+                        self.error.clone(),
+                    );
+                if changed {
+                    self.updated_at = unix_now();
+                }
+                changed
             }
             TeamRunStatus::PausePending => {
                 self.settle_paused(
                     "the relay restarted while the team was pausing",
                     TeamPauseKind::Boundary,
                 );
+                true
             }
             TeamRunStatus::AwaitingUser => {
                 self.rollback_current_round();
@@ -929,16 +957,18 @@ impl TeamRun {
                     "the relay restarted while the team was waiting on your answer; that step will be re-run",
                     TeamPauseKind::Boundary,
                 );
+                true
             }
+            _ if self.is_executable_by_current_build() => self.mark_interrupted_if_stranded(),
             _ => {
                 self.pause_requested = false;
                 self.stopping = false;
                 self.awaiting = None;
                 self.status = TeamRunStatus::Failed;
                 self.updated_at = unix_now();
+                true
             }
         }
-        true
     }
 
     fn append_restore_error(&mut self, reason: &str) {
@@ -1618,6 +1648,49 @@ mod tests {
     }
 
     #[test]
+    fn current_build_liveness_is_executable_legacy_and_non_terminal() {
+        let mut run = TeamRun::new(
+            "r".to_string(),
+            TaskSpec::default(),
+            "/tmp/wt".to_string(),
+            "device".to_string(),
+        );
+        for status in [
+            TeamRunStatus::Queued,
+            TeamRunStatus::Running,
+            TeamRunStatus::PausePending,
+            TeamRunStatus::Paused,
+            TeamRunStatus::AwaitingUser,
+            TeamRunStatus::Blocked,
+            TeamRunStatus::Resolving,
+        ] {
+            run.status = status;
+            assert!(run.is_executable_by_current_build(), "{status:?}");
+            assert!(run.is_live_in_current_build(), "{status:?}");
+        }
+        for status in [
+            TeamRunStatus::Done,
+            TeamRunStatus::Escalated,
+            TeamRunStatus::Failed,
+            TeamRunStatus::Interrupted,
+            TeamRunStatus::Cancelled,
+        ] {
+            run.status = status;
+            assert!(run.is_executable_by_current_build(), "{status:?}");
+            assert!(!run.is_live_in_current_build(), "{status:?}");
+        }
+
+        run.status = TeamRunStatus::Paused;
+        run.orchestration_backend = OrchestrationBackendRef::Cloud {
+            protocol_version: crate::orchestration::CURRENT_PROTOCOL_VERSION,
+            driver_version: crate::orchestration::DriverVersion::new("driver.1").unwrap(),
+            cloud_run_id: crate::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+        };
+        assert!(!run.is_executable_by_current_build());
+        assert!(!run.is_live_in_current_build());
+    }
+
+    #[test]
     fn explicit_malformed_backend_refs_become_non_executing() {
         for backend_json in ["null", "{}"] {
             let run: TeamRun = serde_json::from_str(&format!(
@@ -1673,7 +1746,7 @@ mod tests {
             Some("quantum_cloud")
         );
         run.error = Some("older unrelated failure".to_string());
-        assert!(run.mark_restored_non_executing_backend());
+        assert!(run.reconcile_after_restore());
         assert_eq!(run.status, TeamRunStatus::Paused);
         let error = run.error.as_deref().unwrap_or_default();
         assert!(
@@ -1688,6 +1761,8 @@ mod tests {
         );
         assert_eq!(run.in_flight_thread.as_deref(), Some("thread-sensitive"));
         assert!(run.status.is_resumable());
+        assert!(!run.is_executable_by_current_build());
+        assert!(!run.is_live_in_current_build());
     }
 
     #[test]
@@ -1705,9 +1780,10 @@ mod tests {
         )
         .expect("unknown backend kind must not fail the whole run");
 
-        assert!(run.mark_restored_non_executing_backend());
+        assert!(run.reconcile_after_restore());
         assert_eq!(run.status, TeamRunStatus::Paused);
         assert!(run.status.is_resumable());
+        assert!(!run.is_live_in_current_build());
         assert!(!run.pause_requested);
         assert!(!run.stopping);
         assert!(run.in_flight_thread.is_none());
@@ -1754,9 +1830,10 @@ mod tests {
         )
         .expect("unknown backend kind must not fail the whole run");
 
-        assert!(run.mark_restored_non_executing_backend());
+        assert!(run.reconcile_after_restore());
         assert_eq!(run.status, TeamRunStatus::Paused);
         assert!(run.status.is_resumable());
+        assert!(!run.is_live_in_current_build());
         assert!(run.awaiting.is_none());
         assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Pending);
         assert_eq!(run.sub_tasks[0].rounds_used, 1);
@@ -1782,7 +1859,7 @@ mod tests {
 
     #[test]
     fn non_paused_future_backend_records_restore_terminal_but_keep_backend_reason() {
-        for status in ["running", "blocked"] {
+        for status in ["queued", "running", "blocked", "resolving"] {
             let mut run: TeamRun = serde_json::from_str(&format!(
                 r#"{{
                     "id":"r",
@@ -1793,7 +1870,7 @@ mod tests {
             .expect("unknown backend kind must not fail the whole run");
             run.error = Some("older unrelated failure".to_string());
 
-            assert!(run.mark_restored_non_executing_backend());
+            assert!(run.reconcile_after_restore());
             assert_eq!(run.status, TeamRunStatus::Failed, "{status}");
             let error = run.error.as_deref().unwrap_or_default();
             assert!(

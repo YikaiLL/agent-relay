@@ -22,7 +22,7 @@ use crate::{
 
 use super::{
     ensure_path_within_device_scope, persistence::PersistedRelayState, unix_now, ReviewJob,
-    RunStatus, SecurityProfile, TeamPauseKind, TeamRun, TeamRunStatus, TeamThreadGate, WorkflowRun,
+    RunStatus, SecurityProfile, TeamRun, TeamRunStatus, TeamThreadGate, WorkflowRun,
     CONTROLLER_LEASE_SECS, DEFAULT_APPROVAL_POLICY, DEFAULT_EFFORT, DEFAULT_MODEL, DEFAULT_SANDBOX,
     STALE_TURN_PROGRESS_TIMEOUT_SECS,
 };
@@ -1686,7 +1686,7 @@ impl RelayState {
     /// a finished task has nothing left to steer.
     pub(crate) fn seat_run_id_for_thread(&self, thread_id: &str) -> Option<String> {
         self.team_runs_snapshot()
-            .filter(|run| !run.status.is_terminal())
+            .filter(|run| run.is_live_in_current_build())
             .find(|run| {
                 run.owned_thread_ids()
                     .iter()
@@ -2042,7 +2042,7 @@ impl RelayState {
     /// way to ask a person something — see `team_thread_gate`.
     pub(crate) fn is_thread_team_locked(&self, thread_id: &str) -> bool {
         self.team_runs.values().any(|run| {
-            !run.status.is_terminal()
+            run.is_live_in_current_build()
                 && run
                     .owned_thread_ids()
                     .iter()
@@ -2250,23 +2250,23 @@ impl RelayState {
     pub(crate) fn is_cwd_team_locked(&self, cwd: &str) -> bool {
         let candidate = super::normalize_cwd(cwd);
         self.team_runs.values().any(|run| {
-            !run.status.is_terminal()
+            run.is_live_in_current_build()
                 && !run.cwd.is_empty()
                 && super::path_within_allowed_roots(&candidate, std::slice::from_ref(&run.cwd))
         })
     }
 
-    /// The worktree of the non-terminal team run that owns `thread_id`.
+    /// The worktree of the team run that owns `thread_id`.
     ///
     /// The authority a user action on a team thread is authorized against: the
     /// run's own cwd path-scope, exactly as pause / stop / resume use. A team
-    /// thread has no other workspace of its own to check.
+    /// thread has no other workspace of its own to check. This is not a lock:
+    /// inert records must stay non-actionable, but their lingering questions
+    /// still need the run's path scope rather than a device-only fallback.
     pub(crate) fn team_run_cwd_for_thread(&self, thread_id: &str) -> Option<String> {
         self.team_runs
             .values()
-            .find(|run| {
-                !run.status.is_terminal() && run.owned_thread_ids().iter().any(|id| id == thread_id)
-            })
+            .find(|run| run.owned_thread_ids().iter().any(|id| id == thread_id))
             .map(|run| run.cwd.clone())
     }
 
@@ -2283,7 +2283,7 @@ impl RelayState {
     /// than each guard inventing its own notion of "is this thread busy".
     pub(crate) fn team_thread_gate(&self, thread_id: &str) -> TeamThreadGate {
         for run in self.team_runs.values() {
-            if run.status.is_terminal() {
+            if !run.is_live_in_current_build() {
                 continue;
             }
             if !run.owned_thread_ids().iter().any(|id| id == thread_id) {
@@ -2474,8 +2474,9 @@ impl RelayState {
     }
 
     pub(crate) fn insert_team_run(&mut self, run: TeamRun) {
+        let id = run.id.clone();
+        self.team_runs.insert(id, run);
         self.prune_team_runs();
-        self.team_runs.insert(run.id.clone(), run);
     }
 
     pub(crate) fn team_run(&self, id: &str) -> Option<&TeamRun> {
@@ -2532,7 +2533,7 @@ impl RelayState {
         let live: Vec<&TeamRun> = self
             .team_runs
             .values()
-            .filter(|run| !run.status.is_terminal())
+            .filter(|run| run.is_live_in_current_build())
             .collect();
         match live.as_slice() {
             [] => Err("there is no active task".to_string()),
@@ -2555,7 +2556,7 @@ impl RelayState {
         let live: Vec<&TeamRun> = self
             .team_runs
             .values()
-            .filter(|run| !run.status.is_terminal())
+            .filter(|run| run.is_live_in_current_build())
             .collect();
         match live.as_slice() {
             [run] => Ok(run.id.clone()),
@@ -2573,6 +2574,10 @@ impl RelayState {
     pub(crate) fn blocked_team_run_id(&self, run_id: Option<&str>) -> Result<String, String> {
         if let Some(run_id) = run_id {
             return match self.team_runs.get(run_id) {
+                Some(run) if !run.is_executable_by_current_build() => Err(run
+                    .non_executing_backend_reason()
+                    .unwrap_or("this task is pinned to an orchestration backend this relay build cannot execute")
+                    .to_string()),
                 Some(run) if matches!(run.status, TeamRunStatus::Blocked) => Ok(run.id.clone()),
                 Some(run) if matches!(run.status, TeamRunStatus::Resolving) => {
                     Err("this task is already being resolved".to_string())
@@ -2584,6 +2589,7 @@ impl RelayState {
         let blocked: Vec<&TeamRun> = self
             .team_runs
             .values()
+            .filter(|run| run.is_live_in_current_build())
             .filter(|run| matches!(run.status, TeamRunStatus::Blocked))
             .collect();
         match blocked.as_slice() {
@@ -2610,6 +2616,7 @@ impl RelayState {
         let done: Vec<&TeamRun> = self
             .team_runs
             .values()
+            .filter(|run| run.is_executable_by_current_build())
             .filter(|run| finished(run))
             .collect();
         match done.as_slice() {
@@ -2620,18 +2627,25 @@ impl RelayState {
     }
 
     fn prune_team_runs(&mut self) {
-        if self.team_runs.len() < MAX_WORKFLOW_RUNS {
+        if self.team_runs.len() <= MAX_WORKFLOW_RUNS {
             return;
         }
         let mut terminal: Vec<(String, u64)> = self
             .team_runs
             .iter()
-            .filter(|(_, run)| run.status.is_terminal())
-            .map(|(id, run)| (id.clone(), run.updated_at))
+            .filter(|(_, run)| run.status.is_terminal() || !run.is_executable_by_current_build())
+            .map(|(id, run)| {
+                let eviction_order = if run.is_executable_by_current_build() {
+                    run.updated_at
+                } else {
+                    run.requested_at
+                };
+                (id.clone(), eviction_order)
+            })
             .collect();
         terminal.sort_by_key(|(_, updated_at)| *updated_at);
         for (id, _) in terminal {
-            if self.team_runs.len() < MAX_WORKFLOW_RUNS {
+            if self.team_runs.len() <= MAX_WORKFLOW_RUNS {
                 break;
             }
             self.team_runs.remove(&id);
@@ -2659,26 +2673,7 @@ impl RelayState {
             .iter()
             .map(|(id, run)| {
                 let mut run = run.clone();
-                if !run.mark_restored_non_executing_backend() {
-                    match run.status {
-                        TeamRunStatus::PausePending => {
-                            run.settle_paused(
-                                "the relay restarted while the team was pausing",
-                                TeamPauseKind::Boundary,
-                            );
-                        }
-                        TeamRunStatus::AwaitingUser => {
-                            run.rollback_current_round();
-                            run.settle_paused(
-                                "the relay restarted while the team was waiting on your answer; that step will be re-run",
-                                TeamPauseKind::Boundary,
-                            );
-                        }
-                        _ => {
-                            run.mark_interrupted_if_stranded();
-                        }
-                    }
-                }
+                run.reconcile_after_restore();
                 (id.clone(), run)
             })
             .collect()
@@ -5341,8 +5336,8 @@ fn remote_action_cache_key(device_id: &str, action_id: &str) -> String {
 mod tests {
     use super::{
         BrokerPendingMessage, PendingPairingResult, PendingTranscriptDelta, PersistedRelayState,
-        RelayState, ReviewJob, SecurityProfile, TeamRun, TeamRunStatus, TranscriptDeltaKind,
-        WorkflowRun, MAX_WORKFLOW_RUNS,
+        RelayState, ReviewJob, SecurityProfile, TeamRun, TeamRunStatus, TeamThreadGate,
+        TranscriptDeltaKind, WorkflowRun, MAX_WORKFLOW_RUNS,
     };
     use crate::protocol::ThreadSummaryView;
     use crate::state::{ReviewMode, RunStatus};
@@ -5773,6 +5768,167 @@ mod tests {
         run
     }
 
+    fn cloud_backend() -> relay_api::orchestration::OrchestrationBackendRef {
+        relay_api::orchestration::OrchestrationBackendRef::Cloud {
+            protocol_version: relay_api::orchestration::CURRENT_PROTOCOL_VERSION,
+            driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
+            cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+        }
+    }
+
+    fn inert_team_run_with_status(id: &str, status: TeamRunStatus) -> TeamRun {
+        let mut run = team_run_with_status(id, status);
+        run.orchestration_backend = cloud_backend();
+        run
+    }
+
+    #[test]
+    fn inert_team_runs_do_not_lock_threads_or_worktrees() {
+        let mut relay = test_relay();
+        let mut inert = inert_team_run_with_status("future", TeamRunStatus::Paused);
+        inert.cwd = "/tmp/task-future".to_string();
+        inert.tl_thread_id = "tl-future".to_string();
+        relay.insert_team_run(inert);
+
+        assert!(
+            !relay.is_thread_team_locked("tl-future"),
+            "an inert owned thread must not be treated as locally locked"
+        );
+        assert_eq!(
+            relay.team_thread_gate("tl-future"),
+            TeamThreadGate::Free,
+            "an inert paused TL is visible history, not a conversable local seat"
+        );
+        assert_eq!(relay.seat_run_id_for_thread("tl-future"), None);
+        assert_eq!(
+            relay.team_run_cwd_for_thread("tl-future").as_deref(),
+            Some("/tmp/task-future"),
+            "authorization still needs the owning run's path scope"
+        );
+        assert!(
+            !relay.is_cwd_team_locked("/tmp/task-future/src"),
+            "an inert run must not retain workspace authority"
+        );
+    }
+
+    #[test]
+    fn implicit_active_team_resolution_ignores_inert_runs() {
+        let mut relay = test_relay();
+        let mut live = team_run_with_status("legacy", TeamRunStatus::Running);
+        live.cwd = "/tmp/task-legacy".to_string();
+        relay.insert_team_run(live);
+
+        let mut inert = inert_team_run_with_status("future", TeamRunStatus::Paused);
+        inert.cwd = "/tmp/task-future".to_string();
+        relay.insert_team_run(inert);
+
+        assert_eq!(relay.active_team_run_id(None).unwrap(), "legacy");
+
+        relay.remove_team_run("legacy");
+        assert_eq!(
+            relay.active_team_run_id(None).unwrap_err(),
+            "there is no active task"
+        );
+        assert_eq!(
+            relay.active_team_run_id(Some("future")).unwrap(),
+            "future",
+            "explicit callers may still name the inert record and get a backend-level refusal"
+        );
+    }
+
+    #[test]
+    fn inert_blocked_runs_do_not_enter_blocked_recovery() {
+        let mut relay = test_relay();
+        relay.insert_team_run(inert_team_run_with_status("future", TeamRunStatus::Blocked));
+
+        assert_eq!(
+            relay.blocked_team_run_id(None).unwrap_err(),
+            "there is no blocked task to resolve"
+        );
+        let error = relay
+            .blocked_team_run_id(Some("future"))
+            .expect_err("explicit inert blocked recovery must refuse before Resolving");
+        assert!(error.contains("Cloud orchestration"), "{error}");
+    }
+
+    #[test]
+    fn implicit_reopen_resolution_ignores_inert_finished_runs() {
+        let mut relay = test_relay();
+        relay.insert_team_run(team_run_with_status("legacy", TeamRunStatus::Done));
+        relay.insert_team_run(inert_team_run_with_status("future", TeamRunStatus::Failed));
+
+        assert_eq!(relay.reopenable_team_run_id(None).unwrap(), "legacy");
+
+        relay.remove_team_run("legacy");
+        assert_eq!(
+            relay.reopenable_team_run_id(None).unwrap_err(),
+            "no task has finished, so there is nothing to reopen"
+        );
+        assert_eq!(
+            relay.reopenable_team_run_id(Some("future")).unwrap(),
+            "future",
+            "explicit callers still reach backend-specific refusal in the action layer"
+        );
+    }
+
+    #[test]
+    fn team_run_retention_can_prune_inert_records_but_keeps_locally_live_ones() {
+        let mut relay = test_relay();
+        for i in 0..=MAX_WORKFLOW_RUNS {
+            let mut run = inert_team_run_with_status(&format!("future-{i}"), TeamRunStatus::Paused);
+            run.requested_at = i as u64;
+            run.updated_at = i as u64;
+            relay.insert_team_run(run);
+        }
+        assert_eq!(
+            relay.team_runs.len(),
+            MAX_WORKFLOW_RUNS,
+            "inert records are bounded by normal retention"
+        );
+        assert!(
+            !relay.team_runs.contains_key("future-0"),
+            "the oldest inert record should be evicted first"
+        );
+
+        let mut relay = test_relay();
+        for i in 0..=MAX_WORKFLOW_RUNS {
+            let mut run = team_run_with_status(&format!("legacy-{i}"), TeamRunStatus::Paused);
+            run.requested_at = i as u64;
+            run.updated_at = i as u64;
+            relay.insert_team_run(run);
+        }
+        assert_eq!(
+            relay.team_runs.len(),
+            MAX_WORKFLOW_RUNS + 1,
+            "locally live records must not be evicted to satisfy the cap"
+        );
+
+        let mut relay = test_relay();
+        let mut finished = team_run_with_status("finished", TeamRunStatus::Done);
+        finished.requested_at = 100;
+        finished.updated_at = 1;
+        relay.insert_team_run(finished);
+        for i in 0..MAX_WORKFLOW_RUNS - 1 {
+            let mut run = team_run_with_status(&format!("live-{i}"), TeamRunStatus::Paused);
+            run.requested_at = 200 + i as u64;
+            run.updated_at = 200 + i as u64;
+            relay.insert_team_run(run);
+        }
+        let mut restored_inert =
+            inert_team_run_with_status("restored-inert", TeamRunStatus::Paused);
+        restored_inert.requested_at = 0;
+        restored_inert.updated_at = 10_000;
+        relay.insert_team_run(restored_inert);
+        assert!(
+            !relay.team_runs.contains_key("restored-inert"),
+            "restore-updated inert rows should evict by original request time"
+        );
+        assert!(
+            relay.team_runs.contains_key("finished"),
+            "old terminal history should not be pruned just because inert restore touched updated_at"
+        );
+    }
+
     #[test]
     fn teams_revision_moves_for_any_change_a_client_can_see() {
         // The cache key for the Teams channel. A content hash rather than a bumped
@@ -6194,6 +6350,7 @@ mod tests {
             .expect("unknown backend run must survive restore");
         assert_eq!(restored_run.status, TeamRunStatus::Paused);
         assert!(restored_run.status.is_resumable());
+        assert!(!restored_run.is_live_in_current_build());
         assert!(
             restored_run
                 .error
@@ -6246,6 +6403,7 @@ mod tests {
         let restored_run = restored.team_run("team_future").unwrap();
         assert_eq!(restored_run.status, TeamRunStatus::Paused);
         assert!(restored_run.status.is_resumable());
+        assert!(!restored_run.is_live_in_current_build());
         assert!(
             restored_run
                 .error

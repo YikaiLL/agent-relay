@@ -669,6 +669,10 @@ impl OrchestrationBackendRef {
         matches!(self, Self::LegacyEmbedded)
     }
 
+    pub fn is_executable_by_current_build(&self) -> bool {
+        matches!(self, Self::LegacyEmbedded)
+    }
+
     pub fn unknown_non_executing() -> Self {
         Self::UnknownNonExecuting {
             original_kind: None,
@@ -914,8 +918,7 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                 let mut protocol_version: Option<u32> = None;
                 let mut driver_version: Option<String> = None;
                 let mut cloud_run_id: Option<String> = None;
-                let mut future_shape = false;
-                let mut malformed_shape = false;
+                let mut unsupported_shape = false;
                 let mut kind_seen = false;
                 let mut original_kind_seen = false;
                 let mut protocol_version_seen = false;
@@ -926,66 +929,66 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                     match field {
                         Field::Kind => {
                             if kind_seen {
-                                malformed_shape = true;
+                                unsupported_shape = true;
                                 let _: IgnoredAny = map.next_value()?;
                                 continue;
                             }
                             kind_seen = true;
                             kind = map.next_value::<LenientString>()?.0;
                             if kind.is_none() {
-                                malformed_shape = true;
+                                unsupported_shape = true;
                             }
                         }
                         Field::OriginalKind => {
                             if original_kind_seen {
-                                malformed_shape = true;
+                                unsupported_shape = true;
                                 let _: IgnoredAny = map.next_value()?;
                                 continue;
                             }
                             original_kind_seen = true;
                             original_kind = map.next_value::<LenientString>()?.0;
                             if original_kind.is_none() {
-                                malformed_shape = true;
+                                unsupported_shape = true;
                             }
                         }
                         Field::ProtocolVersion => {
                             if protocol_version_seen {
-                                malformed_shape = true;
+                                unsupported_shape = true;
                                 let _: IgnoredAny = map.next_value()?;
                                 continue;
                             }
                             protocol_version_seen = true;
                             protocol_version = map.next_value::<LenientU32>()?.0;
                             if protocol_version.is_none() {
-                                malformed_shape = true;
+                                unsupported_shape = true;
                             }
                         }
                         Field::DriverVersion => {
                             if driver_version_seen {
-                                malformed_shape = true;
+                                unsupported_shape = true;
                                 let _: IgnoredAny = map.next_value()?;
                                 continue;
                             }
                             driver_version_seen = true;
                             driver_version = map.next_value::<LenientString>()?.0;
                             if driver_version.is_none() {
-                                malformed_shape = true;
+                                unsupported_shape = true;
                             }
                         }
                         Field::CloudRunId => {
                             if cloud_run_id_seen {
-                                malformed_shape = true;
+                                unsupported_shape = true;
                                 let _: IgnoredAny = map.next_value()?;
                                 continue;
                             }
                             cloud_run_id_seen = true;
                             cloud_run_id = map.next_value::<LenientString>()?.0;
                             if cloud_run_id.is_none() {
-                                malformed_shape = true;
+                                unsupported_shape = true;
                             }
                         }
                         Field::Unknown => {
-                            future_shape = true;
+                            unsupported_shape = true;
                             let _: IgnoredAny = map.next_value()?;
                         }
                     }
@@ -1001,8 +1004,7 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                 match kind.as_deref() {
                     None => Ok(unknown),
                     Some("legacy_embedded") => {
-                        if malformed_shape
-                            || future_shape
+                        if unsupported_shape
                             || original_kind.is_some()
                             || protocol_version.is_some()
                             || driver_version.is_some()
@@ -1013,7 +1015,7 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                         Ok(OrchestrationBackendRef::LegacyEmbedded)
                     }
                     Some("cloud") => {
-                        if malformed_shape || future_shape || original_kind.is_some() {
+                        if unsupported_shape || original_kind.is_some() {
                             return Ok(unknown);
                         }
                         let Some(protocol_version) = protocol_version else {
@@ -1038,11 +1040,7 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                         })
                     }
                     Some("local_sidecar") => {
-                        if malformed_shape
-                            || future_shape
-                            || original_kind.is_some()
-                            || cloud_run_id.is_some()
-                        {
+                        if unsupported_shape || original_kind.is_some() || cloud_run_id.is_some() {
                             return Ok(unknown);
                         }
                         let Some(protocol_version) = protocol_version else {
@@ -1332,8 +1330,7 @@ impl DriverPhase {
 /// This intentionally mirrors today's local [`crate::team::TeamRole`] variants
 /// without reusing that enum on the wire; local runtime roles may evolve without
 /// silently changing the v1 protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverRole {
     Tl,
     Dev,
@@ -1341,6 +1338,23 @@ pub enum DriverRole {
 }
 
 impl DriverRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tl => "tl",
+            Self::Dev => "dev",
+            Self::Reviewer => "reviewer",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "tl" => Some(Self::Tl),
+            "dev" => Some(Self::Dev),
+            "reviewer" => Some(Self::Reviewer),
+            _ => None,
+        }
+    }
+
     pub fn from_team_role(role: crate::team::TeamRole) -> Self {
         match role {
             crate::team::TeamRole::Tl => Self::Tl,
@@ -1361,6 +1375,26 @@ impl DriverRole {
 impl From<crate::team::TeamRole> for DriverRole {
     fn from(role: crate::team::TeamRole) -> Self {
         Self::from_team_role(role)
+    }
+}
+
+impl Serialize for DriverRole {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DriverRole {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::from_wire(&raw)
+            .ok_or_else(|| de::Error::custom(format!("unsupported driver role `{raw}`")))
     }
 }
 
@@ -3349,6 +3383,28 @@ mod tests {
 
         for value in samples {
             assert_cloud_visible_json_is_allowlisted(&value);
+        }
+    }
+
+    #[test]
+    fn driver_roles_use_exact_protocol_v1_wire_values() {
+        for (role, wire) in [
+            (DriverRole::Tl, "tl"),
+            (DriverRole::Dev, "dev"),
+            (DriverRole::Reviewer, "reviewer"),
+        ] {
+            let encoded = serde_json::to_string(&role).expect("serialize role");
+            assert_eq!(encoded, format!("\"{wire}\""));
+            let decoded: DriverRole =
+                serde_json::from_str(&encoded).expect("deserialize exact role");
+            assert_eq!(decoded, role);
+        }
+
+        for alias in ["team_lead", "review", "t_l"] {
+            assert!(
+                serde_json::from_str::<DriverRole>(&format!("\"{alias}\"")).is_err(),
+                "{alias} must not be accepted as a protocol-v1 role"
+            );
         }
     }
 

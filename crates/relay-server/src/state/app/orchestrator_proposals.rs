@@ -238,14 +238,18 @@ impl AppState {
         let (target, title) = {
             let relay = self.relay.read().await;
             let target = relay.reopenable_team_run_id(run_id.as_deref())?;
+            let run = relay
+                .team_run(&target)
+                .ok_or_else(|| "there is no task with that id".to_string())?;
+            if let Some(reason) = run.non_executing_backend_reason() {
+                return Err(reason.to_string());
+            }
             // The headline reads as the work being asked for NOW, so an
             // overridden title shows on the card the user is approving.
-            let title = updates.title.clone().unwrap_or_else(|| {
-                relay
-                    .team_run(&target)
-                    .map(|run| run.spec.title.clone())
-                    .unwrap_or_default()
-            });
+            let title = updates
+                .title
+                .clone()
+                .unwrap_or_else(|| run.spec.title.clone());
             (target, title)
         };
 

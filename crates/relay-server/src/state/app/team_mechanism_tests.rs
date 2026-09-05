@@ -191,6 +191,203 @@ async fn resume_team_run_refuses_non_embedded_backend_before_status_flip() {
 }
 
 #[tokio::test]
+async fn stop_on_an_already_paused_embedded_run_is_a_truthful_noop() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-paused-stop".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    app.relay.write().await.insert_team_run(run);
+
+    let status = app
+        .force_stop_team_run(
+            Some("team-paused-stop".to_string()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("stopping an already paused local task is a no-op");
+
+    assert_eq!(status, crate::state::TeamRunStatus::Paused);
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-paused-stop")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Paused);
+    assert!(!run.pause_requested);
+    assert!(!run.stopping);
+    assert_eq!(run.in_flight_thread, None);
+}
+
+#[tokio::test]
+async fn stop_on_a_paused_embedded_run_still_drains_unconfirmed_turns() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-paused-stop-hung".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.in_flight_thread = Some("stale-mid-start".to_string());
+    app.relay.write().await.insert_team_run(run);
+
+    let error = app
+        .force_stop_team_run(
+            Some("team-paused-stop-hung".to_string()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect_err("a paused run with an unconfirmed turn is not quiescent");
+
+    assert!(error.contains("did not confirm stopping"), "{error}");
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-paused-stop-hung")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Blocked);
+    assert!(!run.pause_requested);
+    assert!(!run.stopping);
+    assert_eq!(run.in_flight_thread.as_deref(), Some("stale-mid-start"));
+}
+
+#[tokio::test]
+async fn stop_refuses_non_embedded_backend_without_setting_markers() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-stop".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Running;
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    let error = app
+        .force_stop_team_run(
+            Some("team-cloud-stop".to_string()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect_err("stop must refuse a Cloud-pinned run in this build");
+
+    assert!(error.contains("Cloud orchestration"), "{error}");
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-stop")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Running);
+    assert!(!run.pause_requested);
+    assert!(!run.stopping);
+}
+
+#[tokio::test]
+async fn stranded_cleanup_leaves_non_embedded_records_inert() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-stranded".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Running;
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    app.interrupt_team_run_if_stranded("team-cloud-stranded")
+        .await;
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-stranded")
+        .cloned()
+        .expect("run remains visible");
+    assert_eq!(run.status, crate::state::TeamRunStatus::Running);
+    assert_eq!(run.error, None);
+    assert!(!run.stopping);
+}
+
+#[tokio::test]
+async fn inert_records_can_be_archived_but_not_marked_done() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-archive".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    let error = app
+        .mark_team_run(
+            Some("team-cloud-archive".to_string()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Done,
+        )
+        .await
+        .expect_err("mark_done would be a false success on an inert run");
+    assert!(error.contains("Cloud orchestration"), "{error}");
+
+    let status = app
+        .mark_team_run(
+            Some("team-cloud-archive".to_string()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect("mark_cancelled is the explicit archival escape");
+    assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+
+    let status = app
+        .mark_team_run(
+            Some("team-cloud-archive".to_string()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect("archival is idempotent");
+    assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+
+    app.relay
+        .write()
+        .await
+        .update_team_run("team-cloud-archive", |run| {
+            run.force_mark_status(crate::state::TeamRunStatus::Done);
+        });
+
+    let status = app
+        .mark_team_run(
+            Some("team-cloud-archive".to_string()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Done,
+        )
+        .await
+        .expect("mark_done should acknowledge an already-done inert row as a no-op");
+    assert_eq!(status, crate::state::TeamRunStatus::Done);
+}
+
+#[tokio::test]
 async fn reopen_team_run_refuses_non_embedded_backend_before_mutating() {
     let (_repo, root) = init_team_repo().await;
     let (app, _) = build_review_app(&root, &["codex"]).await;
@@ -232,7 +429,7 @@ async fn reopen_team_run_refuses_non_embedded_backend_before_mutating() {
 }
 
 #[tokio::test]
-async fn paused_restore_validation_preserves_non_embedded_backend_reason() {
+async fn paused_restore_validation_blocks_missing_non_embedded_worktree() {
     let (_repo, root) = init_team_repo().await;
     let (app, _) = build_review_app(&root, &["codex"]).await;
     let backend = cloud_backend();
@@ -260,8 +457,16 @@ async fn paused_restore_validation_preserves_non_embedded_backend_reason() {
         .team_run("team-cloud-restore")
         .cloned()
         .unwrap();
-    assert_eq!(run.status, crate::state::TeamRunStatus::Paused);
-    assert_eq!(run.error.as_deref(), Some(reason.as_str()));
+    assert_eq!(run.status, crate::state::TeamRunStatus::Blocked);
+    let error = run.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("no longer exists"),
+        "missing worktree validation must still run for inert pauses: {error}"
+    );
+    assert!(
+        error.contains(reason.as_str()),
+        "the backend refusal reason should remain visible beside the worktree diagnosis: {error}"
+    );
 }
 
 #[tokio::test]

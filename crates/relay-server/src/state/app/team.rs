@@ -398,8 +398,9 @@ locally and trust it before starting a task team there"
         // also serialises two reopens of the same run.
         let _slot = self.acquire_session_slot()?;
 
-        // Resolved before authorizing: the shared resolver only ever finds a LIVE
-        // run, and a reopen targets one that has finished.
+        // Resolved before authorizing: the shared resolver picks a finished run
+        // for implicit reopen and lets explicit ids reach backend-specific
+        // refusal below.
         let requested = {
             let relay = self.relay.read().await;
             relay.reopenable_team_run_id(run_id.as_deref())?
@@ -535,6 +536,7 @@ locally and trust it before starting a task team there"
         let (run_id, _device_id) = self
             .authorize_team_action(run_id.as_deref(), device_id)
             .await?;
+        self.require_embedded_team_backend(&run_id).await?;
         let status = self
             .team_run_snapshot(&run_id)
             .await
@@ -546,7 +548,6 @@ locally and trust it before starting a task team there"
                 status.as_str()
             ));
         }
-        self.require_embedded_team_backend(&run_id).await?;
         // The worktree is where every seat's turns run and cannot be relocated, so
         // a resume into a tree that is gone would fail at the first turn with a
         // provider error instead of a reason. This blocks the run and says so.
@@ -582,35 +583,44 @@ locally and trust it before starting a task team there"
     /// than a card that says the tree is gone. The branch survives either way, so
     /// blocking loses nothing.
     pub(crate) async fn validate_paused_team_runs(&self) {
-        let paused: Vec<(String, String, String)> = {
+        let paused: Vec<(String, String, String, bool, Option<String>)> = {
             let relay = self.relay.read().await;
             relay
                 .team_runs_snapshot()
-                .filter(|run| {
-                    run.status.is_resumable()
-                        && run.orchestration_backend.non_executing_reason().is_none()
+                .filter(|run| run.status.is_resumable())
+                .map(|run| {
+                    (
+                        run.id.clone(),
+                        run.cwd.clone(),
+                        run.tl_thread_id.clone(),
+                        run.is_executable_by_current_build(),
+                        run.non_executing_backend_reason().map(str::to_string),
+                    )
                 })
-                .map(|run| (run.id.clone(), run.cwd.clone(), run.tl_thread_id.clone()))
                 .collect()
         };
-        for (run_id, cwd, tl_thread_id) in paused {
+        for (run_id, cwd, tl_thread_id, executable_by_current_build, backend_reason) in paused {
             // Liveness only: "is this worktree still on disk", asked at boot.
             if LiveDir::from_path(&cwd).is_none() {
-                self.block_team_run(
-                    &run_id,
-                    format!(
-                        "the task worktree {cwd} no longer exists, so this task cannot be \
+                let mut message = format!(
+                    "the task worktree {cwd} no longer exists, so this task cannot be \
 resumed; its branch is untouched"
-                    ),
-                )
-                .await;
+                );
+                if let Some(reason) = backend_reason {
+                    message.push_str("; ");
+                    message.push_str(&reason);
+                }
+                self.block_team_run(&run_id, message).await;
                 continue;
             }
             // A recorded team lead whose session no longer routes to any provider
             // is not a dead run — the plan file is the durable state and a fresh
             // lead can read it. Mark it now, while a provider probe is cheap and
             // nobody is waiting, rather than letting Resume fail on its first turn.
-            if !tl_thread_id.is_empty() && self.find_thread_provider(&tl_thread_id).await.is_err() {
+            if executable_by_current_build
+                && !tl_thread_id.is_empty()
+                && self.find_thread_provider(&tl_thread_id).await.is_err()
+            {
                 let mut relay = self.relay.write().await;
                 relay.update_team_run(&run_id, |run| {
                     run.request_tl_reseed(
@@ -931,6 +941,7 @@ over on resume"
         let (run_id, device_id) = self
             .authorize_team_action(run_id.as_deref(), device_id)
             .await?;
+        self.require_embedded_team_backend(&run_id).await?;
         let status = self.require_stoppable_team_run(&run_id).await?;
         // Idempotent: a second Pause on a run that already settled is the user
         // pressing twice, not an error worth surfacing.
@@ -997,13 +1008,28 @@ over on resume"
         let (run_id, device_id) = self
             .authorize_team_mark(run_id.as_deref(), device_id)
             .await?;
-        let status = self
+        let (status, executable_by_current_build, backend_reason) = self
             .team_run_snapshot(&run_id)
             .await
-            .map(|run| run.status)
+            .map(|run| {
+                (
+                    run.status,
+                    run.is_executable_by_current_build(),
+                    run.non_executing_backend_reason().map(str::to_string),
+                )
+            })
             .ok_or_else(|| "there is no task with that id".to_string())?;
         if status == target {
             return Ok(target);
+        }
+        if !executable_by_current_build {
+            if target == TeamRunStatus::Cancelled {
+                return self.mark_non_executable_team_run_cancelled(&run_id).await;
+            }
+            return Err(backend_reason.unwrap_or_else(|| {
+                "this task is pinned to an orchestration backend this relay build cannot execute"
+                    .to_string()
+            }));
         }
         if matches!(status, TeamRunStatus::Blocked | TeamRunStatus::Resolving) {
             if status == TeamRunStatus::Resolving {
@@ -1024,6 +1050,39 @@ over on resume"
         };
         self.stop_team_run(Some(run_id), Some(device_id), kind)
             .await
+    }
+
+    /// Archive an inert run by marking it cancelled without pretending this
+    /// build can drain or complete its backend.
+    async fn mark_non_executable_team_run_cancelled(
+        &self,
+        run_id: &str,
+    ) -> Result<TeamRunStatus, String> {
+        let mut relay = self.relay.write().await;
+        let mut changed = false;
+        let mut outcome = Err("there is no task with that id".to_string());
+        if relay.team_runs.contains_key(run_id) {
+            relay.update_team_run(run_id, |run| {
+                if run.is_executable_by_current_build() {
+                    outcome = Err("this task is executable by this build".to_string());
+                    return;
+                }
+                if run.status == TeamRunStatus::Cancelled {
+                    outcome = Ok(TeamRunStatus::Cancelled);
+                    return;
+                }
+                if !run.force_mark_status(TeamRunStatus::Cancelled) {
+                    outcome = Err("this task could not be marked cancelled".to_string());
+                    return;
+                }
+                changed = true;
+                outcome = Ok(TeamRunStatus::Cancelled);
+            });
+            if changed {
+                relay.notify();
+            }
+        }
+        outcome
     }
 
     /// Relabel a terminal or paused run once quiescence is proved.
@@ -1159,7 +1218,23 @@ over on resume"
         let (run_id, device_id) = self
             .authorize_team_action(run_id.as_deref(), device_id)
             .await?;
-        self.require_stoppable_team_run(&run_id).await?;
+        self.require_embedded_team_backend(&run_id).await?;
+        let status = self.require_stoppable_team_run(&run_id).await?;
+        if kind == TeamStopKind::Pause && status == TeamRunStatus::Paused {
+            let _gate = self.team_drive_gate.lock().await;
+            if !self.drain_team_run(&run_id).await {
+                self.block_team_run(
+                    &run_id,
+                    "the task could not be stopped: at least one owned turn did not confirm stopping",
+                )
+                .await;
+                return Err(
+                    "this task is blocked because an owned turn did not confirm stopping"
+                        .to_string(),
+                );
+            }
+            return Ok(TeamRunStatus::Paused);
+        }
 
         {
             let mut relay = self.relay.write().await;
@@ -1515,7 +1590,7 @@ over on resume"
             drop(self.team_commit_barrier.lock().await);
         }
         let drivable = self.team_run_snapshot(run_id).await.is_some_and(|run| {
-            !run.status.is_terminal() && !run.status.is_settled_without_driver()
+            run.is_live_in_current_build() && !run.status.is_settled_without_driver()
         });
         drivable.then_some(gate)
     }
@@ -1608,13 +1683,13 @@ over on resume"
     /// owning its threads) rather than Interrupted — the same contract
     /// `interrupt_workflow_if_stranded` follows.
     pub(super) async fn interrupt_team_run_if_stranded(&self, run_id: &str) {
-        let settled = self
-            .team_run_snapshot(run_id)
-            .await
-            .map(|run| run.status.is_terminal() || run.status.is_settled_without_driver());
+        let should_interrupt = self.team_run_snapshot(run_id).await.is_some_and(|run| {
+            run.is_live_in_current_build() && !run.status.is_settled_without_driver()
+        });
         // Paused, Blocked, and Resolving have no driver on purpose. They are
-        // user-owned settlements, not stranded workflow cursors.
-        if settled.unwrap_or(true) {
+        // user-owned settlements, not stranded workflow cursors. Unsupported
+        // backend records are visible history, but inert in this relay build.
+        if !should_interrupt {
             return;
         }
 
@@ -1701,9 +1776,15 @@ over on resume"
             .team_run_snapshot(run_id)
             .await
             .ok_or_else(|| "there is no task with that id".to_string())?;
-        match run.orchestration_backend.non_executing_reason() {
-            Some(reason) => Err(reason.to_string()),
-            None => Ok(()),
+        if run.is_executable_by_current_build() {
+            Ok(())
+        } else {
+            Err(run
+                .non_executing_backend_reason()
+                .unwrap_or(
+                    "this task is pinned to an orchestration backend this relay build cannot execute",
+                )
+                .to_string())
         }
     }
 
