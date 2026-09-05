@@ -65,16 +65,24 @@ export async function hydrateTranscript(
         return;
       }
 
-      // Freshness gate BEFORE the (order-resetting) merge. A non-prepend tail merge
-      // RESETS the order to the page's ids (createMergedTranscriptHydrationPagePatch),
-      // so merging a page fetched against a now-stale tail would DROP a
-      // concurrently-joined entry from the order — orphaning it in the entries map,
-      // where a later same-id merge never re-adds it (and once it arrives `full`,
-      // `snapshotTailNeedsFullText` is false so nothing re-fetches → permanently
-      // missing). If the thread or signature changed while this fetch was in flight,
-      // the page is stale: release the loading gate and discard it so a fresh fetch,
-      // re-armed at the new revision, rebuilds the tail. (The older-page loop below
-      // prepends, which never resets the order, so its post-merge checks are safe.)
+      // Freshness gate before the merge. A non-prepend tail merge used to RESET
+      // the order to the page's ids, orphaning anything the page did not carry
+      // (older scrolled-in history, or an id a live SSE delta had just
+      // appended) — still present in `entries`, never rendered again, and
+      // unrecoverable, since a later same-id merge only re-adds an id that is
+      // new to `entries`. `createMergedTranscriptHydrationPagePatch`'s
+      // non-prepend branch now splices via `mergeTailPageOrder`
+      // (transcript-hydration-store.js) instead, which keeps anything the
+      // page does not carry above or below it rather than dropping it — see
+      // "a tail page merges into the loaded window instead of replacing its
+      // order" (transcript-hydration-store.test.mjs). That closed the
+      // order-loss failure mode this gate was originally written against, but
+      // the gate itself still earns its keep independently: the thread-id and
+      // signature checks below are a basic identity/freshness check on the
+      // page's own content, not a workaround for the merge. If the thread or
+      // signature changed while this fetch was in flight, the page is stale:
+      // release the loading gate and discard it so a fresh fetch, re-armed at
+      // the new revision, rebuilds the tail.
       if (store.getTranscriptHydrationThreadId(state) !== snapshot.active_thread_id) {
         store.setTranscriptHydrationIdle(state);
         return;
