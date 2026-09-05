@@ -155,13 +155,14 @@ export function buildViewOnlyPin({
   lastRefreshAt = 0,
   lastRefreshServerTime = null,
   wasWorking = false,
+  reviewerThreads = undefined,
   priorEntries = [],
   priorOlderCursor = null,
   historyExtended = false,
   loading = false,
   error = false,
 }) {
-  return {
+  const pin = {
     threadId,
     entries: page ? page.entries || [] : priorEntries,
     olderCursor: page ? page.prev_cursor ?? null : priorOlderCursor,
@@ -198,6 +199,10 @@ export function buildViewOnlyPin({
     // shell as a settled, complete view forever. See viewOnlySelfHealThreadId.
     error,
   };
+  if (reviewerThreads !== undefined) {
+    pin.reviewerThreads = Array.isArray(reviewerThreads) ? reviewerThreads : [];
+  }
+  return pin;
 }
 
 // How long to wait before a render re-arms a view-only load that previously
@@ -256,6 +261,10 @@ function snapshotServerTime(session) {
 
 function pinServerTime(pin) {
   return serverTimeSeconds(pin?.lastRefreshServerTime);
+}
+
+function hasOwn(object, property) {
+  return Object.prototype.hasOwnProperty.call(Object(object), property);
 }
 
 // Prepend an older history page into the pin. Entries already present (by
@@ -394,7 +403,7 @@ export function projectViewOnlySession(realSession, { viewThreadId, viewOnlyThre
     viewedThread: viewOnlyThread
       ? (() => {
         const settings = viewOnlyThread.settings || {};
-        return {
+        const viewedThread = {
           threadId: viewOnlyThread.threadId,
           entries: viewOnlyThread.entries || [],
           olderCursor: viewOnlyThread.olderCursor,
@@ -417,6 +426,12 @@ export function projectViewOnlySession(realSession, { viewThreadId, viewOnlyThre
           status: viewOnlyThread.status,
           refreshServerTime: pinServerTime(viewOnlyThread),
         };
+        if (hasOwn(viewOnlyThread, "reviewerThreads")) {
+          viewedThread.reviewerThreads = Array.isArray(viewOnlyThread.reviewerThreads)
+            ? viewOnlyThread.reviewerThreads
+            : [];
+        }
+        return viewedThread;
       })()
       : null,
     liveActivityServerTime: snapshotServerTime(realSession),

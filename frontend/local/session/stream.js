@@ -437,6 +437,7 @@ export function createStreamController(ctx) {
         currentEntry: existingWindowEntry,
         hasCurrentEntry: Boolean(existingWindowEntry),
         buildTranscript: false,
+        appendEmptyOffsetlessDelta: true,
       });
       if (outcome.kind === "noop") {
         return;
@@ -465,7 +466,10 @@ export function createStreamController(ctx) {
         // alone lets that race repromote this exact item to `full`.
         state.transcriptRefusalEpoch = (state.transcriptRefusalEpoch || 0) + 1;
       }
-      const applied = appendTranscriptDelta(state, event);
+      let applied = appendTranscriptDelta(state, event);
+      if (!applied) {
+        applied = applyAcceptedEmptyOffsetlessDeltaToWindow(event, outcome);
+      }
       const textLengthAfter = (state.transcriptHydrationEntries.get(event.item_id)?.text ?? "").length;
       if (applied) {
         observeAppliedActiveThreadDelta({
@@ -556,6 +560,36 @@ export function createStreamController(ctx) {
       textLengthAfter: outcome.textLengthAfter,
     });
     queueTranscriptRender(outcome.nextSession, outcome.appendText.length);
+  }
+
+  function applyAcceptedEmptyOffsetlessDeltaToWindow(event, outcome) {
+    if (
+      outcome.kind !== "append"
+      || outcome.appendText !== ""
+      || (event?.delta ?? "") !== ""
+      || event?.text_offset != null
+    ) {
+      return false;
+    }
+    const itemId = outcome.itemId || event?.item_id;
+    const entries = state.transcriptHydrationEntries;
+    const order = state.transcriptHydrationOrder;
+    if (!itemId || !(entries instanceof Map) || !Array.isArray(order)) {
+      return false;
+    }
+    const existing = entries.get(itemId);
+    const nextEntry = {
+      item_id: itemId,
+      text: "",
+      tool: null,
+      ...existing,
+      ...outcome.entryPatch,
+    };
+    entries.set(itemId, nextEntry);
+    if (!existing) {
+      order.push(itemId);
+    }
+    return true;
   }
 
   function normalizeLocalDeltaKind(kind) {

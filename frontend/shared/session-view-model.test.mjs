@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 
 import { projectViewOnlySession } from "../local/view-only-thread.js";
-import { VIEW_ONLY_CONTROLLER_DEVICE_ID } from "./session-view-model.js";
+import {
+  selectDisplayedSession,
+  VIEW_ONLY_CONTROLLER_DEVICE_ID,
+} from "./session-view-model.js";
 
 function createElementStub() {
   return {
@@ -453,4 +456,40 @@ test("Local and Remote adapters share normalized displayed-session decisions", a
       });
     });
   }
+});
+
+test("view-only projection inherits live reviewer threads unless the viewed thread replaces them", () => {
+  const liveReviewers = [
+    { reviewer_thread_id: "rev-live", parent_thread_id: "live" },
+  ];
+  const viewed = {
+    threadId: "viewed",
+    entries: [{ item_id: "viewed-entry", text: "viewed" }],
+  };
+  const inherited = selectDisplayedSession({
+    liveSession: liveSession("live", { reviewer_threads: liveReviewers }),
+    viewedThreadId: "viewed",
+    viewedThread: viewed,
+  });
+
+  assert.equal(
+    inherited.reviewer_threads,
+    liveReviewers,
+    "omitting reviewerThreads should preserve the real session list"
+  );
+
+  const replacement = [
+    { reviewer_thread_id: "rev-viewed", parent_thread_id: "viewed" },
+  ];
+  const replaced = selectDisplayedSession({
+    liveSession: liveSession("live", { reviewer_threads: liveReviewers }),
+    viewedThreadId: "viewed",
+    viewedThread: { ...viewed, reviewerThreads: replacement },
+  });
+
+  assert.equal(
+    replaced.reviewer_threads,
+    replacement,
+    "an explicit viewed-thread reviewerThreads list should replace the real session list"
+  );
 });

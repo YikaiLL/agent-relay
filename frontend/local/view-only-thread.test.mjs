@@ -170,6 +170,39 @@ test("projection derives working state and pending prompts from the viewed threa
   );
 });
 
+test("projection preserves reviewer threads unless the pin supplies an explicit replacement", () => {
+  const liveReviewers = [
+    { reviewer_thread_id: "rev-live", parent_thread_id: "LIVE" },
+  ];
+  const replacement = [
+    { reviewer_thread_id: "rev-viewed", parent_thread_id: "A" },
+  ];
+
+  const inherited = projectViewOnlySession(realSession({ reviewer_threads: liveReviewers }), {
+    viewThreadId: "A",
+    viewOnlyThread: pinFor("A"),
+  });
+  assert.equal(
+    inherited.reviewer_threads,
+    liveReviewers,
+    "a Local pin with no reviewerThreads field must not erase the real session list"
+  );
+
+  const replaced = projectViewOnlySession(realSession({ reviewer_threads: liveReviewers }), {
+    viewThreadId: "A",
+    viewOnlyThread: buildViewOnlyPin({
+      threadId: "A",
+      reviewerThreads: replacement,
+      priorEntries: [{ item_id: "A-tail" }],
+    }),
+  });
+  assert.equal(
+    replaced.reviewer_threads,
+    replacement,
+    "a Local pin with reviewerThreads must replace the real session list"
+  );
+});
+
 test("projection is a no-op without a matching pin or when viewing the active thread", () => {
   const real = realSession();
   assert.equal(projectViewOnlySession(real, { viewThreadId: "A", viewOnlyThread: null }), real);

@@ -84,7 +84,7 @@ export function selectDisplayedSessionModel({
     approval_policy: normalized.approvalPolicy ?? "",
     sandbox: normalized.sandbox ?? "",
     available_models: normalized.availableModels,
-    reviewer_threads: normalized.reviewerThreads,
+    reviewer_threads: normalized.reviewerThreads ?? liveSession.reviewer_threads ?? [],
     review_locked: Boolean(normalized.reviewLocked),
     workflow_locked: Boolean(normalized.workflowLocked),
     settings_writable: Boolean(normalized.settingsWritable),
@@ -122,6 +122,7 @@ export function serverTimeSeconds(value) {
 
 function normalizeViewedThread(viewedThread, threadId) {
   const hasTranscriptTruncated = typeof viewedThread.transcriptTruncated === "boolean";
+  const hasReviewerThreads = hasOwn(viewedThread, "reviewerThreads");
   return {
     threadId,
     entries: Array.isArray(viewedThread.entries) ? viewedThread.entries : [],
@@ -142,7 +143,9 @@ function normalizeViewedThread(viewedThread, threadId) {
     approvalPolicy: viewedThread.approvalPolicy ?? "",
     sandbox: viewedThread.sandbox ?? "",
     availableModels: viewedThread.availableModels || [],
-    reviewerThreads: viewedThread.reviewerThreads || [],
+    reviewerThreads: hasReviewerThreads
+      ? (Array.isArray(viewedThread.reviewerThreads) ? viewedThread.reviewerThreads : [])
+      : undefined,
     reviewLocked: Boolean(viewedThread.reviewLocked),
     workflowLocked: Boolean(viewedThread.workflowLocked),
     settingsWritable: Boolean(viewedThread.settingsWritable),
@@ -157,4 +160,8 @@ function filterThreadItems(items, threadId) {
 
 function stringId(value) {
   return typeof value === "string" && value ? value : null;
+}
+
+function hasOwn(object, property) {
+  return Object.prototype.hasOwnProperty.call(Object(object), property);
 }
