@@ -54,7 +54,7 @@ function createManualClock(startTime = 0) {
   };
 }
 
-function makeController({ ensureConversationTranscript } = {}) {
+function makeController({ ensureConversationTranscript, fetchTranscriptPage, isViewingConversation } = {}) {
   const renders = [];
   const clock = createManualClock();
   const state = {
@@ -106,6 +106,10 @@ function makeController({ ensureConversationTranscript } = {}) {
     cancelSessionPoll() {},
     cancelStreamReconnect() {},
     ensureConversationTranscript,
+    fetchTranscriptPage,
+    // Defaults to "yes" — most tests here don't care about the background/
+    // off-screen-thread gate; the tests that DO care override it explicitly.
+    isViewingConversation: isViewingConversation || (() => true),
     handleUnauthorized() {},
     logLine() {},
     renderSession: renderSessionAndClearPendingFlush,
@@ -341,14 +345,42 @@ test("transcript_stream_lagged settles the pending window delta before invalidat
 // path that renders immediately apart from one that merely waits out the
 // same window — this asserts the immediate render, fetch, and timer
 // cancellation BEFORE the clock ever moves).
-test("a gapped delta for an item with an earlier pending append settles and flushes immediately, instead of coalescing", () => {
-  let fetchCalls = 0;
-  const ensureConversationTranscript = () => {
-    fetchCalls += 1;
-    return Promise.resolve();
+//
+// P1 (review, round 2): an earlier version of this test stubbed
+// ensureConversationTranscript itself and only counted that the stub was
+// called. ensureConversationTranscript's own gate (prepareTranscriptHydration
+// State, shared/transcript-hydration-store.js) fires off
+// snapshot.transcript_truncated and the WIRE snapshot's own per-entry
+// content_state — both server-computed signals a client-only window
+// downgrade never touches — so in real code that call is a silent no-op:
+// reproduction showed zero fetchPage calls. Stubbing it hid exactly that.
+// This version stubs one level lower, at fetchTranscriptPage (the actual
+// network boundary repairActiveTranscriptTail calls, bypassing the broken
+// gate entirely — see stream.js's doc on that function), and asserts the
+// REAL merge landed: the window entry is promoted back to `full` with the
+// fetched page's text, and a second render actually paints it.
+test("a gapped delta for an item with an earlier pending append settles and flushes immediately, then repairs with the authoritative page once it lands", async () => {
+  const fetchCalls = [];
+  const fetchTranscriptPage = (threadId, options) => {
+    fetchCalls.push({ threadId, options });
+    return Promise.resolve({
+      thread_id: "thread-1",
+      entries: [
+        {
+          item_id: "agent-1",
+          kind: "agent_text",
+          status: "completed",
+          text: "hello world, repaired",
+          tool: null,
+          turn_id: "turn-1",
+        },
+      ],
+      prev_cursor: null,
+      revision: 8,
+    });
   };
   const { clock, controller, renders, state, transcriptFlushScheduler } = makeController({
-    ensureConversationTranscript,
+    fetchTranscriptPage,
   });
 
   state.transcriptHydrationThreadId = "thread-1";
@@ -413,7 +445,6 @@ test("a gapped delta for an item with an earlier pending append settles and flus
     "the immediate render must carry the earlier valid append — downgrading the window before that append " +
       "settles makes the projection fall back to the array's stale pre-append copy instead"
   );
-  assert.equal(fetchCalls, 1, "a true refusal must trigger exactly one refetch");
   assert.equal(
     transcriptFlushScheduler.stats().pending,
     false,
@@ -422,6 +453,35 @@ test("a gapped delta for an item with an earlier pending append settles and flus
 
   clock.tick(TRANSCRIPT_FLUSH_MAX_WINDOW_MS);
   assert.equal(renders.length, 1, "the absorbed window timer must not render a second time later");
+
+  // The repair fetch is fire-and-forget (`void repairActiveTranscriptTail(...)`)
+  // — flush the microtask queue so its continuation (the merge + render after
+  // `await fetchTranscriptPage(...)` resolves) has actually run before asserting.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(fetchCalls.length, 1, "a true refusal must trigger exactly one authoritative-tail fetch");
+  assert.equal(fetchCalls[0].threadId, "thread-1");
+  assert.equal(fetchCalls[0].options.before, null, "the repair must fetch the LIVE tail, not an older page");
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").content_state,
+    "full",
+    "the fetched page must promote the window entry back to full"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").text,
+    "hello world, repaired",
+    "the window must hold the AUTHORITATIVE page's text, not the refused local copy"
+  );
+  assert.equal(
+    renders.length,
+    2,
+    "the landed repair is new information and must paint again, once — this is not the absorbed stale timer"
+  );
+  assert.equal(
+    renders[1].transcript[0].text,
+    "hello world, repaired",
+    "the second render must carry the repaired, authoritative text"
+  );
 });
 
 // Sibling to the refusal test above: resolveDeltaAppend returns `""` — not
@@ -488,20 +548,49 @@ test("a duplicate delta for an item already fully held triggers neither a refetc
 // straight through to the ordinary coalesced path with no refetch requested —
 // reproducing as fetchCalls: 0, renders: 0, pending: true, the same signature
 // the original per-item defect had.
-test("a first delta for a new item with a missing head (nonzero offset) flushes immediately, instead of coalescing", () => {
-  let fetchCalls = 0;
-  const ensureConversationTranscript = () => {
-    fetchCalls += 1;
-    return Promise.resolve();
+//
+// P1 (review, round 2): same correction as the sibling test above — stubbing
+// ensureConversationTranscript only proved the stub was called, not that a
+// real fetch (or its merge) ever happens; reproduction showed zero
+// fetchPage calls for this shape too. Stubs fetchTranscriptPage instead and
+// asserts the previously-missing item is actually promoted to `full` with
+// real text once the repair lands.
+test("a first delta for a new item with a missing head (nonzero offset) flushes immediately, then repairs once the authoritative page lands", async () => {
+  const fetchCalls = [];
+  const fetchTranscriptPage = (threadId, options) => {
+    fetchCalls.push({ threadId, options });
+    return Promise.resolve({
+      thread_id: "thread-1",
+      entries: [
+        {
+          item_id: "agent-1",
+          kind: "agent_text",
+          status: "completed",
+          text: "hello",
+          tool: null,
+          turn_id: "turn-1",
+        },
+        {
+          item_id: "agent-2",
+          kind: "agent_text",
+          status: "completed",
+          text: "full body the client never saw the head of",
+          tool: null,
+          turn_id: "turn-2",
+        },
+      ],
+      prev_cursor: null,
+      revision: 2,
+    });
   };
   const { clock, controller, renders, state, transcriptFlushScheduler } = makeController({
-    ensureConversationTranscript,
+    fetchTranscriptPage,
   });
 
   // The window is loaded for the thread (it already tracks "agent-1"), but
   // "agent-2" has never been seen by it — this exercises
   // applyTranscriptDeltaToWindow's "unknown item" branch, not the
-  // resolveDeltaAppend-guarded "existing item" branch the tests above do.
+  // resolveDeltaAppend-guarded "existing item" branch the sibling test does.
   state.transcriptHydrationThreadId = "thread-1";
   state.transcriptHydrationOrder = ["agent-1"];
   state.transcriptHydrationEntries = new Map([
@@ -544,7 +633,6 @@ test("a first delta for a new item with a missing head (nonzero offset) flushes 
     1,
     "a missing-head delta for a brand-new item must flush immediately, not sit out the coalescing window"
   );
-  assert.equal(fetchCalls, 1, "a missing head must trigger exactly one refetch");
   assert.equal(
     transcriptFlushScheduler.stats().pending,
     false,
@@ -553,6 +641,37 @@ test("a first delta for a new item with a missing head (nonzero offset) flushes 
 
   clock.tick(TRANSCRIPT_FLUSH_MAX_WINDOW_MS);
   assert.equal(renders.length, 1, "the absorbed window timer must not render a second time later");
+
+  // Flush the microtask queue so the fire-and-forget repair's continuation
+  // (the merge + render after `await fetchTranscriptPage(...)` resolves) has
+  // actually run before asserting.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(fetchCalls.length, 1, "a missing head must trigger exactly one authoritative-tail fetch");
+  assert.equal(fetchCalls[0].threadId, "thread-1");
+  assert.equal(fetchCalls[0].options.before, null, "the repair must fetch the LIVE tail, not an older page");
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-2")?.content_state,
+    "full",
+    "the fetched page must promote the previously-missing-head item to full"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-2")?.text,
+    "full body the client never saw the head of",
+    "the window must hold the AUTHORITATIVE page's text for the item the stream never delivered a head for"
+  );
+  assert.equal(
+    renders.length,
+    2,
+    "the landed repair is new information and must paint again, once"
+  );
+  const repairedEntry = renders[1].transcript.find((entry) => entry.item_id === "agent-2");
+  assert.ok(repairedEntry, "the repaired item must actually appear in the rendered transcript");
+  assert.equal(
+    repairedEntry.text,
+    "full body the client never saw the head of",
+    "the second render must carry the repaired, authoritative text for the previously-missing item"
+  );
 });
 
 // P1 (review): a terminal entry patch used to end at the same coalescing

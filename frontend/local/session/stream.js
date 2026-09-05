@@ -5,6 +5,7 @@ import {
   applyEntryPatchToWindow,
   invalidateTranscriptWindowForRepair,
   markTranscriptWindowProjectionPending,
+  mergeTranscriptHydrationPage,
   resolveDeltaAppend,
   settleTranscriptProjection,
   transcriptWindowIsLoaded,
@@ -29,11 +30,13 @@ export function createStreamController(ctx) {
     seedDefaults,
     renderSession,
     handleUnauthorized,
+    isViewingConversation,
   } = ctx;
   const applySessionSnapshot = (...args) => ctx.applySessionSnapshot(...args);
   // Resolved lazily: the controller is built before the transcript controller exists.
   const ensureConversationTranscript = (...args) =>
     ctx.ensureConversationTranscript?.(...args);
+  const fetchTranscriptPage = (...args) => ctx.fetchTranscriptPage?.(...args);
   const cancelSessionPoll = (...args) => ctx.cancelSessionPoll(...args);
   const cancelStreamReconnect = (...args) => ctx.cancelStreamReconnect(...args);
   const scheduleSessionPoll = (...args) => ctx.scheduleSessionPoll(...args);
@@ -52,6 +55,51 @@ export function createStreamController(ctx) {
     if (chars > 0) {
       transcriptFlushScheduler.note(chars);
     }
+  }
+
+  /// Pull the authoritative transcript tail directly, bypassing the
+  /// snapshot-truncation hydration gate. `ensureConversationTranscript`
+  /// (session/transcript.js) is the WRONG tool for a per-item refusal: its
+  /// gate (`prepareTranscriptHydrationState`, shared/transcript-hydration-
+  /// store.js) fires off `snapshot.transcript_truncated` and the wire
+  /// snapshot's own per-entry `content_state` — both server-computed
+  /// signals a CLIENT-detected gap/mismatch/missing-head never touches, since
+  /// it only downgrades this window's own cached copy. Worse,
+  /// `selectHydrationSnapshot` (transcript/hydration.js) prefers the raw wire
+  /// snapshot over the merged session whenever the thread matches, so even a
+  /// hand-patched session passed in would be ignored. The refused item reads
+  /// back `full` (or is entirely absent from the last snapshot) and
+  /// `ensureConversationTranscript` silently no-ops — no fetch, ever, for
+  /// this signal. Mirrors remote's repairActiveTranscriptTail
+  /// (session-ops.js:697), which documents and bypasses the identical gate
+  /// for the identical reason.
+  async function repairActiveTranscriptTail(threadId) {
+    if (!threadId || !isViewingConversation?.({ active_thread_id: threadId })) {
+      return;
+    }
+    let page;
+    try {
+      page = await fetchTranscriptPage(threadId, { before: null });
+    } catch (error) {
+      logLine(`Transcript repair failed: ${error.message}`);
+      return;
+    }
+    if (!page || page.thread_id !== threadId) {
+      logLine("Transcript repair page response was incomplete.");
+      return;
+    }
+    // The thread may have moved on (or the window been torn down) while the
+    // fetch was in flight — a legitimate no-op, not a failure to retry.
+    if (state.session?.active_thread_id !== threadId || !transcriptWindowIsLoaded(state, threadId)) {
+      return;
+    }
+    // The SAME merge the gated hydration path itself uses for a tail
+    // re-fetch (shared/transcript-hydration.js's hydrateTranscript) — this
+    // only bypasses the decision of WHETHER to fetch, not how a fetched page
+    // is reconciled into the window.
+    mergeTranscriptHydrationPage(state, page, { prepend: false });
+    markTranscriptWindowProjectionPending(state);
+    transcriptFlushScheduler.flushNow("transcript_entry_delta_refused_repair");
   }
 
   function connectSessionStream() {
@@ -405,13 +453,17 @@ export function createStreamController(ctx) {
         // A true refusal, not a duplicate — this item's window entry was just
         // downgraded to preview IN PLACE above (or, for a brand-new item,
         // created directly as one), so there is nothing left to project for
-        // it here. Bring the repair forward instead of letting it sit out the
-        // coalescing window behind a copy we already know is incomplete,
-        // same immediate tail as transcript_stream_lagged (settle, above,
-        // already ran) — minus that path's window-wide invalidation,
-        // which would wrongly downgrade every OTHER entry over one bad chunk.
+        // it here. Bring the ALREADY-KNOWN-GOOD text forward immediately
+        // instead of letting it sit out the coalescing window, same immediate
+        // tail as transcript_stream_lagged (settle, above, already ran) —
+        // minus that path's window-wide invalidation, which would wrongly
+        // downgrade every OTHER entry over one bad chunk.
         state.session = nextSession;
-        void ensureConversationTranscript?.(state.session);
+        // NOT ensureConversationTranscript — see repairActiveTranscriptTail's
+        // own doc for why that gate never fires for this signal. This is a
+        // second, later render once the authoritative page lands; the
+        // flushNow below is the immediate one for the text already in hand.
+        void repairActiveTranscriptTail(currentThreadId);
         transcriptFlushScheduler.flushNow("transcript_entry_delta_refused");
         return;
       }
