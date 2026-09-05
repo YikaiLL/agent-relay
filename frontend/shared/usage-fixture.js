@@ -124,10 +124,10 @@ function weekBuckets() {
 }
 
 const PROVIDERS = [
-  { key: "claude_code", label: "Claude", blurb: "Default for Implementer / Tester", reports_usage: true },
-  { key: "codex", label: "Codex", blurb: "Migrations · long diff review", reports_usage: true },
+  { key: "claude_code", label: "Claude", reports_usage: true },
+  { key: "codex", label: "Codex", reports_usage: true },
   // Silent over ACP today — see markdown/usage-report-api.md §1.3.
-  { key: "cursor", label: "Cursor", blurb: "Small frontend edits · cheapest per token", reports_usage: false },
+  { key: "cursor", label: "Cursor", reports_usage: false },
 ];
 
 export const USAGE_FIXTURE = {

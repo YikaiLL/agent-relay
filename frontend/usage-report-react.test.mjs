@@ -25,6 +25,10 @@ test("day view renders the fixture headline and provider roster", () => {
   assert.match(html, /Usage not reported/);
   assert.match(html, /\d+% of it came from cache/);
   assert.doesNotMatch(html, /not counted/);
+  // Marketing blurbs used to stand in for roles/use-cases; they are gone.
+  assert.doesNotMatch(html, /Default for Implementer/);
+  assert.doesNotMatch(html, /Migrations · long diff review/);
+  assert.doesNotMatch(html, /Small frontend edits/);
 });
 
 test("week tab swaps the centre for the provider cost table", () => {
@@ -34,6 +38,11 @@ test("week tab swaps the centre for the provider cost table", () => {
   assert.match(html, /so far this week/);
   assert.match(html, /This week by provider/);
   assert.match(html, /Cost estimated from list prices/);
+  // Rows are (provider, model); marketing blurbs must not stand in for the model.
+  assert.match(html, /claude-opus-4/);
+  assert.match(html, /gpt-5/);
+  assert.doesNotMatch(html, /Default for Implementer/);
+  assert.doesNotMatch(html, /Migrations · long diff review/);
 });
 
 test("disabled ledger is not an empty day", () => {

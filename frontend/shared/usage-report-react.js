@@ -51,13 +51,6 @@ const PROVIDER_TONE = {
   cursor: "cursor",
 };
 
-const PROVIDER_BLURB = {
-  claude_code: "Default for Implementer / Tester",
-  codex: "Migrations · long diff review",
-  cursor: "Small frontend edits · cheapest per token",
-};
-
-/** Wire role ids → names the design uses. Unknown ids pass through. */
 const ROLE_LABEL = {
   tl: "Planner",
   planner: "Planner",
@@ -81,9 +74,18 @@ function providerMeta(report, key) {
   return {
     key,
     label: fromReport?.label || key,
-    blurb: fromReport?.blurb || PROVIDER_BLURB[key] || "",
     reports_usage: fromReport?.reports_usage,
   };
+}
+
+/** Subtitle under a week/month table row — the model id, not marketing copy. */
+function groupModelLabel(group) {
+  const model = typeof group?.model === "string" ? group.model.trim() : "";
+  return model || "unknown model";
+}
+
+function groupRowKey(group) {
+  return `${group?.provider || ""}::${group?.model || ""}`;
 }
 
 /**
@@ -616,10 +618,7 @@ function LeftRail({ report, focus, projection, onSetBudget, budgetPending }) {
                   )
                 : null,
               row.share != null ? h("span", null, `${Math.round(row.share)}%`) : null
-            ),
-            meta.blurb
-              ? h("div", { className: "usage-provider-blurb" }, meta.blurb)
-              : null
+            )
           )
         );
       })
@@ -910,8 +909,8 @@ function WeekView({ report, mode = "week" }) {
 
   const weekGroups = buckets.at(-1)?.groups || [];
   const prevBucketGroups = report.compare?.buckets?.at(-1)?.groups || [];
-  const prevByProvider = new Map(
-    prevBucketGroups.map((g) => [g.provider, headlineTotal(g)])
+  const prevByGroup = new Map(
+    prevBucketGroups.map((g) => [groupRowKey(g), headlineTotal(g)])
   );
 
   return h(
@@ -986,14 +985,15 @@ function WeekView({ report, mode = "week" }) {
             const meta = providerMeta(report, g.provider);
             const silent = report.providers?.find((p) => p.key === g.provider)?.reports_usage === false;
             const total = silent ? null : headlineTotal(g);
-            const prev = prevByProvider.get(g.provider);
+            const prev = prevByGroup.get(groupRowKey(g));
             const d = silent || total == null ? null : deltaPercent(total, prev);
             const cost = silent
               ? { text: "—", estimated: false, title: "Usage not reported" }
               : costLabel(g);
+            const modelLabel = groupModelLabel(g);
             return h(
               "tr",
-              { key: g.provider, className: silent ? "is-silent" : "" },
+              { key: groupRowKey(g), className: silent ? "is-silent" : "" },
               h(
                 "td",
                 null,
@@ -1002,7 +1002,7 @@ function WeekView({ report, mode = "week" }) {
                   "span",
                   null,
                   h("strong", null, meta.label || g.provider),
-                  meta.blurb ? h("span", { className: "usage-provider-blurb" }, meta.blurb) : null
+                  h("span", { className: "usage-provider-blurb" }, modelLabel)
                 )
               ),
               h("td", null, silent ? "—" : formatTokens(total)),
