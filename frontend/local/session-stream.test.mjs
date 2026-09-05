@@ -329,6 +329,77 @@ test("transcript_stream_lagged settles the pending window delta before invalidat
   assert.equal(renders.length, 1, "the absorbed window timer must not render a second time later");
 });
 
+// P1 (review): transcript_stream_lagged is not the only local site that
+// downgrades a loaded window entry's content_state — applyTranscriptDeltaToWindow
+// (shared/transcript-hydration-store.js) does the same thing IN PLACE whenever
+// an ordinary per-item delta is refused as a gap or byte mismatch, with no
+// settle beforehand. The fix above only covered the bulk lagged-notice path;
+// this covers the equivalent per-item path reached through an everyday
+// streaming delta, never through transcript_stream_lagged at all.
+test("a gapped delta for an item with an earlier pending append settles before the window downgrades, so the coalesced render carries the newest text", () => {
+  const { clock, controller, renders, state } = makeController();
+
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationOrder = ["agent-1"];
+  state.transcriptHydrationEntries = new Map([
+    [
+      "agent-1",
+      {
+        item_id: "agent-1",
+        kind: "agent_text",
+        status: "running",
+        text: "hello",
+        tool: null,
+        entry_seq: null,
+        content_state: "full",
+      },
+    ],
+  ]);
+  state.session.transcript[0].text = "hello";
+
+  // A valid delta appends " world" — lands only in the window (deferred
+  // projection); the array still reads "hello" until something settles it.
+  controller.applyLocalTranscriptEntryDelta({
+    delta: " world",
+    item_id: "agent-1",
+    revision: 6,
+    text_offset: 5,
+    thread_id: "thread-1",
+  });
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").text,
+    "hello world",
+    "precondition: the valid append landed in the window"
+  );
+  assert.equal(
+    state.session.transcript[0].text,
+    "hello",
+    "precondition: the array projection is still pending"
+  );
+
+  // A second, GAPPED delta for the SAME item arrives (offset far past the
+  // window's current length) — applyTranscriptDeltaToWindow refuses it and
+  // downgrades the window entry to preview in place, right there, with no
+  // notice like transcript_stream_lagged to hang a fix off of.
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "z",
+    item_id: "agent-1",
+    revision: 7,
+    text_offset: 100,
+    thread_id: "thread-1",
+  });
+
+  clock.tick(TRANSCRIPT_FLUSH_MIN_WINDOW_MS);
+
+  assert.equal(renders.length, 1, "the coalesced window must still render once");
+  assert.equal(
+    renders[0].transcript[0].text,
+    "hello world",
+    "the render must carry the earlier valid append — downgrading the window before that append settles " +
+      "makes the projection fall back to the array's stale pre-append copy instead"
+  );
+});
+
 // P1 (review): a terminal entry patch used to end at the same coalescing
 // queueTranscriptRender() as an ordinary streaming delta, so a completion /
 // failure / error / cancellation sat behind the 100-300ms window instead of

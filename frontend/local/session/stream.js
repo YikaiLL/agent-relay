@@ -349,6 +349,26 @@ export function createStreamController(ctx) {
     // every reader that needs the newest text reads the window directly.
     if (transcriptWindowIsLoaded(state, currentThreadId)) {
       const textLengthBefore = (state.transcriptHydrationEntries.get(event.item_id)?.text ?? "").length;
+      // Peek whether this delta will be refused (a gap or byte mismatch)
+      // BEFORE calling appendTranscriptDelta, which downgrades the window
+      // entry's content_state to preview IN PLACE on refusal
+      // (transcript-hydration-store.js's applyTranscriptDeltaToWindow).
+      // Settle FIRST when it will: an earlier valid append for this thread
+      // may still be pending only in the window (queueTranscriptRender below
+      // defers the array projection), and downgrading before that settles
+      // makes the projection's non-"full" fallback read the stale pre-append
+      // array — the same rollback transcript_stream_lagged had, just reached
+      // through an ordinary per-item gap instead of a bulk notice. Mirrors
+      // remote's applyTranscriptDelta, which pre-resolves via
+      // resolveDeltaAppend and never lets a refused delta reach the window
+      // write undetected.
+      const existingWindowEntry = state.transcriptHydrationEntries.get(event.item_id);
+      if (
+        existingWindowEntry
+        && resolveDeltaAppend(existingWindowEntry.text ?? "", event.delta ?? "", event.text_offset) == null
+      ) {
+        settleTranscriptProjection(state);
+      }
       const applied = appendTranscriptDelta(state, event);
       const textLengthAfter = (state.transcriptHydrationEntries.get(event.item_id)?.text ?? "").length;
       if (applied) {
