@@ -467,60 +467,20 @@ test("two distinct keys retain fully independent positions and anchors", () => {
 
 test("two keys that share a thread id under different relays stay isolated", () => {
   // Remote's scroll key is relay-scoped (`relayId:threadId`), so the same
-  // underlying thread id can appear under two different keys at once -- e.g.
-  // the reader has panes open on two relays that happen to be looking at
-  // threads with the same id.
+  // underlying thread id can appear under two different keys at once -- the
+  // reader has panes open on two relays whose threads share an id. Nothing
+  // about the thread id alone can tell the two panes apart, so this asserts
+  // the ACTION each pane gets, not just that the Maps are keyed separately:
+  // a switch between them must honor the arriving key's own retained intent
+  // rather than reading as "same thread, nothing happened".
   const engine = createTranscriptScrollBookkeeping();
   const sharedThreadId = "shared-thread";
+  const entries = [userEntry("u1")];
 
-  engine.rememberView(
-    "relay-1:shared-thread",
-    makeScrollElement({ scrollHeight: 2000, clientHeight: 400, scrollTop: 300 })
-  );
-  engine.rememberView(
-    "relay-2:shared-thread",
-    makeScrollElement({ scrollHeight: 5000, clientHeight: 400, scrollTop: 4600 })
-  );
-
-  assert.deepEqual(engine.readRestoreIntent("relay-1:shared-thread"), {
-    followBottom: false,
-    scrollTop: 300,
-  });
-  assert.deepEqual(engine.readRestoreIntent("relay-2:shared-thread"), {
-    followBottom: true,
-    scrollTop: 4600,
-  });
-
+  // relay-1 is the pane on screen: it claims its anchor and, crucially,
+  // commits the engine's single retained snapshot under its own key.
   engine.applyRestore({
     key: "relay-1:shared-thread",
-    nextEntries: [userEntry("u1")],
-    nextThreadId: sharedThreadId,
-    pendingInputRequestIds: [],
-    restoredScrollPosition: null,
-    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
-  });
-
-  assert.ok(engine.anchorsFor("relay-1:shared-thread").has("u1"));
-  assert.equal(
-    engine.anchorsFor("relay-2:shared-thread").size,
-    0,
-    "the same thread id under a different relay must not see the other relay's anchor"
-  );
-});
-
-test("applyRestore does not let a snapshot committed under a different key masquerade as the same thread", () => {
-  // Two panes (different relays) can show a thread with the SAME id. The
-  // engine's single retained snapshot belongs to whichever key committed it
-  // last (relay-1 here). A genuine switch into relay-2's pane must not be
-  // read as "same thread, nothing happened" just because the stale
-  // relay-1-keyed snapshot's activeThreadId happens to match -- that drops
-  // the restoredScrollPosition the caller already worked out for relay-2.
-  const engine = createTranscriptScrollBookkeeping();
-  const sharedThreadId = "shared";
-  const entries = [agentEntry("a1")];
-
-  engine.applyRestore({
-    key: "relay-1:shared",
     nextEntries: entries,
     nextThreadId: sharedThreadId,
     pendingInputRequestIds: [],
@@ -528,27 +488,23 @@ test("applyRestore does not let a snapshot committed under a different key masqu
     scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
   });
   engine.commitSnapshot({
-    key: "relay-1:shared",
+    key: "relay-1:shared-thread",
     threadId: sharedThreadId,
     entries,
     scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
   });
 
-  // relay-2's own pane retained its own offset from an earlier visit to the
-  // same thread id.
+  // relay-2's pane retained its own mid-history offset on an earlier visit.
   engine.rememberView(
-    "relay-2:shared",
+    "relay-2:shared-thread",
     makeScrollElement({ scrollHeight: 2000, clientHeight: 400, scrollTop: 300 })
   );
 
-  // The reader switches to relay-2. A real adapter detects this by scrollKey
-  // (thread id is identical here, so that alone can't tell the panes apart)
-  // and fetches the new key's own restoration intent before deciding.
-  const restoredScrollPosition = engine.readRestoreIntent("relay-2:shared");
+  const restoredScrollPosition = engine.readRestoreIntent("relay-2:shared-thread");
   assert.deepEqual(restoredScrollPosition, { followBottom: false, scrollTop: 300 });
 
   const action = engine.applyRestore({
-    key: "relay-2:shared",
+    key: "relay-2:shared-thread",
     nextEntries: entries,
     nextThreadId: sharedThreadId,
     pendingInputRequestIds: [],
@@ -556,8 +512,63 @@ test("applyRestore does not let a snapshot committed under a different key masqu
     scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400, scrollTop: 0 }),
   });
 
+  assert.equal(
+    action.kind,
+    "restore-thread",
+    "arriving at relay-2 is a transition, even though relay-1's snapshot carries the same thread id"
+  );
+  assert.equal(action.scrollTop, 300, "relay-2 gets ITS retained offset, not relay-1's position");
+
+  assert.ok(engine.anchorsFor("relay-1:shared-thread").has("u1"));
+  assert.deepEqual(
+    [...engine.anchorsFor("relay-2:shared-thread")],
+    ["u1"],
+    "relay-2 claims the entry for ITSELF on arrival; the two anchor sets are separate objects"
+  );
+  assert.notEqual(
+    engine.anchorsFor("relay-1:shared-thread"),
+    engine.anchorsFor("relay-2:shared-thread")
+  );
+});
+
+test("a same-thread-id relay switch restores rather than preserving, with nothing new to anchor", () => {
+  // The same defect's quietest shape, and the one that actually reaches a
+  // reader: with no unclaimed user entry to fall through to, treating
+  // relay-1's snapshot as "the same thread" decides `preserve` and leaves the
+  // reader at scrollTop 0 instead of the 300 they left relay-2 at. There is
+  // no scroll to undo it afterwards -- the pane just renders in the wrong place.
+  const engine = createTranscriptScrollBookkeeping();
+  const sharedThreadId = "shared-thread";
+  const entries = [agentEntry("a1")];
+
+  engine.commitSnapshot({
+    key: "relay-1:shared-thread",
+    threadId: sharedThreadId,
+    entries,
+    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
+  });
+  engine.rememberView(
+    "relay-2:shared-thread",
+    makeScrollElement({ scrollHeight: 2000, clientHeight: 400, scrollTop: 300 })
+  );
+
+  const scrollElement = makeScrollElement({
+    scrollHeight: 2000,
+    clientHeight: 400,
+    scrollTop: 0,
+  });
+  const action = engine.applyRestore({
+    key: "relay-2:shared-thread",
+    nextEntries: entries,
+    nextThreadId: sharedThreadId,
+    pendingInputRequestIds: [],
+    restoredScrollPosition: engine.readRestoreIntent("relay-2:shared-thread"),
+    scrollElement,
+  });
+
   assert.equal(action.kind, "restore-thread");
   assert.equal(action.scrollTop, 300);
+  assert.equal(scrollElement.scrollTop, 300, "the reader is actually moved, not left at 0");
 });
 
 // --- retarget across relay-scoped keys (Remote's flavor of promotion) ------
