@@ -94,6 +94,17 @@ values outside the current bounded token grammar are malformed, not opaque
 pass-through data, and are deliberately omitted so paths, URLs, or unbounded
 prose cannot enter the content-blind vocabulary.
 
+A known backend carrying an unsupported protocol version is persisted as
+`UnknownNonExecuting`, with its validated identity slots retained. A later
+build may promote those bounded slots deliberately; this build does not retain
+or replay an unvalidated future object shape. Driver progress follows the same
+fail-closed rule: explicit `null`, malformed known fields, duplicate known
+fields, and unknown fields set a durable `malformed` marker even though the
+unsupported value itself is dropped. `LegacyEmbedded` does not consume driver
+progress and may continue locally, but a malformed progress record cannot
+change backend or produce a driver cursor. An unknown backend cannot produce a
+driver cursor at all.
+
 The current archival lifecycle for inert unsupported-backend runs is explicit:
 if a paused inert run loses its worktree, restore/validation changes it to a
 diagnostic `Blocked` state; executable blocked-run resolution refuses to resume

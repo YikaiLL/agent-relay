@@ -22,6 +22,7 @@ use serde::{
 pub const CURRENT_PROTOCOL_VERSION: u32 = 1;
 /// Oldest protocol version this crate can negotiate.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
+const _: () = assert!(MIN_PROTOCOL_VERSION <= CURRENT_PROTOCOL_VERSION);
 
 pub const MAX_OPAQUE_ID_LEN: usize = 96;
 pub const MAX_DRIVER_VERSION_LEN: usize = 64;
@@ -56,12 +57,19 @@ pub enum ProtocolValueError {
         peer_min: u32,
         peer_max: u32,
     },
+    UnsupportedLocalProtocolRange {
+        requested_min: u32,
+        requested_max: u32,
+        supported_min: u32,
+        supported_max: u32,
+    },
     InvalidRange {
         min: u32,
         max: u32,
     },
     UnsupportedProtocolVersion(u32),
     MalformedDriverProgress,
+    NonExecutingBackend,
 }
 
 impl fmt::Display for ProtocolValueError {
@@ -89,6 +97,15 @@ impl fmt::Display for ProtocolValueError {
                 f,
                 "no compatible orchestration protocol version (local {local_min}-{local_max}, peer {peer_min}-{peer_max})"
             ),
+            Self::UnsupportedLocalProtocolRange {
+                requested_min,
+                requested_max,
+                supported_min,
+                supported_max,
+            } => write!(
+                f,
+                "requested local protocol range {requested_min}-{requested_max} is outside this build's supported range {supported_min}-{supported_max}"
+            ),
             Self::InvalidRange { min, max } => {
                 write!(f, "invalid protocol version range {min}-{max}")
             }
@@ -97,6 +114,9 @@ impl fmt::Display for ProtocolValueError {
             }
             Self::MalformedDriverProgress => {
                 f.write_str("persisted driver progress is malformed and cannot be executed")
+            }
+            Self::NonExecutingBackend => {
+                f.write_str("the orchestration backend is non-executing in this build")
             }
         }
     }
@@ -1499,6 +1519,7 @@ impl<'de> Deserialize<'de> for DriverProgress {
                         }
                         Field::Unknown => {
                             let _: IgnoredAny = map.next_value()?;
+                            progress.malformed = true;
                         }
                     }
                 }
@@ -1743,16 +1764,17 @@ impl DriverCursor {
         if run.driver_progress.is_malformed() {
             return Err(ProtocolValueError::MalformedDriverProgress);
         }
+        let protocol_version = run
+            .orchestration_backend
+            .supported_protocol_version()
+            .ok_or(ProtocolValueError::NonExecutingBackend)?;
         let current = run.current_sub_task();
         let current_rounds_used = current
             .and_then(|index| run.sub_tasks.get(index))
             .map(|task| task.rounds_used)
             .unwrap_or(0);
         Ok(Self {
-            protocol_version: run
-                .orchestration_backend
-                .supported_protocol_version()
-                .unwrap_or(CURRENT_PROTOCOL_VERSION),
+            protocol_version,
             backend: run.orchestration_backend.kind(),
             status: DriverRunStatus::from_team_status(run.status),
             phase: DriverPhase::from_team_phase(run.phase),
@@ -2892,11 +2914,11 @@ pub fn negotiate_protocol(
     let local_min = local.min.max(MIN_PROTOCOL_VERSION);
     let local_max = local.max.min(CURRENT_PROTOCOL_VERSION);
     if local_min > local_max {
-        return Err(ProtocolValueError::NoCompatibleProtocol {
-            local_min: local.min,
-            local_max: local.max,
-            peer_min: peer.min,
-            peer_max: peer.max,
+        return Err(ProtocolValueError::UnsupportedLocalProtocolRange {
+            requested_min: local.min,
+            requested_max: local.max,
+            supported_min: MIN_PROTOCOL_VERSION,
+            supported_max: CURRENT_PROTOCOL_VERSION,
         });
     }
 
@@ -3641,12 +3663,16 @@ mod tests {
         );
         assert_eq!(
             refused_future_local,
-            Err(ProtocolValueError::NoCompatibleProtocol {
-                local_min: 2,
-                local_max: 3,
-                peer_min: 2,
-                peer_max: 3,
+            Err(ProtocolValueError::UnsupportedLocalProtocolRange {
+                requested_min: 2,
+                requested_max: 3,
+                supported_min: 1,
+                supported_max: 1,
             })
+        );
+        assert_eq!(
+            refused_future_local.unwrap_err().to_string(),
+            "requested local protocol range 2-3 is outside this build's supported range 1-1"
         );
 
         let invalid: Result<ProtocolRange, _> = serde_json::from_str(r#"{"min":3,"max":2}"#);
@@ -4303,6 +4329,21 @@ mod tests {
             valid.in_flight_command_id.as_ref().map(|id| id.as_str()),
             Some("cmd-future")
         );
+        assert!(
+            valid.is_malformed(),
+            "a newer progress field must leave a durable fail-closed marker"
+        );
+
+        let clean: DriverProgress = serde_json::from_str(
+            r#"{
+                "state_revision":42,
+                "last_command_seq":7,
+                "last_event_seq":6,
+                "in_flight_command_id":"cmd-current"
+            }"#,
+        )
+        .expect("known progress fields must decode");
+        assert!(!clean.is_malformed());
 
         let malformed: DriverProgress = serde_json::from_str(
             r#"{
@@ -4328,6 +4369,10 @@ mod tests {
             .expect("future progress shape must not invalidate persisted state");
         assert!(whole_value_malformed.is_malformed());
 
+        let null_progress: DriverProgress = serde_json::from_str("null")
+            .expect("explicit null progress must not invalidate persisted state");
+        assert!(null_progress.is_malformed());
+
         let float_counter: DriverProgress = serde_json::from_str(r#"{"state_revision":17.0}"#)
             .expect("float counter must not invalidate persisted state");
         assert!(float_counter.is_malformed());
@@ -4343,6 +4388,14 @@ mod tests {
             DriverCursor::from_team_run(&run, Vec::new()),
             Err(ProtocolValueError::MalformedDriverProgress),
             "malformed persisted counters must never become an executable zero cursor"
+        );
+
+        run.driver_progress = DriverProgress::default();
+        run.orchestration_backend = OrchestrationBackendRef::unknown_non_executing();
+        assert_eq!(
+            DriverCursor::from_team_run(&run, Vec::new()),
+            Err(ProtocolValueError::NonExecutingBackend),
+            "an inert backend must not produce an executable-looking cursor"
         );
     }
 
