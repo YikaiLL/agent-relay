@@ -52,12 +52,24 @@ export function createTranscriptScrollBookkeeping() {
     scrollElement,
   }) {
     const anchorSet = anchorsFor(key);
+    // A retained snapshot committed under a DIFFERENT, non-null key must not
+    // stand in for "the same thread" here: two keys can share a thread id
+    // (relay-scoped keys with the same underlying thread), and comparing
+    // activeThreadId alone would read a genuine switch as "nothing changed"
+    // and silently drop the restoredScrollPosition the caller already
+    // resolved for this key. A null scrollKey (the null-element snapshot) is
+    // the one exception -- there is no better signal, so let decide's own
+    // activeThreadId comparison do the switch detection.
+    const snapshotForKey =
+      previousSnapshot && (previousSnapshot.scrollKey == null || previousSnapshot.scrollKey === key)
+        ? previousSnapshot
+        : null;
     const action = restoreTranscriptScrollPosition({
       alreadyAnchoredUserIds: anchorSet,
       nextEntries,
       nextThreadId,
       pendingInputRequestIds,
-      previousSnapshot,
+      previousSnapshot: snapshotForKey,
       restoredScrollPosition,
       scrollElement,
     });
@@ -91,7 +103,10 @@ export function createTranscriptScrollBookkeeping() {
   // synthetic `claude-pending-*` id promoted to its real session id on first
   // send) across all three retained things in one step. Returns true if
   // anything was rekeyed.
-  function retarget({ fromKey, toKey, fromThreadId, toThreadId }) {
+  function retarget(options) {
+    // `options || {}`, not a destructured default param: a default only
+    // applies for `undefined`, and callers (safely) pass `null` too.
+    const { fromKey, toKey, fromThreadId, toThreadId } = options || {};
     if (!fromKey || !toKey || !fromThreadId || !toThreadId || fromKey === toKey) {
       return false;
     }
