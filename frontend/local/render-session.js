@@ -1247,7 +1247,13 @@ export function createSessionRenderer({
       void reviewsCache.sync(
         session?.reviews_revision,
         () => fetchReviews(),
-        () => renderSession(state.session || session)
+        () => {
+          renderSession(state.session || session);
+          // The sidebar is rendered outside renderSession(). Its Reviewing dots
+          // read this cache too, so the dedicated response must repaint the list
+          // instead of waiting for an unrelated snapshot or polling tick.
+          renderThreads();
+        }
       );
     }
     if (typeof fetchWorkflows === "function") {

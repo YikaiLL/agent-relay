@@ -39,7 +39,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version-file: .node-version
           cache: npm
 
       - name: Install Rust
@@ -108,7 +108,7 @@ jobs:
         if: steps.railway_inputs.outputs.ready == 'true'
         uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version-file: .node-version
 
       - name: Install Railway CLI
         if: steps.railway_inputs.outputs.ready == 'true'
