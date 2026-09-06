@@ -126,6 +126,7 @@ export function createViewOnlyRefreshOps({
           }
           : null,
         settingsWritable: Boolean(normalized.thread_state?.settings_writable),
+        taskReviewer: Boolean(normalized.thread_state?.task_reviewer),
         availableModels: normalized.thread_state?.available_models || [],
         lastRefreshAt: Date.now(),
         lastRefreshServerTime: normalized.server_time ?? null,

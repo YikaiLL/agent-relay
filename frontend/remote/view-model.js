@@ -47,11 +47,13 @@ export function selectSessionRenderModel({ session, previousSession, hasControll
   const canWrite = hasControllerLease && !activeThreadFrozen;
   // Sending to an idle thread is itself the atomic claim. The relay serializes
   // concurrent sends, so no separate take-over step is needed.
+  const taskReviewer = Boolean(session.active_thread_task_reviewer);
   const canCompose = canComposeThread({
     activeTurnId: session.active_turn_id,
     hasActiveSession,
     hasControllerLease,
     reviewLocked: activeThreadFrozen,
+    taskReviewer,
   });
 
   return {
@@ -64,7 +66,12 @@ export function selectSessionRenderModel({ session, previousSession, hasControll
     hasControllerLease,
     activeThreadFrozen,
     activeThreadUnderWorkflow,
-    messagePlaceholder: activeThreadFrozen
+    taskReviewer,
+    // Checked before `activeThreadFrozen` so a reviewer that is also mid-review
+    // still reads as permanently closed rather than temporarily busy.
+    messagePlaceholder: taskReviewer
+      ? "This is a task reviewer — read only."
+      : activeThreadFrozen
       ? activeThreadUnderWorkflow
         ? "This session is locked by Code Flow…"
         : "This session is being reviewed…"

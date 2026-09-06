@@ -1080,6 +1080,7 @@ export function projectRemoteViewedSession(realSession, threadId, currentView) {
       reviewLocked: Boolean(threadState.review_locked),
       workflowLocked: Boolean(threadState.workflow_locked ?? currentView?.workflow_locked),
       settingsWritable: Boolean(threadState.settings_writable),
+      taskReviewer: Boolean(threadState.task_reviewer ?? currentView?.active_thread_task_reviewer),
       status: thread?.status,
       refreshServerTime: viewRefreshTime,
     }

@@ -94,6 +94,12 @@ pub(crate) const WORKFLOW_LOCKED_THREAD_MSG: &str =
 /// card stays answerable — that channel is deliberately NOT closed by this lock.
 pub(crate) const TEAM_LOCKED_THREAD_MSG: &str =
     "this thread belongs to a running task; pause the task to talk to its team lead";
+/// A task reviewer's transcript is a record of what it judged the work to be. A
+/// later user turn would append to that record after the fact, so the seat is
+/// readable forever and conversable never — unlike the team lock, this one does
+/// not lift when the run ends.
+pub(crate) const TASK_REVIEWER_READ_ONLY_MSG: &str =
+    "this is a task reviewer; you can read its review but not send messages to it";
 
 #[derive(Clone)]
 pub struct AppState {

@@ -160,6 +160,14 @@ pub(crate) struct ReviewerThread {
     pub(crate) parent_thread_id: String,
     #[serde(default)]
     pub(crate) seq: u64,
+    /// Task-team reviewers are first-class Sessions; reviewers created by a
+    /// foreground Session's Request reviewer flow remain panel-only. Persist the
+    /// distinction on reviewer identity itself so pruning the owning run cannot
+    /// silently change navigation.
+    // `None` exists only while decoding a pre-field snapshot, so restore can
+    // distinguish "legacy; infer once" from a current explicit `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) navigation_visible: Option<bool>,
 }
 
 /// Paths only. Pin and proven stay separate so a refresh cannot move an explicit choice.
@@ -1181,8 +1189,9 @@ impl RelayState {
     }
 
     /// Move a session into a project (replaces any prior membership). Rejects
-    /// reviewer-owned threads (they're hidden, review-scoped, not user sessions);
-    /// an ordinary session id that isn't loaded into the thread list is still
+    /// nav-hidden reviewers — they have no row to file — but not visible task
+    /// reviewers, which offer the same Project menu as their sibling seats. An
+    /// ordinary session id that isn't loaded into the thread list is still
     /// assignable on purpose — membership is metadata, not gated on load state.
     pub(super) fn assign_thread_to_project(
         &mut self,
@@ -1192,7 +1201,10 @@ impl RelayState {
         if !self.projects.contains_key(project_id) {
             return Err(format!("project `{project_id}` not found"));
         }
-        if self.reviewer_thread_ids().contains(thread_id) {
+        if self
+            .navigation_hidden_reviewer_thread_ids()
+            .contains(thread_id)
+        {
             return Err(format!(
                 "`{thread_id}` is a reviewer thread and cannot be assigned to a project"
             ));
@@ -1479,13 +1491,14 @@ impl RelayState {
         });
     }
 
-    /// Thread ids that are reviewer threads. The thread list filters these out so a
-    /// reviewer never shows up as a peer session — it is owned by its review
-    /// (surfaced through the Reviewer panel). Backed by the DURABLE `reviewer_threads`
-    /// map (persisted), so hiding survives a relay restart and review-job eviction.
-    /// Unioned with live `review_jobs` reviewer ids for safety (the map is populated
-    /// atomically with thread registration, so this union is belt-and-suspenders).
-    pub(crate) fn reviewer_thread_ids(&self) -> HashSet<String> {
+    /// Thread ids that are reviewer threads. This is the semantic set used by the
+    /// read-only and workspace-concurrency guards; navigation applies the narrower
+    /// `navigation_hidden_reviewer_thread_ids` view below. Backed by the DURABLE
+    /// `reviewer_threads` map (persisted), so reviewer identity survives a relay
+    /// restart and review-job eviction. Unioned with live `review_jobs` reviewer ids
+    /// for safety (the map is populated atomically with thread registration, so this
+    /// union is belt-and-suspenders).
+    fn collect_reviewer_thread_ids(&self) -> HashSet<String> {
         self.reviewer_threads
             .keys()
             .cloned()
@@ -1505,10 +1518,64 @@ impl RelayState {
             .collect()
     }
 
-    /// Persistently record a reviewer thread's identity (reviewer id -> parent id),
-    /// so it stays hidden from navigation across restarts and job eviction. Assigns a
-    /// strictly increasing `seq` for FIFO eviction ordering.
+    pub(crate) fn reviewer_thread_ids(&self) -> HashSet<String> {
+        self.collect_reviewer_thread_ids()
+    }
+
+    /// Reviewer sessions that are implementation details of a foreground Session and
+    /// therefore stay out of navigation. A task-team reviewer is different: it is a
+    /// first-class seat in the task worktree, alongside the visible TL and Dev seats,
+    /// so it belongs in the Session list too. That origin is persisted directly on the
+    /// reviewer record: task-run pruning/deletion must not make a Session disappear.
+    /// The full set remains available alongside the nav-hidden subset so callers that
+    /// need both do not rebuild the workflow/review unions under the same lock.
+    pub(crate) fn reviewer_thread_ids_and_navigation_hidden(
+        &self,
+    ) -> (HashSet<String>, HashSet<String>) {
+        let reviewer_ids = self.collect_reviewer_thread_ids();
+        let mut hidden = reviewer_ids.clone();
+        for (thread_id, reviewer) in &self.reviewer_threads {
+            if reviewer.navigation_visible == Some(true) {
+                hidden.remove(thread_id);
+            }
+        }
+        (reviewer_ids, hidden)
+    }
+
+    pub(crate) fn navigation_hidden_reviewer_thread_ids(&self) -> HashSet<String> {
+        self.reviewer_thread_ids_and_navigation_hidden().1
+    }
+
+    /// Whether this reviewer originated as a task-team seat and therefore has a
+    /// first-class Session row. Reviewer identity still makes the thread read-only;
+    /// this predicate controls only the user-facing lifecycle of that visible row.
+    pub(crate) fn is_task_reviewer_thread(&self, thread_id: &str) -> bool {
+        self.reviewer_threads
+            .get(thread_id)
+            .is_some_and(|reviewer| reviewer.navigation_visible == Some(true))
+    }
+
+    /// Persistently record a reviewer thread's identity (reviewer id -> parent id).
+    /// Foreground Session and workflow reviewers stay hidden from navigation across
+    /// restarts and job eviction. Assigns a strictly increasing `seq` for FIFO
+    /// eviction ordering.
     pub(crate) fn register_reviewer_thread(&mut self, reviewer_id: String, parent_id: String) {
+        self.register_reviewer_thread_with_navigation(reviewer_id, parent_id, false);
+    }
+
+    /// Persistently record a task-team reviewer as a semantic reviewer that is also a
+    /// first-class Session. Registration and visibility are one write, so a thread-list
+    /// poll cannot observe the seat briefly hidden while its run bookkeeping catches up.
+    pub(crate) fn register_task_reviewer_thread(&mut self, reviewer_id: String, parent_id: String) {
+        self.register_reviewer_thread_with_navigation(reviewer_id, parent_id, true);
+    }
+
+    fn register_reviewer_thread_with_navigation(
+        &mut self,
+        reviewer_id: String,
+        parent_id: String,
+        navigation_visible: bool,
+    ) {
         let seq = self.reviewer_thread_seq;
         self.reviewer_thread_seq += 1;
         self.reviewer_threads.insert(
@@ -1516,8 +1583,32 @@ impl RelayState {
             ReviewerThread {
                 parent_thread_id: parent_id,
                 seq,
+                navigation_visible: Some(navigation_visible),
             },
         );
+    }
+
+    /// State written before reviewer origin was persisted inferred task reviewers from
+    /// run ownership on every list poll. Preserve that one-time inference on restore,
+    /// then keep the answer durable even after the run is pruned or deleted.
+    fn migrate_task_reviewer_navigation_visibility(&mut self) {
+        if self
+            .reviewer_threads
+            .values()
+            .all(|reviewer| reviewer.navigation_visible.is_some())
+        {
+            return;
+        }
+        let task_thread_ids: HashSet<String> = self
+            .team_runs
+            .values()
+            .flat_map(|run| run.owned_thread_ids())
+            .collect();
+        for (thread_id, reviewer) in &mut self.reviewer_threads {
+            if reviewer.navigation_visible.is_none() {
+                reviewer.navigation_visible = Some(task_thread_ids.contains(thread_id));
+            }
+        }
     }
 
     /// Stop hiding a reviewer thread — either because it was actually deleted, or
@@ -1541,11 +1632,18 @@ impl RelayState {
             .map_or(0, |max| max + 1);
     }
 
-    /// Reviewer thread ids owned by `parent_id` (for the parent-delete prompt).
+    /// Nav-hidden reviewer thread ids owned by `parent_id`.
+    ///
+    /// These are implementation children of a foreground Session and therefore
+    /// participate in its delete/archive prompt and reuse flow. A visible task
+    /// reviewer is a sibling Session with its own lifecycle: deleting its TL must
+    /// never silently delete it, and a foreground review must not claim it by reuse.
     pub(crate) fn reviewer_threads_of_parent(&self, parent_id: &str) -> Vec<String> {
         self.reviewer_threads
             .iter()
-            .filter(|(_, record)| record.parent_thread_id == parent_id)
+            .filter(|(_, record)| {
+                record.parent_thread_id == parent_id && record.navigation_visible != Some(true)
+            })
             .map(|(reviewer, _)| reviewer.clone())
             .collect()
     }
@@ -1558,7 +1656,9 @@ impl RelayState {
         let mut owned: Vec<(&String, u64)> = self
             .reviewer_threads
             .iter()
-            .filter(|(_, record)| record.parent_thread_id == parent_id)
+            .filter(|(_, record)| {
+                record.parent_thread_id == parent_id && record.navigation_visible != Some(true)
+            })
             .map(|(reviewer, record)| (reviewer, record.seq))
             .collect();
         if owned.len() <= keep {
@@ -1635,16 +1735,17 @@ impl RelayState {
             })
     }
 
-    /// Compact views of the reviewer→parent map for the snapshot. The local UI uses
-    /// it both for the delete/archive prompt and the Phase 3 reuse picker, so each
-    /// view is enriched (best-effort) with the reviewer thread's provider, name, and
-    /// last-updated time from its in-process summary. After a restart those joins
-    /// return `None` (the summary isn't persisted); the backend re-derives the
-    /// provider on submit. Sorted for a stable snapshot.
+    /// Compact views of nav-hidden foreground-reviewer records for the snapshot.
+    /// The local UI uses these both for the delete/archive prompt and the Phase 3
+    /// reuse picker. Visible task reviewers already live in the Session list and are
+    /// deliberately excluded: listing them here too would give one seat two owners.
+    /// Each view is enriched best-effort from its in-process summary and sorted for a
+    /// stable snapshot.
     pub(crate) fn reviewer_thread_views(&self) -> Vec<crate::protocol::ReviewerThreadView> {
         let mut views: Vec<_> = self
             .reviewer_threads
             .iter()
+            .filter(|(_, record)| record.navigation_visible != Some(true))
             .map(|(reviewer, record)| {
                 let summary = self.reviewer_thread_summary(reviewer);
                 crate::protocol::ReviewerThreadView {
@@ -3436,6 +3537,10 @@ impl RelayState {
                 .active_thread_id
                 .as_ref()
                 .and_then(|id| self.thread_promoted_from.get(id).cloned()),
+            active_thread_task_reviewer: self
+                .active_thread_id
+                .as_deref()
+                .is_some_and(|id| self.is_task_reviewer_thread(id)),
             active_controller_device_id: self.active_controller_device_id.clone(),
             active_controller_last_seen_at: self.active_controller_last_seen_at,
             controller_lease_expires_at: self.controller_lease_expires_at(),
@@ -3594,8 +3699,9 @@ impl RelayState {
     /// thread, controller, provider, or model. Used to spin up a reviewer thread
     /// that runs concurrently with (and never disturbs) the user's active
     /// conversation. The thread summary is added to `relay.threads` so
-    /// `find_thread_provider` can route to it; it is hidden from navigation by
-    /// `reviewer_thread_ids()` filtering.
+    /// `find_thread_provider` can route to it; the subsequent reviewer identity
+    /// registration decides whether it is a hidden foreground-review child or a
+    /// visible task-team Session.
     pub fn register_background_thread(
         &mut self,
         thread: ThreadSummaryView,
@@ -3904,6 +4010,7 @@ impl RelayState {
         // Team runs persist non-terminal too, and `Paused` survives verbatim —
         // see `restored_team_runs` for why that one is not reconciled.
         self.team_runs = Self::restored_team_runs(&persisted.team_runs);
+        self.migrate_task_reviewer_navigation_visibility();
         self.orchestrator_thread_id = persisted
             .orchestrator_thread_id
             .clone()
@@ -5018,6 +5125,7 @@ impl RelayState {
         // Team runs persist non-terminal too, and `Paused` survives verbatim —
         // see `restored_team_runs` for why that one is not reconciled.
         self.team_runs = Self::restored_team_runs(&persisted.team_runs);
+        self.migrate_task_reviewer_navigation_visibility();
         self.orchestrator_thread_id = persisted
             .orchestrator_thread_id
             .clone()
@@ -6887,8 +6995,11 @@ mod tests {
         assert!(restored.thread_project_id.get("t1").is_none());
     }
 
+    /// A nav-hidden reviewer has no row to file. A task reviewer does — it sits in
+    /// the sidebar offering the same Project menu as its TL and Dev siblings, so
+    /// refusing it here would be a menu item that always fails.
     #[test]
-    fn assign_rejects_reviewer_threads() {
+    fn assign_rejects_hidden_reviewers_but_files_visible_task_ones() {
         let mut relay = test_relay();
         relay.create_project("proj_x".to_string(), "P".to_string());
         relay.register_reviewer_thread("reviewer-1".to_string(), "parent-1".to_string());
@@ -6896,6 +7007,15 @@ mod tests {
             .assign_thread_to_project("reviewer-1", "proj_x")
             .is_err());
         assert!(relay.project_for_thread("reviewer-1").is_none());
+
+        relay.register_task_reviewer_thread("task-reviewer-1".to_string(), "task-tl".to_string());
+        relay
+            .assign_thread_to_project("task-reviewer-1", "proj_x")
+            .expect("a visible task reviewer is filed like any other session");
+        assert_eq!(
+            relay.project_for_thread("task-reviewer-1").unwrap().id,
+            "proj_x"
+        );
     }
 
     #[test]

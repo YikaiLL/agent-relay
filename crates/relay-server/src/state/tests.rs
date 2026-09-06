@@ -291,6 +291,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             beta_features_enabled: false,
             active_thread_id: Some("thread-1".to_string()),
             active_thread_promoted_from: None,
+            active_thread_task_reviewer: false,
             active_controller_device_id: Some("device-a".to_string()),
             active_controller_last_seen_at: Some(100),
             controller_lease_expires_at: Some(115),
@@ -2055,6 +2056,123 @@ fn reviewer_thread_hiding_persists_across_restart() {
 }
 
 #[test]
+fn task_reviewer_navigation_visibility_persists_without_its_run() {
+    let mut relay = test_state();
+    let reviewer_id = "task-reviewer-1";
+    let mut run = TeamRun::new(
+        "task-run-1".to_string(),
+        TaskSpec::default(),
+        "/tmp/project/.worktrees/task".to_string(),
+        "device-1".to_string(),
+    );
+    run.sub_tasks.push(relay_api::team::SubTask {
+        reviewer_thread_id: Some(reviewer_id.to_string()),
+        owned_thread_ids: vec![reviewer_id.to_string()],
+        ..Default::default()
+    });
+    relay.insert_team_run(run);
+    relay.register_task_reviewer_thread(reviewer_id.to_string(), "task-tl-1".to_string());
+
+    assert!(relay.reviewer_thread_ids().contains(reviewer_id));
+    assert!(!relay
+        .navigation_hidden_reviewer_thread_ids()
+        .contains(reviewer_id));
+
+    relay.remove_team_run("task-run-1");
+    assert!(
+        !relay
+            .navigation_hidden_reviewer_thread_ids()
+            .contains(reviewer_id),
+        "removing bounded task history must not re-hide its reviewer Session"
+    );
+
+    let persisted = PersistedRelayState::from_relay(&relay);
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut restored = RelayState::new(
+        "/tmp/other".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    restored.apply_persisted(&persisted);
+    assert!(
+        !restored
+            .navigation_hidden_reviewer_thread_ids()
+            .contains(reviewer_id),
+        "task reviewer visibility must survive restart even after the run record is gone"
+    );
+}
+
+#[test]
+fn restore_migrates_legacy_task_reviewer_visibility_from_run_ownership() {
+    let mut relay = test_state();
+    let reviewer_id = "legacy-task-reviewer";
+    let explicitly_hidden_id = "current-session-reviewer";
+    let pruned_legacy_id = "pruned-legacy-reviewer";
+    // Build both durable reviewer identities, then erase only the legacy record's
+    // origin marker below to model a pre-field snapshot.
+    relay.register_reviewer_thread(reviewer_id.to_string(), "task-tl-1".to_string());
+    relay.register_reviewer_thread(
+        explicitly_hidden_id.to_string(),
+        "foreground-session".to_string(),
+    );
+    relay.register_reviewer_thread(
+        pruned_legacy_id.to_string(),
+        "already-pruned-task-tl".to_string(),
+    );
+    let mut run = TeamRun::new(
+        "legacy-task-run".to_string(),
+        TaskSpec::default(),
+        "/tmp/project/.worktrees/task".to_string(),
+        "device-1".to_string(),
+    );
+    run.sub_tasks.push(relay_api::team::SubTask {
+        reviewer_thread_id: Some(reviewer_id.to_string()),
+        // Include an explicitly hidden current record too: migration may infer only
+        // the legacy `None`, never override a present `false`.
+        owned_thread_ids: vec![reviewer_id.to_string(), explicitly_hidden_id.to_string()],
+        ..Default::default()
+    });
+    relay.insert_team_run(run);
+
+    let mut persisted = PersistedRelayState::from_relay(&relay);
+    persisted
+        .reviewer_threads
+        .get_mut(reviewer_id)
+        .expect("legacy reviewer persisted")
+        .navigation_visible = None;
+    persisted
+        .reviewer_threads
+        .get_mut(pruned_legacy_id)
+        .expect("pruned legacy reviewer persisted")
+        .navigation_visible = None;
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut restored = RelayState::new(
+        "/tmp/other".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    restored.apply_persisted(&persisted);
+    assert!(
+        !restored
+            .navigation_hidden_reviewer_thread_ids()
+            .contains(reviewer_id),
+        "restore must preserve task-reviewer visibility from pre-flag snapshots"
+    );
+    assert!(
+        restored
+            .navigation_hidden_reviewer_thread_ids()
+            .contains(explicitly_hidden_id),
+        "migration must not expose a current Session-bound reviewer"
+    );
+    assert!(
+        restored
+            .navigation_hidden_reviewer_thread_ids()
+            .contains(pruned_legacy_id),
+        "a legacy reviewer whose task run was already pruned has no durable evidence of task origin and intentionally remains hidden"
+    );
+}
+
+#[test]
 fn terminal_review_cards_persist_across_restart_but_in_progress_ones_do_not() {
     let mut relay = test_state();
 
@@ -2393,6 +2511,30 @@ fn reviewer_thread_views_enrich_provider_and_label_from_summary() {
     assert_eq!(ghost.updated_at, None);
 }
 
+#[test]
+fn visible_task_reviewers_have_an_independent_lifecycle_and_no_reuse_picker_entry() {
+    let mut relay = test_state();
+    let parent = "task-tl";
+    relay.register_reviewer_thread("bound-reviewer".to_string(), parent.to_string());
+    relay.register_task_reviewer_thread("task-reviewer".to_string(), parent.to_string());
+
+    assert_eq!(
+        relay.reviewer_threads_of_parent(parent),
+        vec!["bound-reviewer".to_string()],
+        "parent delete/reuse fan-out includes only the hidden implementation child"
+    );
+    let picker_ids: Vec<_> = relay
+        .reviewer_thread_views()
+        .into_iter()
+        .map(|view| view.reviewer_thread_id)
+        .collect();
+    assert_eq!(
+        picker_ids,
+        vec!["bound-reviewer".to_string()],
+        "a task reviewer already visible in Sessions must not also appear in the reuse picker"
+    );
+}
+
 // The reuse picker exists to offer reviewer threads `request_review` will actually
 // accept — and it refuses any reviewer that is not in the tree under review ("that
 // reviewer thread works in X, but the work to review is in Y — start a clean reviewer
@@ -2472,6 +2614,29 @@ fn reviewers_to_evict_returns_oldest_beyond_cap() {
         ]
     );
     assert!(relay.reviewers_to_evict("parent-1", 6).is_empty());
+}
+
+#[test]
+fn reviewer_fifo_cap_never_counts_or_evicts_visible_task_reviewers() {
+    let mut relay = test_state();
+    let parent = "task-tl";
+    for index in 1..=6 {
+        relay.register_task_reviewer_thread(format!("task-rev-{index}"), parent.to_string());
+    }
+    for index in 1..=5 {
+        relay.register_reviewer_thread(format!("bound-rev-{index}"), parent.to_string());
+    }
+    assert!(
+        relay.reviewers_to_evict(parent, 5).is_empty(),
+        "six task seats do not consume the foreground reviewer's five-row cap"
+    );
+
+    relay.register_reviewer_thread("bound-rev-6".to_string(), parent.to_string());
+    assert_eq!(
+        relay.reviewers_to_evict(parent, 5),
+        vec!["bound-rev-1".to_string()],
+        "only the oldest nav-hidden foreground reviewer is evicted"
+    );
 }
 
 #[test]
@@ -3298,10 +3463,11 @@ fn has_working_thread_in_cwd_ignores_reviewer_and_deleted_threads() {
     let mut relay = test_state();
     let cwd = "/tmp/project";
 
-    // A working REVIEWER thread is a read-only background thread — it can't mutate the
-    // workspace, so it must NOT block a new review request. ("working" = a genuine
-    // in-flight turn; a bare phase is not liveness, see is_working().)
-    relay.register_reviewer_thread("reviewer-1".to_string(), "parent-1".to_string());
+    // A working TASK REVIEWER is nav-visible but still a read-only semantic reviewer —
+    // it can't mutate the workspace, so it must NOT block a new review request.
+    // ("working" = a genuine in-flight turn; a bare phase is not liveness, see
+    // is_working().)
+    relay.register_task_reviewer_thread("reviewer-1".to_string(), "parent-1".to_string());
     {
         let rt = relay.ensure_runtime_for_thread("reviewer-1");
         rt.current_cwd = cwd.to_string();

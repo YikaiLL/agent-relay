@@ -622,6 +622,13 @@ impl AppState {
             ) {
                 return Err(TEAM_LOCKED_THREAD_MSG.to_string());
             }
+            // Unlike the team gate above, this one never lifts: the seat is readable
+            // for as long as it exists, and conversable at no point in its life. It
+            // is THE guard (there is no later copy) because reviewer identity is
+            // durable — nothing can land in between and make this answer stale.
+            if relay.is_task_reviewer_thread(&target_thread) {
+                return Err(TASK_REVIEWER_READ_ONLY_MSG.to_string());
+            }
             // A thread with a turn ALREADY IN FLIGHT must not receive a second
             // prompt: taking it over and calling start_turn again would double-start
             // (the provider rejects/queues it, and the relay loses track of the
@@ -727,7 +734,6 @@ impl AppState {
             .map(|settings| settings.sandbox.clone())
             .filter(|value| !value.is_empty())
             .unwrap_or(defaults.sandbox);
-
         // A target that has not been materialized in this relay process still
         // needs a runtime for event routing and path-scope validation. Reading
         // history is non-authoritative for turn liveness and does not resume the

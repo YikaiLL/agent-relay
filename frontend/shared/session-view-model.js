@@ -88,6 +88,7 @@ export function selectDisplayedSessionModel({
     review_locked: Boolean(normalized.reviewLocked),
     workflow_locked: Boolean(normalized.workflowLocked),
     settings_writable: Boolean(normalized.settingsWritable),
+    active_thread_task_reviewer: Boolean(normalized.taskReviewer),
     view_only: true,
     ...(viewOnlySessionPatch || {}),
   };
@@ -149,6 +150,7 @@ function normalizeViewedThread(viewedThread, threadId) {
     reviewLocked: Boolean(viewedThread.reviewLocked),
     workflowLocked: Boolean(viewedThread.workflowLocked),
     settingsWritable: Boolean(viewedThread.settingsWritable),
+    taskReviewer: Boolean(viewedThread.taskReviewer),
     status: viewedThread.status,
     refreshServerTime: viewedThread.refreshServerTime,
   };

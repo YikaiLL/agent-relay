@@ -140,12 +140,13 @@ impl AppState {
     ) -> Result<ThreadsResponse, String> {
         let query = normalize_thread_query(query);
         let wanted_ids = normalize_thread_id_probe(ids)?;
-        // Read reviewer ids before the provider fetch so we can request a larger
-        // page from each provider. If the newest N slots are all reviewer threads
-        // we would return fewer than `limit` normal threads otherwise.
-        let reviewer_count = {
+        // Read nav-hidden reviewer ids before the provider fetch so we can request a
+        // larger page from each provider. If the newest N slots are all Session-bound
+        // reviewers we would return fewer than `limit` visible threads otherwise.
+        // Task-team reviewers are visible seats and consume a normal page slot.
+        let hidden_reviewer_count = {
             let relay = self.relay.read().await;
-            relay.reviewer_thread_ids().len()
+            relay.navigation_hidden_reviewer_thread_ids().len()
         };
         // A search asks each provider for a deep scan, because the row it is looking
         // for is almost always one that fell off the end of a normal page.
@@ -158,7 +159,7 @@ impl AppState {
         } else {
             limit
         };
-        let fetch_limit = scan_limit.saturating_add(reviewer_count);
+        let fetch_limit = scan_limit.saturating_add(hidden_reviewer_count);
 
         let mut all_threads = Vec::new();
         // A provider that fails to list is dropped from the merge and the request still
@@ -199,19 +200,17 @@ impl AppState {
                 }
             }
         }
-        // Reviewer threads are owned by their review (surfaced through the
-        // Reviewer panel), not peer sessions — keep them out of the thread list
-        // ENTIRELY, even while the reviewer is briefly the active thread during
-        // the review handoff. The user should never see a transient reviewer
-        // "conversation" pop into navigation; the review's status and result live
-        // only in the Reviewer tab (which fetches the reviewer transcript by id
-        // directly when you click in).
-        let reviewer_ids = relay.reviewer_thread_ids();
+        // A foreground Session's reviewer is owned by its review (surfaced through
+        // the Reviewer panel), not a peer session — keep it out of the thread list
+        // entirely, even while it is briefly active during review handoff. Task-team
+        // reviewers are first-class seats in the task worktree, so they stay visible
+        // alongside the TL and Dev sessions.
+        let (reviewer_ids, hidden_reviewer_ids) = relay.reviewer_thread_ids_and_navigation_hidden();
         let mut threads = relay
             .filter_deleted_threads(all_threads)
             .into_iter()
             .filter(|thread| path_within_device_scope(&thread.cwd, &device_scope, &allowed_roots))
-            .filter(|thread| !reviewer_ids.contains(&thread.id))
+            .filter(|thread| !hidden_reviewer_ids.contains(&thread.id))
             .collect::<Vec<_>>();
 
         // Preserve the active thread even when no provider lists it yet. A
@@ -220,10 +219,11 @@ impl AppState {
         // bridge's `list_threads` can't return it. Without this, starting a blank
         // session (or any later thread-list refresh) would drop the conversation
         // the user is actively viewing — it would never appear in the sidebar.
-        // ...but never re-add a reviewer thread: it must stay hidden from nav even
-        // when it is the active thread mid-review.
+        // ...but never re-add a nav-hidden reviewer thread: it must stay hidden even
+        // when it is the active thread mid-review. A task-team reviewer is not in this
+        // narrower set and can therefore be restored like any other visible session.
         if let Some(active_id) = relay.active_thread_id.clone() {
-            if !reviewer_ids.contains(&active_id)
+            if !hidden_reviewer_ids.contains(&active_id)
                 && !threads.iter().any(|thread| thread.id == active_id)
             {
                 if let Some(active_thread) = relay
@@ -300,15 +300,21 @@ impl AppState {
             // looks up threads by id in this cache, and a synthetic `claude-pending-…`
             // reviewer is only there (not yet in the provider's own thread list), so
             // losing its row would make it unroutable for `send_message_to_thread`.
-            // We preserve any reviewer rows that were already cached here.
-            let retained_reviewer_rows: Vec<_> = relay
-                .threads
-                .iter()
-                .filter(|cached| reviewer_ids.contains(&cached.id))
-                .cloned()
-                .collect();
+            // Preserve only rows not already returned. A task reviewer may now be in
+            // BOTH sets (nav-visible response and semantic reviewer set); blindly
+            // appending every cached reviewer would add another duplicate on every
+            // periodic refresh. Building the id set also collapses any duplicates a
+            // previous build left in the routing cache.
             let mut cached_threads = response_threads.clone();
-            cached_threads.extend(retained_reviewer_rows);
+            let mut cached_ids: std::collections::HashSet<String> = cached_threads
+                .iter()
+                .map(|thread| thread.id.clone())
+                .collect();
+            for cached in &relay.threads {
+                if reviewer_ids.contains(&cached.id) && cached_ids.insert(cached.id.clone()) {
+                    cached_threads.push(cached.clone());
+                }
+            }
             relay.threads = cached_threads;
 
             relay.notify();
@@ -680,7 +686,10 @@ impl AppState {
         // dead key — invisible to every reader, and orphaned forever in a PERSISTED map,
         // since no cleanup path ever sees a pending id again. Resolve first, then act.
         let thread_id = &relay.resolve_promoted_thread_id(thread_id);
-        if relay.reviewer_thread_ids().contains(thread_id) {
+        if relay
+            .navigation_hidden_reviewer_thread_ids()
+            .contains(thread_id)
+        {
             return Err(format!(
                 "`{thread_id}` is a reviewer thread and cannot be renamed"
             ));

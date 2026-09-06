@@ -121,6 +121,12 @@ pub struct SessionSnapshot {
     /// keeps older peers parseable; consumers treat absence as "no promotion".
     #[serde(default)]
     pub active_thread_promoted_from: Option<String>,
+    /// The ACTIVE thread is a task reviewer: readable, never conversable. Clients
+    /// disable the composer on this instead of letting the send fail — and it must
+    /// come from here rather than be derived from the team runs in this snapshot,
+    /// because run records are pruned while the seat and its transcript remain.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub active_thread_task_reviewer: bool,
     pub active_controller_device_id: Option<String>,
     pub active_controller_last_seen_at: Option<u64>,
     pub controller_lease_expires_at: Option<u64>,
@@ -2086,6 +2092,10 @@ pub struct ThreadStateView {
     pub review_locked: bool,
     pub workflow_locked: bool,
     pub settings_writable: bool,
+    /// Same fact as `SessionSnapshot::active_thread_task_reviewer`, for a thread
+    /// being viewed without being resumed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub task_reviewer: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

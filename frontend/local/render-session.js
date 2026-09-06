@@ -470,6 +470,9 @@ export function createSessionRenderer({
       session.active_thread_id
     );
     const activeThreadFrozen = activeThreadUnderReview || activeThreadUnderWorkflow;
+    // Not folded into `activeThreadFrozen`: that flag also hides Stop and gates
+    // AskUser, and a reviewer's own turn is still stoppable while it runs.
+    const taskReviewer = Boolean(session.active_thread_task_reviewer);
     // In a read-only view, the workspace is the saved thread's own cwd (or blank
     // when unknown) — never the user's currently-selected cwd, which would
     // misrepresent the saved thread.
@@ -731,6 +734,7 @@ export function createSessionRenderer({
       hasActiveSession,
       hasControllerLease: canWrite,
       reviewLocked: activeThreadFrozen || Boolean(state.viewOnlyThread?.review),
+      taskReviewer,
     });
     // Frozen while a submit is in flight (app.js runComposerSubmit) so a
     // draft edit or second submit can't change or duplicate the in-flight send.
@@ -763,7 +767,9 @@ export function createSessionRenderer({
       !viewingConversation ||
       activeThreadFrozen ||
       submitInFlight;
-    messageInput.placeholder = activeThreadFrozen
+    messageInput.placeholder = taskReviewer
+      ? "This is a task reviewer — read only."
+      : activeThreadFrozen
       ? activeThreadUnderWorkflow
         ? "This session is locked by Code Flow…"
         : "This session is being reviewed…"

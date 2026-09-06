@@ -1918,7 +1918,8 @@ started ({error}); finishing with round {round}'s findings."
             // (a missing runtime reads as "idle") and the read-back binds to a fresh
             // message instead of replaying the prior review.
             let mut data = bridge.read_thread(reviewer_thread_id).await?;
-            // Keep the row routable + nav-hidden (reviewer_thread_ids still filters it).
+            // Keep this foreground-review row routable and nav-hidden; its durable
+            // reviewer record remains explicitly non-task-owned.
             data.thread.provider = provider_name.to_string();
             data.thread.source = provider_name.to_string();
             let mut relay = self.relay.write().await;

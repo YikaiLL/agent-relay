@@ -1,12 +1,17 @@
+// `taskReviewer` is unlike the other gates here: it never lifts. The seat is a
+// record of what the reviewer judged, so the relay refuses user turns into it for
+// as long as it exists (TASK_REVIEWER_READ_ONLY_MSG).
 export function canComposeThread({
   activeTurnId,
   hasActiveSession,
   hasControllerLease,
   reviewLocked,
+  taskReviewer,
 }) {
   return Boolean(
     hasActiveSession
     && !reviewLocked
+    && !taskReviewer
     && (hasControllerLease || !activeTurnId)
   );
 }

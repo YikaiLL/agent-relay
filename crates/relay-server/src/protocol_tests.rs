@@ -85,6 +85,7 @@ fn make_snapshot() -> SessionSnapshot {
         beta_features_enabled: false,
         active_thread_id: Some("thread-1".to_string()),
         active_thread_promoted_from: None,
+        active_thread_task_reviewer: false,
         active_controller_device_id: Some("device-1".to_string()),
         active_controller_last_seen_at: Some(1),
         controller_lease_expires_at: Some(2),

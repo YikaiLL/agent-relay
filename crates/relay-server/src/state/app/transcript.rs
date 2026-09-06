@@ -265,6 +265,7 @@ impl AppState {
             review_locked,
             workflow_locked,
             settings_writable,
+            task_reviewer: relay.is_task_reviewer_thread(thread_id),
         })
     }
 

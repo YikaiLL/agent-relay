@@ -132,16 +132,6 @@ test("an unseated role has no thread to open rather than a plausible one", () =>
   assert.equal(seats[0].threadId, "tl-1");
 });
 
-test("only the reviewer is marked hidden from navigation", () => {
-  // The dev is the seat that WRITES; hiding it would make the writer invisible to
-  // the concurrency guard, so the backend deliberately leaves it in the sidebar.
-  const seats = teamSeats(run());
-  assert.deepEqual(
-    seats.filter((seat) => seat.hiddenFromNav).map((seat) => seat.role),
-    ["reviewer"]
-  );
-});
-
 test("the phase decides which seat is working", () => {
   const at = (phase, tasks = []) =>
     teamSeats(run({ phase, sub_tasks: tasks })).filter((seat) => seat.state);

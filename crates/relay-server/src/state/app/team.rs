@@ -1975,16 +1975,16 @@ over on resume"
             relay.update_team_run(run_id, |run| {
                 run.record_run_thread_role(&thread_id, role);
             });
-            // Hide only the reviewer from navigation. Hiding the dev too would put
-            // it in `reviewer_thread_ids()`, which `has_working_thread_in_cwd`
-            // subtracts — and the dev is the seat that WRITES, so it must stay
-            // visible to that guard.
+            // Record only the reviewer in the semantic reviewer set, and atomically
+            // mark this task-owned reviewer as a first-class Session. The same set
+            // still powers read-only and workspace-concurrency guards. The Dev writes,
+            // so it must never enter that set.
             if role == TeamRole::Reviewer {
                 let tl = relay
                     .team_run(run_id)
                     .map(|run| run.tl_thread_id.clone())
                     .unwrap_or_default();
-                relay.register_reviewer_thread(thread_id.clone(), tl);
+                relay.register_task_reviewer_thread(thread_id.clone(), tl);
             }
             relay.push_log(
                 "info",

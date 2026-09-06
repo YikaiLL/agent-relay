@@ -4459,36 +4459,43 @@ tree; got {}",
         );
     }
 
-    /// Reviewer threads are hidden from navigation entirely (they have no tab and no
-    /// sidebar row), so a rename targeting one is a bug or an attack, not a UI action.
-    /// Mirrors `assign_thread_to_project`'s refusal.
+    /// A foreground Session's reviewer is hidden from navigation entirely (it has no
+    /// tab or sidebar row), so a rename targeting one is a bug or an attack. A task
+    /// reviewer is a visible peer Session and must have the same rename affordance as
+    /// its TL and Dev siblings.
     #[tokio::test]
-    async fn rename_thread_refuses_reviewer_threads() {
+    async fn rename_thread_refuses_hidden_reviewer_but_allows_task_reviewer() {
         let (app, _p, _o) = build_app("/tmp/rename-reviewer").await;
         {
             let mut relay = app.relay.write().await;
-            relay.register_background_thread(
-                ThreadSummaryView {
-                    workspace_trusted: false,
-                    id: "reviewer-1".to_string(),
-                    name: None,
-                    preview: String::new(),
-                    cwd: "/tmp/rename-reviewer".to_string(),
-                    updated_at: 1,
-                    source: "fake".to_string(),
-                    status: "idle".to_string(),
-                    model_provider: "fake".to_string(),
-                    provider: "fake".to_string(),
-                    forked_from: None,
-                    renamed: false,
-                },
-                "/tmp/rename-reviewer",
-                "fake-model",
-                "on-request",
-                "workspace-write",
-                "medium",
-            );
-            relay.register_reviewer_thread("reviewer-1".to_string(), "parent-1".to_string());
+            for (id, task_owned) in [("reviewer-1", false), ("task-reviewer-1", true)] {
+                relay.register_background_thread(
+                    ThreadSummaryView {
+                        workspace_trusted: false,
+                        id: id.to_string(),
+                        name: None,
+                        preview: String::new(),
+                        cwd: "/tmp/rename-reviewer".to_string(),
+                        updated_at: 1,
+                        source: "fake".to_string(),
+                        status: "idle".to_string(),
+                        model_provider: "fake".to_string(),
+                        provider: "fake".to_string(),
+                        forked_from: None,
+                        renamed: false,
+                    },
+                    "/tmp/rename-reviewer",
+                    "fake-model",
+                    "on-request",
+                    "workspace-write",
+                    "medium",
+                );
+                if task_owned {
+                    relay.register_task_reviewer_thread(id.to_string(), "task-tl".to_string());
+                } else {
+                    relay.register_reviewer_thread(id.to_string(), "parent-1".to_string());
+                }
+            }
         }
 
         let error = app
@@ -4502,6 +4509,24 @@ tree; got {}",
             .await
             .expect_err("reviewer rename should be refused");
         assert!(error.contains("reviewer thread"), "unexpected: {error}");
+
+        app.rename_thread(
+            "task-reviewer-1",
+            RenameThreadInput {
+                name: Some("Final task review".to_string()),
+                device_id: None,
+            },
+        )
+        .await
+        .expect("visible task reviewer should be renamable");
+        assert_eq!(
+            app.relay
+                .read()
+                .await
+                .thread_custom_name("task-reviewer-1")
+                .as_deref(),
+            Some("Final task review")
+        );
     }
 
     // B4a (revised): projects are NOT embedded in the snapshot (unbounded → would
@@ -18938,6 +18963,7 @@ the provider, not forwarded ({turn_models:?})"
         let parent = start_parent(&app, cwd, "codex").await;
 
         let pending = "claude-pending-review-test";
+        let task_pending = "claude-pending-task-review-test";
         {
             // Mirror production ordering: insert the job WITHOUT reviewer_thread_id,
             // then register the background thread and assign reviewer_thread_id
@@ -18983,27 +19009,266 @@ the provider, not forwarded ({turn_models:?})"
             relay.update_review_job("review-cache", |job| {
                 job.reviewer_thread_id = Some(pending.to_string());
             });
+
+            // A deferred-start task reviewer is nav-visible by origin, but until
+            // promotion it is absent from the provider list just like the bound
+            // reviewer above. It still needs its cached row for routing.
+            relay.register_background_thread(
+                ThreadSummaryView {
+                    workspace_trusted: false,
+                    id: task_pending.to_string(),
+                    name: None,
+                    preview: String::new(),
+                    cwd: cwd.to_string(),
+                    updated_at: 2,
+                    source: "claude_code".to_string(),
+                    status: "active".to_string(),
+                    model_provider: "anthropic".to_string(),
+                    provider: "claude_code".to_string(),
+                    forked_from: None,
+                    renamed: false,
+                },
+                cwd,
+                "claude-model",
+                "on-request",
+                "workspace-write",
+                "medium",
+            );
+            relay.register_task_reviewer_thread(
+                task_pending.to_string(),
+                "task-team-lead".to_string(),
+            );
         }
 
-        // Trigger a list_threads refresh (simulates the periodic poll or a
-        // browser-triggered refresh) and verify the reviewer row is preserved.
+        // Trigger two refreshes (simulates the periodic poll) and verify neither
+        // kind of pending reviewer is lost or duplicated in the routing cache.
         let listed = app.list_threads(50, None).await.expect("list_threads");
         assert!(
             listed.threads.iter().all(|t| t.id != pending),
             "reviewer thread must not appear in the nav-visible response"
         );
-        // But it must still be in the relay.threads routing cache.
-        let in_cache = app
+        app.list_threads(50, None)
+            .await
+            .expect("second list_threads");
+        let relay = app.relay.read().await;
+        for reviewer_id in [pending, task_pending] {
+            assert_eq!(
+                relay
+                    .threads
+                    .iter()
+                    .filter(|thread| thread.id == reviewer_id)
+                    .count(),
+                1,
+                "pending reviewer {reviewer_id} must survive refresh exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_threads_shows_task_reviewer_but_hides_session_bound_reviewer() {
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex"]).await;
+        let task_tl = start_parent(&app, cwd, "codex").await;
+        let task_reviewer = start_parent(&app, cwd, "codex").await;
+        let bound_reviewer = start_parent(&app, cwd, "codex").await;
+
+        {
+            let mut relay = app.relay.write().await;
+            relay.register_task_reviewer_thread(task_reviewer.id.clone(), task_tl.id.clone());
+            relay.register_reviewer_thread(
+                bound_reviewer.id.clone(),
+                "foreground-session".to_string(),
+            );
+
+            let mut run = relay_api::team::TeamRun::new(
+                "team-nav-reviewer".to_string(),
+                crate::state::TaskSpec::default(),
+                cwd.to_string(),
+                "device-1".to_string(),
+            );
+            run.tl_thread_id = task_tl.id.clone();
+            run.sub_tasks.push(relay_api::team::SubTask {
+                reviewer_thread_id: Some(task_reviewer.id.clone()),
+                owned_thread_ids: vec![task_reviewer.id.clone()],
+                ..Default::default()
+            });
+            relay.insert_team_run(run);
+        }
+
+        let listed = app.list_threads(50, None).await.expect("list_threads");
+        assert!(
+            listed
+                .threads
+                .iter()
+                .any(|thread| thread.id == task_reviewer.id),
+            "a task-team reviewer is a visible Session alongside its TL and Dev"
+        );
+        assert!(
+            listed
+                .threads
+                .iter()
+                .all(|thread| thread.id != bound_reviewer.id),
+            "a foreground Session's bound reviewer must remain hidden"
+        );
+
+        // The visible door does not weaken team ownership: typing into this Session
+        // while the run is live must still be refused before touching the provider.
+        let error = app
+            .send_message(crate::protocol::SendMessageInput {
+                text: "can I interrupt the reviewer?".to_string(),
+                model: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                thread_id: task_reviewer.id.clone(),
+            })
+            .await
+            .expect_err("a live task reviewer remains team-locked");
+        assert_eq!(error, crate::state::app::TEAM_LOCKED_THREAD_MSG);
+
+        // Repeated sidebar polls must not append another cached copy merely because
+        // this reviewer belongs to both the response and the semantic reviewer set.
+        app.list_threads(50, None)
+            .await
+            .expect("second list_threads");
+        assert_eq!(
+            app.relay
+                .read()
+                .await
+                .threads
+                .iter()
+                .filter(|thread| thread.id == task_reviewer.id)
+                .count(),
+            1,
+            "a visible task reviewer must occur once in the routing cache"
+        );
+
+        // Navigation visibility belongs to reviewer identity, not the bounded task
+        // history map: deleting the run card must not make one sibling Session vanish.
+        app.relay.write().await.remove_team_run("team-nav-reviewer");
+        let after_run_delete = app
+            .list_threads(50, None)
+            .await
+            .expect("list after run delete");
+        assert!(
+            after_run_delete
+                .threads
+                .iter()
+                .any(|thread| thread.id == task_reviewer.id),
+            "task reviewer visibility must survive task-run deletion"
+        );
+
+        // The task reviewer is a peer Session, not an implementation child of the
+        // TL. Deleting that TL with the default reviewer cascade must leave the
+        // visible reviewer intact in both provider storage and navigation.
+        app.delete_thread_permanently(&task_tl.id, None)
+            .await
+            .expect("deleting a terminal task TL should succeed");
+        assert!(
+            providers
+                .get("codex")
+                .unwrap()
+                .threads
+                .lock()
+                .await
+                .contains_key(&task_reviewer.id),
+            "deleting the TL must not permanently delete its visible reviewer Sessions"
+        );
+        let after_tl_delete = app
+            .list_threads(50, None)
+            .await
+            .expect("list after TL delete");
+        assert!(
+            after_tl_delete
+                .threads
+                .iter()
+                .any(|thread| thread.id == task_reviewer.id),
+            "the task reviewer stays navigable after its TL is deleted"
+        );
+    }
+
+    /// The team lock lifts when a run ends; this one must not. A finished reviewer
+    /// is still only readable, and the refusal has to land before `start_turn` so a
+    /// direct API caller cannot append to the review record.
+    #[tokio::test]
+    async fn a_terminal_task_reviewer_is_readable_but_never_conversable() {
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex"]).await;
+        let reviewer = start_parent(&app, cwd, "codex").await;
+
+        {
+            let mut relay = app.relay.write().await;
+            relay.register_task_reviewer_thread(reviewer.id.clone(), "task-tl".to_string());
+            let mut run = relay_api::team::TeamRun::new(
+                "terminal-task".to_string(),
+                crate::state::TaskSpec::default(),
+                cwd.to_string(),
+                "device-1".to_string(),
+            );
+            run.status = crate::state::TeamRunStatus::Done;
+            run.tl_thread_id = "task-tl".to_string();
+            run.sub_tasks.push(relay_api::team::SubTask {
+                reviewer_thread_id: Some(reviewer.id.clone()),
+                owned_thread_ids: vec![reviewer.id.clone()],
+                ..Default::default()
+            });
+            relay.insert_team_run(run);
+        }
+
+        // Opening it is how the user READS the review, so this must still succeed —
+        // and the snapshot has to say so, or the composer only finds out by failing.
+        let snapshot = app
+            .resume_session(crate::protocol::ResumeSessionInput {
+                thread_id: reviewer.id.clone(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: None,
+            })
+            .await
+            .expect("a terminal task reviewer must still open for reading");
+        assert!(snapshot.active_thread_task_reviewer);
+
+        // The seat outlives the bounded run history, so the flag must not be
+        // derived from it — this is the whole reason it lives on reviewer identity.
+        app.relay.write().await.remove_team_run("terminal-task");
+        assert!(
+            app.relay
+                .read()
+                .await
+                .snapshot()
+                .active_thread_task_reviewer,
+            "pruning the task run must not reopen the composer on its reviewer"
+        );
+
+        let turns_before = providers.get("codex").unwrap().turns.lock().await.len();
+        let error = app
+            .send_message(crate::protocol::SendMessageInput {
+                text: "why did you flag that line?".to_string(),
+                model: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                thread_id: reviewer.id.clone(),
+            })
+            .await
+            .expect_err("a task reviewer never accepts a user turn");
+        assert_eq!(error, crate::state::app::TASK_REVIEWER_READ_ONLY_MSG);
+        assert_eq!(
+            providers.get("codex").unwrap().turns.lock().await.len(),
+            turns_before,
+            "the refusal must land before the provider is asked to start a turn"
+        );
+
+        // Nav-hidden foreground reviewers are already unreachable; this refusal is
+        // about the seat that now HAS a visible door.
+        assert!(!app
             .relay
             .read()
             .await
-            .threads
-            .iter()
-            .any(|t| t.id == pending);
-        assert!(
-            in_cache,
-            "reviewer thread must be retained in relay.threads for routing after list_threads"
-        );
+            .navigation_hidden_reviewer_thread_ids()
+            .contains(&reviewer.id));
     }
 
     #[tokio::test]

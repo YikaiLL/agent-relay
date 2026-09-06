@@ -268,9 +268,6 @@ export function teamSeats(run) {
       label: TEAM_ROLE_LABELS[role],
       threadId,
       state,
-      // The reviewer is hidden from the sidebar (`register_reviewer_thread`), so
-      // this screen is the only way to reach its transcript.
-      hiddenFromNav: role === "reviewer",
       subTaskTitle: role === "lead" ? null : task?.title || null,
     };
   });
