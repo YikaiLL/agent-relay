@@ -25,6 +25,9 @@ jobs:
       - name: npm ci
         run: npm ci
 
+      - name: Install Playwright
+        run: npm run test:browser:install:ci
+
       - name: npm test
         run: npm test
 
