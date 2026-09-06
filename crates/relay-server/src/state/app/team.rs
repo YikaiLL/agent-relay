@@ -729,8 +729,13 @@ over on resume"
     }
 
     #[cfg(test)]
-    pub(crate) fn team_stop_gate_arrivals(&self) -> u64 {
-        self.team_stop_gate_arrivals
+    pub(crate) async fn hold_team_stop_pre_gate_barrier(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.team_stop_pre_gate_barrier.clone().lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn team_stop_pre_gate_arrivals(&self) -> u64 {
+        self.team_stop_pre_gate_arrivals
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1068,7 +1073,10 @@ over on resume"
     /// This is the unsupported-backend lifecycle escape: Resume and blocked
     /// recovery stay diagnostic refusals in this build, while an explicit
     /// mark-cancel gives the user a current-build exit and releases any local
-    /// seats that were restored with the record.
+    /// seats that were restored with the record. A `Done` target for a non-Done
+    /// inert run is still refused by `mark_team_run`; this helper only implements
+    /// the explicit `Cancelled` target, including relabelling an already-Done
+    /// inert record just as the executable terminal path permits.
     async fn mark_non_executable_team_run_cancelled(
         &self,
         run_id: &str,
@@ -1251,8 +1259,11 @@ over on resume"
         // Stop that queued behind it must re-read `Running` after admission and
         // perform a real stop, not return a stale paused no-op.
         #[cfg(test)]
-        self.team_stop_gate_arrivals
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            self.team_stop_pre_gate_arrivals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            drop(self.team_stop_pre_gate_barrier.lock().await);
+        }
         let _gate = self.team_drive_gate.lock().await;
 
         let status = self.require_stoppable_team_run(&run_id).await?;

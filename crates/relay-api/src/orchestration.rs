@@ -3806,6 +3806,53 @@ mod tests {
     }
 
     #[test]
+    fn persisted_backend_refs_use_exact_wire_shapes() {
+        let cases = [
+            (
+                OrchestrationBackendRef::LegacyEmbedded,
+                r#"{"kind":"legacy_embedded"}"#,
+            ),
+            (
+                OrchestrationBackendRef::Cloud {
+                    protocol_version: 1,
+                    driver_version: DriverVersion::new("driver.1").unwrap(),
+                    cloud_run_id: DriverRunId::new("cloud-run-1").unwrap(),
+                },
+                r#"{"kind":"cloud","protocol_version":1,"driver_version":"driver.1","cloud_run_id":"cloud-run-1"}"#,
+            ),
+            (
+                OrchestrationBackendRef::LocalSidecar {
+                    protocol_version: 1,
+                    driver_version: DriverVersion::new("driver.1").unwrap(),
+                },
+                r#"{"kind":"local_sidecar","protocol_version":1,"driver_version":"driver.1"}"#,
+            ),
+            (
+                OrchestrationBackendRef::UnknownNonExecuting {
+                    original_kind: Some(UnknownBackendKind::new("cloud_v99").unwrap()),
+                    protocol_version: Some(99),
+                    driver_version: Some(DriverVersion::new("driver.99").unwrap()),
+                    cloud_run_id: Some(DriverRunId::new("cloud-run-99").unwrap()),
+                },
+                r#"{"kind":"unknown_non_executing","original_kind":"cloud_v99","protocol_version":99,"driver_version":"driver.99","cloud_run_id":"cloud-run-99"}"#,
+            ),
+        ];
+
+        for (backend, expected) in cases {
+            let encoded = serde_json::to_string(&backend).expect("serialize backend ref");
+            assert_eq!(encoded, expected);
+            let decoded: OrchestrationBackendRef =
+                serde_json::from_str(expected).expect("deserialize pinned backend ref");
+            assert_eq!(decoded, backend);
+        }
+
+        assert_eq!(
+            serde_json::to_string(&OrchestrationBackendRef::unknown_non_executing()).unwrap(),
+            r#"{"kind":"unknown_non_executing"}"#
+        );
+    }
+
+    #[test]
     fn persisted_backend_ref_degrades_future_or_malformed_shapes() {
         let extra_cloud: OrchestrationBackendRef = serde_json::from_str(
             r#"{

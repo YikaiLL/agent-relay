@@ -189,11 +189,13 @@ pub struct AppState {
     team_gated_barrier: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     team_gated_arrivals: Arc<std::sync::atomic::AtomicU64>,
-    /// Counts immediate Stop/Cancel/mark paths that reached drive-gate admission.
-    /// Tests use this to queue a stop behind Resume deterministically while
-    /// holding the gate.
+    /// Test-only latch immediately before Stop/Cancel enters the drive gate.
+    /// Holding it lets a test prove another action won gate admission first,
+    /// without relying on observing a task before Tokio has enqueued its waiter.
     #[cfg(test)]
-    team_stop_gate_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    team_stop_pre_gate_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    team_stop_pre_gate_arrivals: Arc<std::sync::atomic::AtomicU64>,
     /// The third window: the driver's OWN git mutation of the worktree. Not a
     /// turn, so the turn latches miss it entirely — and a stop that returned here
     /// would release the tree while the relay was still staging into it.
@@ -399,7 +401,9 @@ impl AppState {
             #[cfg(test)]
             team_gated_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
-            team_stop_gate_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            team_stop_pre_gate_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_stop_pre_gate_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
@@ -570,7 +574,9 @@ impl AppState {
             #[cfg(test)]
             team_gated_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
-            team_stop_gate_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            team_stop_pre_gate_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_stop_pre_gate_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]

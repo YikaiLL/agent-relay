@@ -377,25 +377,9 @@ async fn stop_revalidates_after_a_queued_resume_wins_the_drive_gate() {
         outcome: driver_outcome.clone(),
     }));
 
-    let gate = app.team_drive_gate.lock().await;
     let driver_pre_gate = app.hold_team_gated_barrier().await;
-    let stop_gate_before = app.team_stop_gate_arrivals();
-
-    let resume_task = {
-        let app = app.clone();
-        let run_id = run_id.clone();
-        tokio::spawn(async move {
-            app.resume_team_run(Some(run_id), Some("device-1".to_string()))
-                .await
-        })
-    };
-    wait_until_condition("resume should claim its driver ticket before the held drive gate opens", || {
-        app.driving_team_runs
-            .lock()
-            .expect("drive set")
-            .contains(&run_id)
-    })
-    .await;
+    let stop_pre_gate = app.hold_team_stop_pre_gate_barrier().await;
+    let stop_pre_gate_before = app.team_stop_pre_gate_arrivals();
 
     let stop_task = {
         let app = app.clone();
@@ -405,18 +389,18 @@ async fn stop_revalidates_after_a_queued_resume_wins_the_drive_gate() {
                 .await
         })
     };
-    wait_until_condition("stop should queue behind resume at the held drive gate", || {
-        app.team_stop_gate_arrivals() > stop_gate_before
+    wait_until_condition("stop should park before drive-gate admission", || {
+        app.team_stop_pre_gate_arrivals() > stop_pre_gate_before
     })
     .await;
 
-    drop(gate);
-
-    let resumed = resume_task
+    let resumed = app
+        .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
         .await
-        .expect("resume task should not panic")
         .expect("resume should win the gate first");
     assert_eq!(resumed, crate::state::TeamRunStatus::Running);
+
+    drop(stop_pre_gate);
 
     let stopped = stop_task
         .await
@@ -590,6 +574,16 @@ async fn inert_records_can_be_archived_but_not_marked_done() {
         .await
         .expect("mark_done should acknowledge an already-done inert row as a no-op");
     assert_eq!(status, crate::state::TeamRunStatus::Done);
+
+    let status = app
+        .mark_team_run(
+            Some("team-cloud-archive".to_string()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect("explicit archival may relabel an already-done inert row");
+    assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
 }
 
 #[tokio::test]
