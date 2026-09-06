@@ -19,7 +19,11 @@ import {
   isReviewInProgress,
   isReviewInProgressForThread,
 } from "../shared/review-state.js";
-import { isWorkingThreadStatus } from "../shared/thread-status.js";
+import {
+  selectDisplayedSession,
+  serverTimeSeconds,
+} from "../shared/session-view-model.js";
+import { reduceTranscriptDeltaEvent } from "../shared/transcript-event-reducer.js";
 
 // Any non-active thread can be viewed read-only. (The active thread is live —
 // projecting it would hide approvals/streaming, so it is never eligible.)
@@ -57,40 +61,6 @@ export function resolveViewOnlyPinWasWorkingAfterFetch({
   return resolveViewOnlyPinWasWorking({ prior, isWorking });
 }
 
-/// How much of a delta is genuinely new for a pinned entry, given `text_offset`.
-/// Mirrors `resolveDeltaAppend` in shared/transcript-hydration-store.js — same wire
-/// contract, same reconciliation. Returns null to refuse, "" for a pure duplicate.
-function resolveViewOnlyDeltaAppend(haveText, deltaText, textOffset) {
-  const offset =
-    typeof textOffset === "number" && Number.isSafeInteger(textOffset) && textOffset >= 0
-      ? textOffset
-      : null;
-  if (offset == null) {
-    return deltaText;
-  }
-  const have = haveText.length;
-  if (have < offset) {
-    return null;
-  }
-  const overlapLen = Math.min(have - offset, deltaText.length);
-  if (
-    overlapLen > 0
-    && haveText.slice(offset, offset + overlapLen) !== deltaText.slice(0, overlapLen)
-  ) {
-    return null;
-  }
-  if (have >= offset + deltaText.length) {
-    return "";
-  }
-  return deltaText.slice(have - offset);
-}
-
-/// Normalize a delta's wire kind to the transcript entry kind the renderer uses.
-/// Mirrors `normalizeLocalDeltaKind` in session/stream.js — same wire, same mapping.
-function deltaEntryKind(kind) {
-  return kind === "command_output" ? "command" : kind || "agent_text";
-}
-
 /**
  * Apply a live transcript delta to a view-only pin.
  *
@@ -110,33 +80,22 @@ export function applyDeltaToViewOnlyPin(pin, event) {
   if (!pin || !event?.item_id || !Array.isArray(pin.entries)) {
     return pin;
   }
-  // A pin is one specific thread. An unlabeled delta is not assumed to be ours —
-  // guessing would let another thread's text bleed into a read-only view.
-  if (!event.thread_id || event.thread_id !== pin.threadId) {
+  const outcome = reduceTranscriptDeltaEvent({
+    session: {
+      active_thread_id: pin.threadId,
+      transcript: pin.entries,
+      transcript_revision: pin.transcriptRevision,
+    },
+    event,
+    currentThreadId: pin.threadId,
+    requireEventThreadId: true,
+  });
+
+  if (outcome.kind === "noop" || outcome.kind === "duplicate") {
     return pin;
   }
 
-  const index = pin.entries.findIndex((entry) => entry?.item_id === event.item_id);
-  const deltaText = event.delta ?? "";
-  // Re-delivery is normal (the stream can replay a chunk the snapshot already carried),
-  // so reconcile against text_offset rather than blindly appending — a duplicated
-  // append here would corrupt the read-only view with no way to notice.
-  // A FIRST delta for an unknown item must start at offset 0. A non-zero offset means
-  // the message's opening text never arrived, so appending the tail would render a
-  // truncated body as if it were whole.
-  const startsAtZero =
-    event.text_offset == null
-    || (Number.isSafeInteger(event.text_offset) && event.text_offset === 0);
-  const delta =
-    index >= 0
-      ? resolveViewOnlyDeltaAppend(pin.entries[index].text ?? "", deltaText, event.text_offset)
-      : (startsAtZero ? deltaText : null);
-  if (delta === "") {
-    // Pure re-delivery of text we already hold. The stream replays routinely
-    // after a snapshot, so treating this as damage would refetch constantly.
-    return pin;
-  }
-  if (delta == null) {
+  if (outcome.kind === "needs_repair") {
     // A gap (earlier text missing) or a divergence (same range, different
     // bytes). Splicing either would corrupt the body, so refusing is right --
     // but refusing SILENTLY left the hole for whatever refreshed next, and the
@@ -146,7 +105,7 @@ export function applyDeltaToViewOnlyPin(pin, event) {
     // flag the refresh decision can act on in this frame rather than at the end
     // of the turn.
     const duringFetch = pin.loading ? { deltaDuringFetch: true } : {};
-    if (index < 0) {
+    if (outcome.entryIndex < 0) {
       // We hold nothing for this item and the chunk does not start at 0, so its
       // opening text never arrived. Nothing to downgrade; the pin still needs a
       // page before it can render this entry at all.
@@ -157,43 +116,14 @@ export function applyDeltaToViewOnlyPin(pin, event) {
       tailGap: true,
       ...duringFetch,
       entries: pin.entries.map((entry, position) =>
-        position === index ? { ...entry, content_state: "preview" } : entry
+        position === outcome.entryIndex ? { ...entry, content_state: "preview" } : entry
       ),
     };
   }
-  const entries =
-    index >= 0
-      ? pin.entries.map((entry, position) =>
-          position === index
-            ? {
-              ...entry,
-              entry_seq:
-                  Number.isSafeInteger(event.entry_seq) && !Number.isSafeInteger(entry.entry_seq)
-                    ? event.entry_seq
-                    : entry.entry_seq,
-              kind: entry.kind || deltaEntryKind(event.delta_kind || event.entry_kind),
-              status: "running",
-              text: `${entry.text ?? ""}${delta}`,
-              turn_id: entry.turn_id || event.turn_id || null,
-            }
-            : entry
-        )
-      : [
-          ...pin.entries,
-          {
-            entry_seq: Number.isSafeInteger(event.entry_seq) ? event.entry_seq : null,
-            item_id: event.item_id,
-            kind: deltaEntryKind(event.delta_kind || event.entry_kind),
-            status: "running",
-            text: delta,
-            tool: null,
-            turn_id: event.turn_id || null,
-          },
-        ];
 
   return {
     ...pin,
-    entries,
+    entries: outcome.nextTranscript,
     // A pin carrying live deltas is by definition mid-turn. Without this the
     // projection can report the thread idle while text is still arriving, which is
     // what made a watched background thread look finished when it wasn't.
@@ -225,13 +155,14 @@ export function buildViewOnlyPin({
   lastRefreshAt = 0,
   lastRefreshServerTime = null,
   wasWorking = false,
+  reviewerThreads = undefined,
   priorEntries = [],
   priorOlderCursor = null,
   historyExtended = false,
   loading = false,
   error = false,
 }) {
-  return {
+  const pin = {
     threadId,
     entries: page ? page.entries || [] : priorEntries,
     olderCursor: page ? page.prev_cursor ?? null : priorOlderCursor,
@@ -268,6 +199,10 @@ export function buildViewOnlyPin({
     // shell as a settled, complete view forever. See viewOnlySelfHealThreadId.
     error,
   };
+  if (reviewerThreads !== undefined) {
+    pin.reviewerThreads = Array.isArray(reviewerThreads) ? reviewerThreads : [];
+  }
+  return pin;
 }
 
 // How long to wait before a render re-arms a view-only load that previously
@@ -320,24 +255,16 @@ export function viewOnlySelfHealThreadId(
   return viewThreadId;
 }
 
-function settledThreadStatus(status) {
-  const normalized = typeof status === "string" ? status.toLowerCase() : "";
-  return normalized === "active" || normalized === "running" || normalized === "working"
-    ? "idle"
-    : status || "idle";
-}
-
-function serverTimeSeconds(value) {
-  const seconds = Number(value);
-  return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
-}
-
 function snapshotServerTime(session) {
   return serverTimeSeconds(session?.server_time);
 }
 
 function pinServerTime(pin) {
   return serverTimeSeconds(pin?.lastRefreshServerTime);
+}
+
+function hasOwn(object, property) {
+  return Object.prototype.hasOwnProperty.call(Object(object), property);
 }
 
 // Prepend an older history page into the pin. Entries already present (by
@@ -470,81 +397,45 @@ function maxEntrySeq(entries) {
 // truncation indicator) works unchanged. transcript_truncated reflects the
 // pin's pagination cursor so the scroll-up history loader arms itself.
 export function projectViewOnlySession(realSession, { viewThreadId, viewOnlyThread } = {}) {
-  if (
-    !viewOnlyThread ||
-    !realSession ||
-    !viewThreadId ||
-    viewOnlyThread.threadId !== viewThreadId ||
-    viewThreadId === realSession.active_thread_id
-  ) {
-    return realSession;
-  }
-  const activity = (realSession.thread_activity || []).find(
-    (entry) => entry?.thread_id === viewThreadId
-  );
-  const explicitTurnId = viewOnlyThread.activeTurnId || null;
-  const explicitStatus =
-    viewOnlyThread.currentStatus == null ? "" : String(viewOnlyThread.currentStatus).trim();
-  const hasExplicitThreadState = Boolean(explicitTurnId || explicitStatus);
-  const explicitWorking = Boolean(
-    explicitTurnId || (explicitStatus && isWorkingThreadStatus(explicitStatus))
-  );
-  // The pin's thread_state is fetched independently of the compact live snapshot.
-  // If that fetch is newer and says the viewed thread is idle, do not let an
-  // older thread_activity row keep the composer stuck in "running" forever.
-  const pinTime = pinServerTime(viewOnlyThread);
-  const snapshotTime = snapshotServerTime(realSession);
-  const activityFreshEnough =
-    !pinTime || !snapshotTime || snapshotTime >= pinTime;
-  const isWorking = explicitWorking || Boolean(
-    activity && (!hasExplicitThreadState || activityFreshEnough)
-  );
-  const currentPhase = isWorking
-    ? viewOnlyThread.currentPhase ?? activity?.phase ?? null
-    : null;
-  const currentTool = isWorking
-    ? viewOnlyThread.currentTool ?? activity?.tool ?? null
-    : null;
-  const settings = viewOnlyThread.settings || {};
-  const pendingApprovals = (realSession.pending_approvals || []).filter(
-    (entry) => entry?.thread_id === viewThreadId
-  );
-  const pendingQuestions = (realSession.pending_ask_user_questions || []).filter(
-    (entry) => entry?.thread_id === viewThreadId
-  );
-  return {
-    ...realSession,
-    active_thread_id: viewThreadId,
-    active_turn_id: explicitTurnId || (isWorking ? `view:${viewThreadId}` : null),
-    pending_approvals: pendingApprovals,
-    pending_ask_user_questions: pendingQuestions,
-    // A sentinel controller id makes canCurrentDeviceWrite() false → read-only.
-    active_controller_device_id: "__view_only__",
-    transcript: viewOnlyThread.entries || [],
-    transcript_truncated: viewOnlyThread.olderCursor != null,
-    current_status: viewOnlyThread.currentStatus
-      || (isWorking ? "active" : settledThreadStatus(viewOnlyThread.status)),
-    current_phase: currentPhase,
-    current_tool: currentTool,
-    last_progress_at: viewOnlyThread.lastProgressAt ?? null,
-    view_only: true,
-    // A read-only saved-thread view must never present the LIVE session's
-    // metadata as the saved thread's. Use the viewed thread's summary fields
-    // (cwd/provider) and BLANK what the summary doesn't carry (model, effort,
-    // approval policy, sandbox). Blank/unknown over impersonation — and never
-    // fall back to the live cwd.
-    current_cwd: viewOnlyThread.cwd ?? "",
-    thread_workspace_cwd: viewOnlyThread.threadWorkspaceCwd ?? "",
-    provider: viewOnlyThread.provider ?? "",
-    model: settings.model || "",
-    reasoning_effort: settings.reasoning_effort || "",
-    approval_policy: settings.approval_policy || "",
-    sandbox: settings.sandbox || "",
-    available_models: viewOnlyThread.availableModels || [],
-    review_locked: Boolean(viewOnlyThread.review),
-    workflow_locked: Boolean(viewOnlyThread.workflowLocked),
-    settings_writable: Boolean(viewOnlyThread.settingsWritable),
-  };
+  return selectDisplayedSession({
+    liveSession: realSession,
+    viewedThreadId: viewThreadId,
+    viewedThread: viewOnlyThread
+      ? (() => {
+        const settings = viewOnlyThread.settings || {};
+        const viewedThread = {
+          threadId: viewOnlyThread.threadId,
+          entries: viewOnlyThread.entries || [],
+          olderCursor: viewOnlyThread.olderCursor,
+          activeTurnId: viewOnlyThread.activeTurnId || null,
+          currentStatus: viewOnlyThread.currentStatus,
+          currentPhase: viewOnlyThread.currentPhase ?? null,
+          currentTool: viewOnlyThread.currentTool ?? null,
+          lastProgressAt: viewOnlyThread.lastProgressAt ?? null,
+          currentCwd: viewOnlyThread.cwd ?? "",
+          threadWorkspaceCwd: viewOnlyThread.threadWorkspaceCwd ?? "",
+          provider: viewOnlyThread.provider ?? "",
+          model: settings.model || "",
+          reasoningEffort: settings.reasoning_effort || "",
+          approvalPolicy: settings.approval_policy || "",
+          sandbox: settings.sandbox || "",
+          availableModels: viewOnlyThread.availableModels || [],
+          reviewLocked: Boolean(viewOnlyThread.review),
+          workflowLocked: Boolean(viewOnlyThread.workflowLocked),
+          settingsWritable: Boolean(viewOnlyThread.settingsWritable),
+          status: viewOnlyThread.status,
+          refreshServerTime: pinServerTime(viewOnlyThread),
+        };
+        if (hasOwn(viewOnlyThread, "reviewerThreads")) {
+          viewedThread.reviewerThreads = Array.isArray(viewOnlyThread.reviewerThreads)
+            ? viewOnlyThread.reviewerThreads
+            : [];
+        }
+        return viewedThread;
+      })()
+      : null,
+    liveActivityServerTime: snapshotServerTime(realSession),
+  });
 }
 
 // Decide what to do with the pin on each render. Returns { kind }:

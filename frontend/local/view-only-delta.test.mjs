@@ -85,6 +85,27 @@ test("receiving a delta marks the pin as working", () => {
   assert.equal(next.activeTurnId, "turn-1");
 });
 
+test("an offsetless empty delta does not mark a completed pin entry running", () => {
+  const original = pin({
+    entries: [{
+      item_id: "item-1",
+      kind: "agent_text",
+      status: "completed",
+      text: "done",
+      turn_id: "turn-1",
+      tool: null,
+    }],
+  });
+  const next = applyDeltaToViewOnlyPin(
+    original,
+    delta({ delta: "", turn_id: "turn-late" })
+  );
+
+  assert.equal(next, original, "empty no-op deltas preserve pin identity");
+  assert.equal(original.entries[0].status, "completed");
+  assert.equal(original.wasWorking, false);
+});
+
 test("an existing turn id is not overwritten by a later delta", () => {
   const next = applyDeltaToViewOnlyPin(
     pin({ activeTurnId: "turn-original" }),

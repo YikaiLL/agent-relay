@@ -18,7 +18,6 @@ import {
   applyEntryPatchToWindow,
   clearTranscriptHydration,
   invalidateTranscriptWindowForRepair,
-  resolveDeltaAppend,
   restoreHydratedTranscript,
   switchTranscriptHydrationThread,
   transcriptWindowIsLoaded,
@@ -83,8 +82,16 @@ import {
   viewOnlyThreadIsWorking,
 } from "../local/view-only-thread.js";
 import { sessionViewedWorkspaceKey } from "../shared/viewed-workspace-key.js";
-import { isWorkingThreadStatus } from "../shared/thread-status.js";
 import { createTranscriptFlushScheduler } from "../shared/transcript-flush-scheduler.js";
+import {
+  selectDisplayedSession,
+  serverTimeSeconds,
+} from "../shared/session-view-model.js";
+import {
+  numericRevision,
+  reduceTranscriptDeltaEvent,
+  reduceTranscriptEntryPatchEvent,
+} from "../shared/transcript-event-reducer.js";
 
 const fetchTranscriptPageOverBroker = createTranscriptPageFetcher(dispatchOrRecover);
 const fetchRawTranscriptPage = fetchTranscriptPageOverBroker;
@@ -173,8 +180,8 @@ export function flushRemoteTranscriptRenderForTest() {
 
 // Counts actual array rebuilds — mirrors local's transcriptFullRebuildCount
 // (frontend/local/transcript/store.js). Incremented by settleTranscriptProjection's
-// window-derived rebuild and by the synchronous no-window array fallback
-// (applyArrayTranscriptDeltaAppend) alike, so it stays one counter across both
+// window-derived rebuild and by the synchronous no-window reducer fallback
+// alike, so it stays one counter across both
 // full-rebuild sites, the same shape as transcriptFullWindowCopyCount
 // (frontend/shared/transcript-hydration-store.js).
 //
@@ -300,16 +307,6 @@ export async function repairRemoteWorkspace(threadId) {
   }
 }
 
-function transcriptDeltaKindToEntryKind(deltaKind) {
-  switch (deltaKind) {
-    case "command_output":
-      return "command";
-    case "agent_text":
-    default:
-      return "agent_text";
-  }
-}
-
 export function applyTranscriptDelta({
   thread_id,
   base_revision,
@@ -354,25 +351,9 @@ export function applyTranscriptDelta({
       return;
     }
   }
-  const currentRevision = numericRevision(currentSession.transcript_revision);
-  const deltaBaseRevision = numericRevision(base_revision);
-  const deltaRevision = numericRevision(revision);
-  if (
-    deltaRevision != null
-    && currentRevision != null
-    && deltaRevision < currentRevision
-  ) {
-    const message = `[transcript-delta] ignored stale revision=${deltaRevision} current=${currentRevision} thread=${thread_id || "-"} item=${item_id || "-"}`;
-    renderLog(message);
-    console.log(message);
-    return;
-  }
 
   const transcript = currentSession.transcript;
   if (!Array.isArray(transcript)) return;
-  const resolvedKind = transcriptDeltaKindToEntryKind(delta_kind || kind);
-  const deltaText = delta ?? "";
-  const offset = numericOffset(text_offset);
   // The rule: write the window only when it is loaded for THIS delta's own
   // thread — never assume the pin's thread and the window's thread agree
   // (projectRemoteViewedSession resets `transcript` on exactly that
@@ -393,82 +374,54 @@ export function applyTranscriptDelta({
   // mid-stream" test (session-ops.test.mjs).
   const windowLoaded = transcriptWindowIsLoaded(state, currentThreadId);
   const viewedThreadId = commit === commitViewedSession ? (currentThreadId || thread_id) : null;
+  const deltaEvent = {
+    thread_id,
+    base_revision,
+    revision,
+    entry_seq,
+    server_time,
+    item_id,
+    turn_id,
+    delta,
+    delta_kind: delta_kind || kind,
+    kind,
+    text_offset,
+  };
+  const existingWindowEntry = windowLoaded
+    ? state.transcriptHydrationEntries.get(item_id)
+    : undefined;
+  const outcome = reduceTranscriptDeltaEvent({
+    session: currentSession,
+    event: deltaEvent,
+    currentThreadId,
+    currentEntry: existingWindowEntry,
+    hasCurrentEntry: windowLoaded ? Boolean(existingWindowEntry) : undefined,
+    buildTranscript: !windowLoaded,
+    rejectStaleRevision: true,
+    enforceBaseRevisionWithoutOffset: true,
+    useDeltaEventKindFallback: true,
+    unknownDeltaKindFallback: "agent_text",
+    appendEmptyOffsetlessDelta: true,
+  });
 
-  // Offset-based path (agent-text deltas carry text_offset): the entry's own
-  // text length is the cursor, so a single dropped/coalesced chunk no longer
-  // freezes the whole message. We can tell apart a contiguous append, a
-  // duplicate re-delivery, and a genuine gap — and only the gap needs an
-  // authoritative repair fetch. This tolerates a non-contiguous base_revision
-  // chain (interleaved streams, snapshot-bumped revisions). Deltas whose
-  // revision is strictly behind the current revision are still dropped above as
-  // superseded before reaching here — that is intentional (a newer snapshot
-  // already covers them).
-  if (offset != null) {
-    const haveText = windowLoaded
-      ? (state.transcriptHydrationEntries.get(item_id)?.text ?? "")
-      : (transcript.find((entry) => entry?.item_id === item_id)?.text ?? "");
-    const have = haveText.length;
-    if (have < offset) {
-      // Missing earlier text: appending here would splice the stream out of
-      // order. Pull the authoritative tail instead of silently freezing.
-      scheduleTranscriptGapRepair(currentThreadId || thread_id || null, "offset_gap", deltaRevision, {
-        item: item_id,
-        offset,
-        have,
-      });
-      return;
+  if (outcome.kind === "noop") {
+    if (outcome.reason === "stale_revision") {
+      const message = `[transcript-delta] ignored stale revision=${outcome.eventRevision} current=${outcome.currentRevision} thread=${thread_id || "-"} item=${item_id || "-"}`;
+      renderLog(message);
+      console.log(message);
     }
-    // The shared resolveDeltaAppend re-derives `have < offset` internally too
-    // (harmless — it is a cheap comparison), but we need the two failure
-    // modes told apart for the repair reason, so gap is ruled out above
-    // first: a null result here can only be the byte-mismatch branch (the
-    // overlap disagrees with what we hold).
-    const appendText = resolveDeltaAppend(haveText, deltaText, offset);
-    if (appendText == null) {
-      scheduleTranscriptGapRepair(currentThreadId || thread_id || null, "offset_mismatch", deltaRevision, {
-        item: item_id,
-        offset,
-        have,
-      });
-      return;
-    }
-    if (appendText === "") {
-      // Duplicate re-delivery: we already hold this delta's whole range.
-      return;
-    }
-    commitTranscriptDeltaAppend({
-      windowLoaded,
-      commit,
-      currentSession,
-      currentThreadId,
-      item_id,
-      turn_id,
-      entry_seq,
-      resolvedKind,
-      appendText,
-      rawDeltaText: deltaText,
-      rawOffset: offset,
-      rawDeltaKind: delta_kind,
-      deltaRevision,
-      server_time,
-      viewedThreadId,
-    });
     return;
   }
-
-  // Fallback path (command output / legacy deltas with no offset): rely on the
-  // base_revision chain, but on a mismatch repair instead of dropping — the old
-  // silent drop is exactly what left the last message permanently incomplete.
-  if (
-    deltaBaseRevision != null
-    && currentRevision != null
-    && deltaBaseRevision !== currentRevision
-  ) {
-    scheduleTranscriptGapRepair(currentThreadId || thread_id || null, "base_revision_gap", deltaRevision, {
-      item: item_id,
-      base_revision: deltaBaseRevision,
-      current: currentRevision,
-    });
+  if (outcome.kind === "needs_repair") {
+    scheduleTranscriptGapRepair(
+      currentThreadId || thread_id || null,
+      outcome.reason,
+      outcome.eventRevision,
+      outcome.detail
+    );
+    return;
+  }
+  if (outcome.kind === "duplicate") {
     return;
   }
   commitTranscriptDeltaAppend({
@@ -476,15 +429,8 @@ export function applyTranscriptDelta({
     commit,
     currentSession,
     currentThreadId,
-    item_id,
-    turn_id,
-    entry_seq,
-    resolvedKind,
-    appendText: deltaText,
-    rawDeltaText: deltaText,
-    rawOffset: null,
-    rawDeltaKind: delta_kind,
-    deltaRevision,
+    event: deltaEvent,
+    outcome,
     server_time,
     viewedThreadId,
   });
@@ -503,88 +449,38 @@ function commitTranscriptDeltaAppend({
   commit = commitLiveSession,
   currentSession,
   currentThreadId,
-  item_id,
-  turn_id,
-  entry_seq,
-  resolvedKind,
-  appendText,
-  rawDeltaText,
-  rawOffset,
-  rawDeltaKind,
-  deltaRevision,
+  event,
+  outcome,
   server_time,
   viewedThreadId = null,
 }) {
   let nextSession;
   if (windowLoaded) {
     appendTranscriptDeltaToWindow(state, {
-      item_id,
+      item_id: outcome.itemId,
       thread_id: currentThreadId,
-      delta: rawDeltaText,
-      delta_kind: rawDeltaKind,
-      turn_id,
-      entry_seq,
-      text_offset: rawOffset,
+      delta: event.delta ?? "",
+      delta_kind: event.delta_kind,
+      turn_id: event.turn_id,
+      entry_seq: event.entry_seq,
+      text_offset: event.text_offset,
     });
     markTranscriptWindowProjectionPending(state);
     nextSession = { ...currentSession };
   } else {
-    nextSession = applyArrayTranscriptDeltaAppend(currentSession, {
-      item_id,
-      turn_id,
-      entry_seq,
-      resolvedKind,
-      appendText,
-    });
+    nextSession = outcome.nextSession;
     transcriptDeltaRebuildCount += 1;
   }
-  if (deltaRevision != null) {
-    nextSession.transcript_revision = deltaRevision;
+  if (outcome.eventRevision != null) {
+    nextSession.transcript_revision = outcome.nextRevision;
   }
   if (Number.isSafeInteger(server_time)) {
     nextSession.server_time = server_time;
   }
-  commit(nextSession, { chars: appendText.length, reason: "transcript_entry_delta" });
+  commit(nextSession, { chars: outcome.appendText.length, reason: "transcript_entry_delta" });
   if (viewedThreadId) {
     latchViewOnlyWasWorkingFromDelta(viewedThreadId);
   }
-}
-
-// The no-window fallback: rebuild the array for just this one entry,
-// synchronously — the array-path twin of appendTranscriptDeltaToWindow.
-// O(n) in transcript length, but n is capped at 6 while this branch can run
-// at all — see the windowLoaded comment in applyTranscriptDelta above.
-function applyArrayTranscriptDeltaAppend(session, { item_id, turn_id, entry_seq, resolvedKind, appendText }) {
-  const transcript = session.transcript;
-  const entryIndex = transcript.findIndex((entry) => entry?.item_id === item_id);
-  const nextTranscript = entryIndex >= 0
-    ? transcript.map((entry, index) =>
-        index === entryIndex
-          ? {
-            ...entry,
-            entry_seq: Number.isSafeInteger(entry_seq) && !Number.isSafeInteger(entry.entry_seq)
-              ? entry_seq
-              : entry.entry_seq,
-            kind: entry.kind || resolvedKind,
-            status: "running",
-            text: `${entry.text ?? ""}${appendText}`,
-            turn_id: entry.turn_id || turn_id || null,
-          }
-          : entry
-      )
-    : [
-        ...transcript,
-        {
-          item_id,
-          turn_id: turn_id ?? null,
-          text: appendText,
-          kind: resolvedKind,
-          status: "running",
-          tool: null,
-          entry_seq: Number.isSafeInteger(entry_seq) ? entry_seq : null,
-        },
-      ];
-  return { ...session, transcript: nextTranscript };
 }
 
 // Highest target revision we still owe a repair for, per thread. A Map (not a
@@ -1122,93 +1018,60 @@ function shouldAcceptSessionSnapshot(snapshot) {
 
 export function projectRemoteViewedSession(realSession, threadId, currentView) {
   const thread = (state.threads || []).find((candidate) => candidate?.id === threadId);
-  const activity = (realSession?.thread_activity || []).find(
-    (entry) => entry?.thread_id === threadId
-  );
   const threadState = currentView?.thread_state || currentView || {};
-  const explicitTurnId = threadState.active_turn_id || null;
-  const explicitStatus =
-    threadState.current_status == null ? "" : String(threadState.current_status).trim();
-  const hasExplicitThreadState = Boolean(explicitTurnId || explicitStatus);
-  const explicitWorking = Boolean(
-    explicitTurnId || (explicitStatus && isWorkingThreadStatus(explicitStatus))
-  );
-  // The viewed thread state comes from an independent transcript-page fetch. When
-  // that fetch is newer and says the viewed thread is idle, ignore an older
-  // thread_activity row from the compact live snapshot so mobile does not keep
-  // the composer locked forever.
   const viewRefreshTime = viewedRefreshServerTime(currentView);
-  const snapshotTime = threadActivityServerTime(realSession);
-  const activityFreshEnough =
-    !viewRefreshTime || !snapshotTime || snapshotTime >= viewRefreshTime;
-  const isWorking = explicitWorking || Boolean(
-    activity && (!hasExplicitThreadState || activityFreshEnough)
-  );
-  const currentPhase = isWorking
-    ? threadState.current_phase ?? activity?.phase ?? null
+  const viewMatchesThread = currentView?.active_thread_id === threadId;
+  const viewedThread = threadId
+    ? {
+      threadId,
+      entries: viewMatchesThread ? currentView.transcript || [] : [],
+      transcriptRevision: viewMatchesThread ? currentView.transcript_revision || 0 : 0,
+      transcriptTruncated: viewMatchesThread ? Boolean(currentView.transcript_truncated) : false,
+      activeTurnId: threadState.active_turn_id || null,
+      currentStatus: threadState.current_status,
+      currentPhase: threadState.current_phase ?? null,
+      currentTool: threadState.current_tool ?? null,
+      lastProgressAt: threadState.last_progress_at ?? null,
+      currentCwd: threadState.current_cwd || thread?.cwd || "",
+      threadWorkspaceCwd:
+        threadState.thread_workspace_cwd
+        ?? currentView?.thread_workspace_cwd
+        ?? "",
+      provider: threadState.provider || thread?.provider || "",
+      model: threadState.model || "",
+      reasoningEffort: threadState.reasoning_effort || "",
+      approvalPolicy: threadState.approval_policy || "",
+      sandbox: threadState.sandbox || "",
+      availableModels: threadState.available_models || [],
+      // The viewed thread's OWN reviewers. The global remote snapshot scopes
+      // reviewer_threads to the active parent, so without this a viewed non-active
+      // thread shows fewer reviewers than local; the per-thread read supplies them
+      // on view entry (currentView.thread_state.reviewers). On a later snapshot /
+      // live delta, currentView is the previously-projected session (no thread_state,
+      // value already under reviewer_threads), so fall back to that — otherwise the
+      // set collapses to [] on the first re-projection.
+      reviewerThreads: threadState.reviewers ?? currentView?.reviewer_threads ?? [],
+      reviewLocked: Boolean(threadState.review_locked),
+      workflowLocked: Boolean(threadState.workflow_locked ?? currentView?.workflow_locked),
+      settingsWritable: Boolean(threadState.settings_writable),
+      status: thread?.status,
+      refreshServerTime: viewRefreshTime,
+    }
     : null;
-  const currentTool = isWorking
-    ? threadState.current_tool ?? activity?.tool ?? null
-    : null;
-  const pendingApprovals = (realSession?.pending_approvals || []).filter(
-    (entry) => entry?.thread_id === threadId
-  );
-  const pendingQuestions = (realSession?.pending_ask_user_questions || []).filter(
-    (entry) => entry?.thread_id === threadId
-  );
-  return {
-    ...(realSession || {}),
-    active_controller_device_id: "__view_only__",
-    active_controller_last_seen_at: null,
-    active_flags: [],
-    active_thread_id: threadId,
-    active_turn_id: explicitTurnId || (isWorking ? `view:${threadId}` : null),
-    controller_lease_expires_at: null,
-    current_cwd: threadState.current_cwd || thread?.cwd || "",
-    thread_workspace_cwd:
-      threadState.thread_workspace_cwd
-      ?? currentView?.thread_workspace_cwd
-      ?? "",
-    current_phase: currentPhase,
-    current_status: threadState.current_status
-      || (isWorking ? "active" : settledThreadStatus(thread?.status)),
-    current_tool: currentTool,
-    last_progress_at: threadState.last_progress_at ?? null,
-    provider: threadState.provider || thread?.provider || "",
-    model: threadState.model || "",
-    reasoning_effort: threadState.reasoning_effort || "",
-    approval_policy: threadState.approval_policy || "",
-    sandbox: threadState.sandbox || "",
-    available_models: threadState.available_models || [],
-    // The viewed thread's OWN reviewers. The global remote snapshot scopes
-    // reviewer_threads to the active parent, so without this a viewed non-active
-    // thread shows fewer reviewers than local; the per-thread read supplies them
-    // on view entry (currentView.thread_state.reviewers). On a later snapshot /
-    // live delta, currentView is the previously-projected session (no thread_state,
-    // value already under reviewer_threads), so fall back to that — otherwise the
-    // set collapses to [] on the first re-projection.
-    reviewer_threads: threadState.reviewers ?? currentView?.reviewer_threads ?? [],
-    review_locked: Boolean(threadState.review_locked),
-    workflow_locked: Boolean(threadState.workflow_locked ?? currentView?.workflow_locked),
-    settings_writable: Boolean(threadState.settings_writable),
-    pending_approvals: pendingApprovals,
-    pending_ask_user_questions: pendingQuestions,
-    transcript:
-      currentView?.active_thread_id === threadId ? currentView.transcript || [] : [],
-    transcript_revision:
-      currentView?.active_thread_id === threadId ? currentView.transcript_revision || 0 : 0,
-    transcript_truncated:
-      currentView?.active_thread_id === threadId
-        ? Boolean(currentView.transcript_truncated)
-        : false,
-    view_only: true,
-    view_last_refresh_server_time: viewRefreshTime || null,
-  };
-}
-
-function serverTimeSeconds(value) {
-  const seconds = Number(value);
-  return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+  return selectDisplayedSession({
+    // Remote can open a saved thread before a live snapshot exists. Preserve the
+    // old adapter's empty-object base in that case; Local still passes null through.
+    liveSession: realSession || {},
+    viewedThreadId: threadId,
+    viewedThread,
+    liveActivityServerTime: threadActivityServerTime(realSession),
+    viewOnlySessionPatch: {
+      active_controller_last_seen_at: null,
+      active_flags: [],
+      controller_lease_expires_at: null,
+      view_last_refresh_server_time: viewRefreshTime || null,
+    },
+  });
 }
 
 function snapshotServerTime(session) {
@@ -1238,13 +1101,6 @@ function stampThreadActivitySnapshotTime(snapshot) {
     : snapshot;
 }
 
-function settledThreadStatus(status) {
-  const normalized = typeof status === "string" ? status.toLowerCase() : "";
-  return normalized === "active" || normalized === "running" || normalized === "working"
-    ? "idle"
-    : status || "idle";
-}
-
 function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null } = {}) {
   // This function does its own full-array rebuild below — settle any pending
   // window append into it FIRST, or this rebuild would carry the pre-append
@@ -1256,47 +1112,29 @@ function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null 
     return;
   }
   const currentThreadId = currentSession.active_thread_id || null;
-  const eventThreadId = event.thread_id || event.active_thread_id || event.entry?.thread_id || null;
-  if (eventThreadId && currentThreadId && eventThreadId !== currentThreadId) {
-    return;
-  }
-  if (!shouldAcceptTranscriptRevision(event)) {
+  const outcome = reduceTranscriptEntryPatchEvent({
+    session: currentSession,
+    event,
+    currentThreadId,
+    defaultStatus,
+    rejectStaleRevision: true,
+    enforceBaseRevision: true,
+    useEventKindFallback: true,
+    windowLoaded: transcriptWindowIsLoaded(state, currentThreadId),
+  });
+  if (outcome.kind === "rejected_patch") {
+    if (outcome.reason !== "revision_mismatch") {
+      return;
+    }
     scheduleTranscriptGapRepair(
-      currentThreadId || eventThreadId,
+      currentThreadId || outcome.eventThreadId,
       "entry_patch_revision_mismatch",
       event.revision ?? event.transcript_revision,
-      {
-        base_revision: event.base_revision,
-        current: currentSession.transcript_revision,
-        item: event.item_id || event.entry?.item_id,
-      }
+      outcome.repairDetail
     );
     return;
   }
-
-  const incoming = event.entry || {
-    item_id: event.item_id,
-    entry_seq: event.entry_seq,
-    kind: event.entry_kind || event.kind,
-    status: event.status,
-    text: event.text,
-    tool: event.tool,
-    turn_id: event.turn_id,
-  };
-  const itemId = incoming.item_id || event.item_id;
-  if (!itemId || !Array.isArray(currentSession.transcript)) {
-    return;
-  }
-
-  const entryPatch = {
-    ...incoming,
-    item_id: itemId,
-    kind: incoming.kind || event.entry_kind
-      ? normalizeTranscriptEventEntryKind(incoming.kind || event.entry_kind)
-      : null,
-    status: incoming.status || defaultStatus || "completed",
-    turn_id: incoming.turn_id || event.turn_id || null,
-  };
+  const entryPatch = outcome.entryPatch;
   // Also invalidate the window's own copy for THIS thread — never assume the
   // window's thread agrees with the live thread a patch always targets (a
   // background thread can be pinned view-only, in which case the window
@@ -1308,51 +1146,12 @@ function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null 
   // source for exactly that reason. A no-op when the window isn't loaded for
   // this thread, or doesn't yet track this item.
   applyEntryPatchToWindow(state, currentThreadId, entryPatch);
-  const entryIndex = currentSession.transcript.findIndex((entry) => entry.item_id === itemId);
-  // True when applyEntryPatchToWindow just no-op'd because the window has
-  // never tracked this item at all. renderedTranscriptFromWindow's own
-  // array-fallback means the array append below is never silently dropped by
-  // a later settle — but the window still doesn't know this item exists, so
-  // drive a real hydration merge below to fold it in properly instead of
-  // leaving it permanently array-only.
-  const patchIntroducesUntrackedItem = entryIndex < 0 && transcriptWindowIsLoaded(state, currentThreadId);
-  const nextTranscript = entryIndex >= 0
-    ? currentSession.transcript.map((entry, index) => {
-        if (index !== entryIndex) {
-          return entry;
-        }
-        return {
-          ...entry,
-          ...entryPatch,
-          kind: entryPatch.kind || entry.kind || "agent_text",
-          text: entryPatch.text ?? entry.text ?? null,
-          tool: entryPatch.tool ?? entry.tool ?? null,
-          turn_id: entryPatch.turn_id || entry.turn_id || null,
-        };
-      })
-    : [
-        ...currentSession.transcript,
-        {
-          text: entryPatch.text ?? "",
-          tool: entryPatch.tool ?? null,
-          ...entryPatch,
-          kind: entryPatch.kind || "agent_text",
-        },
-      ];
-
-  const nextSession = {
-    ...currentSession,
-    transcript: nextTranscript,
-  };
-  const eventRevision = numericRevision(event.revision ?? event.transcript_revision);
-  if (eventRevision != null) {
-    nextSession.transcript_revision = eventRevision;
-  }
+  const nextSession = { ...outcome.nextSession };
   if (Number.isSafeInteger(event.server_time)) {
     nextSession.server_time = event.server_time;
   }
-  if (patchIntroducesUntrackedItem) {
-    // currentSession (pre-patch), NOT nextSession: a patch carries no
+  if (outcome.patchIntroducesUntrackedItem) {
+    // currentSession (pre-patch), NOT outcome.nextSession: a patch carries no
     // content_state field, so feeding this item's fabricated array entry to
     // hydration's tail merge (createMergedSnapshotTailPatch, run
     // unconditionally by prepareTranscriptHydrationState whenever this
@@ -1364,7 +1163,7 @@ function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null 
     // "Invalidate and refetch instead of merging a patch-derived session").
     // currentSession never mentions this item, so the merge can only repair
     // OTHER already-tracked entries — renderedTranscriptFromWindow's own
-    // array-fallback already renders this one correctly from nextTranscript
+    // array-fallback already renders this one correctly from outcome.nextTranscript
     // until a genuine snapshot teaches the window about it honestly. Mirrors
     // local's applyLocalTranscriptEntryPatch (local/session/stream.js), which
     // reaches the same place via ensureConversationTranscript(state.session).
@@ -1375,7 +1174,7 @@ function applyTranscriptEntryPatch(event, { defaultStatus = null, reason = null 
   // (completed, failed, cancelled, …) is terminal completion and must paint
   // at once — it is the only signal remote gets for a turn going idle.
   commitLiveSession(nextSession, {
-    immediate: entryPatch.status !== "running",
+    immediate: outcome.terminal,
     reason: reason || "transcript_entry_patch",
   });
 }
@@ -1405,18 +1204,6 @@ function applySessionMetadataPatch(patch, reason = "session_meta_updated") {
   // Approvals, ask-user state, and turn/error status all ride this patch, and
   // remote has no separate live event for any of them — always paint at once.
   commitLiveSession(nextSession, { immediate: true, reason });
-}
-
-function shouldAcceptTranscriptRevision(event) {
-  const currentRevision = numericRevision(
-    currentLiveSession()?.transcript_revision
-  );
-  const eventBaseRevision = numericRevision(event.base_revision);
-  const eventRevision = numericRevision(event.revision ?? event.transcript_revision);
-  if (eventRevision != null && currentRevision != null && eventRevision < currentRevision) {
-    return false;
-  }
-  return !(eventBaseRevision != null && currentRevision != null && eventBaseRevision !== currentRevision);
 }
 
 function currentLiveSession() {
@@ -1527,19 +1314,6 @@ function scheduleTranscriptFlush({ immediate = false, chars = 0, reason } = {}) 
   }
 }
 
-function normalizeTranscriptEventEntryKind(kind) {
-  if (
-    kind === "user_text"
-    || kind === "agent_text"
-    || kind === "command"
-    || kind === "tool_call"
-    || kind === "reasoning"
-  ) {
-    return kind;
-  }
-  return transcriptDeltaKindToEntryKind(kind || "agent_text");
-}
-
 function upsertApproval(approvals, incoming) {
   const existingIndex = approvals.findIndex(
     (approval) => approval?.request_id === incoming.request_id
@@ -1550,14 +1324,6 @@ function upsertApproval(approvals, incoming) {
   return approvals.map((approval, index) =>
     index === existingIndex ? { ...approval, ...incoming } : approval
   );
-}
-
-function numericRevision(value) {
-  return Number.isSafeInteger(value) ? value : null;
-}
-
-function numericOffset(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 export async function syncRemoteSnapshot(reason, silent = false) {
