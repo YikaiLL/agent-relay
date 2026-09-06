@@ -511,3 +511,141 @@ test("scroll fallback fires onLoad when IntersectionObserver is unavailable", as
   dispose();
   delete globalThis.requestAnimationFrame;
 });
+
+// --- scroll fallback lifecycle (no requestAnimationFrame) ------------------
+//
+// Node has no global requestAnimationFrame, so these exercise the real
+// setTimeout(cb, 16) branch. The bug they pin: dispose() only ever tried
+// cancelAnimationFrame, which cannot cancel a setTimeout, so a frame queued
+// before teardown still fired and called onLoad afterwards.
+
+// Long enough for the fallback's own 16ms timer to have fired if it were
+// still live.
+const flushFallbackFrame = () => new Promise((resolve) => setTimeout(resolve, 40));
+
+function makeFallbackScrollEl({ scrollTop = 0 } = {}) {
+  const listeners = new Set();
+  return {
+    scrollTop,
+    addEventListener: (_type, handler) => listeners.add(handler),
+    removeEventListener: (_type, handler) => listeners.delete(handler),
+    // Only handlers still registered fire — a detached loader that forgot to
+    // remove its listener would be caught here too.
+    emitScroll() {
+      for (const handler of [...listeners]) {
+        handler();
+      }
+    },
+    listenerCount: () => listeners.size,
+  };
+}
+
+test("scroll fallback: detach cancels a frame queued before teardown so onLoad never fires", async () => {
+  assert.equal(
+    typeof globalThis.requestAnimationFrame,
+    "undefined",
+    "precondition: this test must exercise the setTimeout branch"
+  );
+  const scrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+  let calls = 0;
+
+  const dispose = createTranscriptHistoryLoader({
+    ObserverCtor: null,
+    onLoad: () => {
+      calls += 1;
+    },
+    scrollElement: scrollEl,
+    sentinelElement: { id: "sentinel" },
+  });
+
+  // A scroll queues the fallback frame, which is still pending 16ms out.
+  scrollEl.emitScroll();
+  assert.equal(calls, 0, "the frame has not run yet");
+
+  // Torn down (unmount, or the sentinel being replaced) before it runs.
+  dispose();
+  assert.equal(scrollEl.listenerCount(), 0, "detach removes its scroll listener");
+
+  await flushFallbackFrame();
+  assert.equal(calls, 0, "a frame queued before detach must not call onLoad afterwards");
+});
+
+test("scroll fallback: a replacement loader does not overlap the detached one", async () => {
+  assert.equal(
+    typeof globalThis.requestAnimationFrame,
+    "undefined",
+    "precondition: this test must exercise the setTimeout branch"
+  );
+  const scrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+  const calls = [];
+
+  const disposeFirst = createTranscriptHistoryLoader({
+    ObserverCtor: null,
+    onLoad: () => {
+      calls.push("first");
+    },
+    scrollElement: scrollEl,
+    sentinelElement: { id: "A" },
+  });
+
+  // The first loader has a frame in flight when its sentinel is replaced.
+  scrollEl.emitScroll();
+  disposeFirst();
+
+  const disposeSecond = createTranscriptHistoryLoader({
+    ObserverCtor: null,
+    onLoad: () => {
+      calls.push("second");
+    },
+    scrollElement: scrollEl,
+    sentinelElement: { id: "B" },
+  });
+  assert.equal(scrollEl.listenerCount(), 1, "only the replacement loader is listening");
+
+  scrollEl.emitScroll();
+  await flushFallbackFrame();
+
+  assert.deepEqual(
+    calls,
+    ["second"],
+    "only the replacement loader may load; the detached one's queued frame must stay silent"
+  );
+
+  disposeSecond();
+});
+
+test("scroll fallback: a frame that survives cancellation is still suppressed by detach", async () => {
+  // Environments that hand out a scheduler with no matching canceller (a
+  // partial rAF polyfill) cannot be cleaned up by cancelling, so the callback
+  // itself has to check whether it is still owned.
+  const scrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+  let calls = 0;
+  let queuedFrame = null;
+  globalThis.requestAnimationFrame = (cb) => {
+    queuedFrame = cb;
+    return 1;
+  };
+
+  try {
+    const dispose = createTranscriptHistoryLoader({
+      ObserverCtor: null,
+      onLoad: () => {
+        calls += 1;
+      },
+      scrollElement: scrollEl,
+      sentinelElement: { id: "sentinel" },
+    });
+
+    scrollEl.emitScroll();
+    assert.equal(typeof queuedFrame, "function", "a frame is queued and uncancellable");
+
+    dispose();
+    // The environment runs it anyway — nothing could have cancelled it.
+    queuedFrame();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(calls, 0, "a detached fallback's callback must not call onLoad");
+  } finally {
+    delete globalThis.requestAnimationFrame;
+  }
+});

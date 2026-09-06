@@ -204,35 +204,54 @@ function nextFrame() {
 
 function attachScrollFallback({ scrollElement, onLoad }) {
   let pending = false;
-  let rafHandle = null;
+  let frameHandle = null;
+  // Cancelling has to match how the frame was scheduled: the setTimeout branch
+  // below needs clearTimeout, and the old teardown only ever tried
+  // cancelAnimationFrame — so without rAF a detached fallback's callback still
+  // fired and called onLoad, overlapping whatever loader replaced it.
+  let cancelFrame = null;
+  // Belt-and-braces for the environments that supply a scheduler but no
+  // matching canceller: an already-queued callback still has to stay silent
+  // once this fallback is detached.
+  let disposed = false;
+  // Resolved per schedule, not once at attach, so this keeps the original
+  // behaviour in an environment that gains rAF after the listener is bound.
+  function scheduleFrame(cb) {
+    if (typeof requestAnimationFrame === "function") {
+      cancelFrame = typeof cancelAnimationFrame === "function" ? cancelAnimationFrame : null;
+      return requestAnimationFrame(cb);
+    }
+    cancelFrame = clearTimeout;
+    return setTimeout(cb, 16);
+  }
   const handler = () => {
-    if (rafHandle != null) {
+    if (disposed || frameHandle != null) {
       return;
     }
-    rafHandle = (typeof requestAnimationFrame === "function"
-      ? requestAnimationFrame
-      : (cb) => setTimeout(cb, 16))(() => {
-        rafHandle = null;
-        if (pending) {
-          return;
-        }
-        if ((scrollElement.scrollTop || 0) > 80) {
-          return;
-        }
-        pending = true;
-        Promise.resolve()
-          .then(() => onLoad())
-          .catch(() => {})
-          .finally(() => {
-            pending = false;
-          });
-      });
+    frameHandle = scheduleFrame(() => {
+      frameHandle = null;
+      if (disposed || pending) {
+        return;
+      }
+      if ((scrollElement.scrollTop || 0) > 80) {
+        return;
+      }
+      pending = true;
+      Promise.resolve()
+        .then(() => onLoad())
+        .catch(() => {})
+        .finally(() => {
+          pending = false;
+        });
+    });
   };
   scrollElement.addEventListener("scroll", handler, { passive: true });
   return () => {
+    disposed = true;
     scrollElement.removeEventListener("scroll", handler);
-    if (rafHandle != null && typeof cancelAnimationFrame === "function") {
-      cancelAnimationFrame(rafHandle);
+    if (frameHandle != null) {
+      cancelFrame?.(frameHandle);
+      frameHandle = null;
     }
   };
 }
