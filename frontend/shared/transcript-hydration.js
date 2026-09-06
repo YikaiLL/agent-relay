@@ -81,8 +81,8 @@ export async function hydrateTranscript(
       // appended) — still present in `entries`, never rendered again, and
       // unrecoverable, since a later same-id merge only re-adds an id that is
       // new to `entries`. `createMergedTranscriptHydrationPagePatch`'s
-      // non-prepend branch now splices via `mergeTailPageOrder`
-      // (transcript-hydration-store.js) instead, which keeps anything the
+      // non-prepend branch now delegates to `mergeTailPageOrder`
+      // (shared/authoritative-tail-merge.js) instead, which keeps anything the
       // page does not carry above or below it rather than dropping it — see
       // "a tail page merges into the loaded window instead of replacing its
       // order" (transcript-hydration-store.test.mjs). That closed the

@@ -2,6 +2,11 @@ import {
   normalizeTranscriptDeltaKind,
   resolveDeltaAppend,
 } from "./transcript-event-reducer.js";
+import {
+  reconcileAuthoritativeTail,
+  selectTranscriptText,
+  uniqueItemIds,
+} from "./authoritative-tail-merge.js";
 
 export function createClearedTranscriptHydrationPatch() {
   return {
@@ -527,14 +532,18 @@ export function createMergedTranscriptHydrationPagePatch(
     prepareEntry = defaultPrepareTranscriptEntry,
   } = {}
 ) {
+  if (!prepend) {
+    return createMergedTailPagePatch(state, page, prepareEntry);
+  }
+
   let workingState = state;
   let accumulatedPatch = null;
-  // A page load (cold hydration / older-history prepend) legitimately
-  // materializes the full window. This is user-paced (scroll / initial load),
-  // not a per-streaming-snapshot cost, so the O(n) copy here is acceptable.
+  // A page load (older-history prepend) legitimately materializes the full
+  // window. This is user-paced (scroll-up), not a per-streaming-snapshot
+  // cost, so the O(n) copy here is acceptable.
   noteFullWindowCopy();
   const nextEntries = new Map(state.transcriptHydrationEntries);
-  const nextOrder = prepend ? [...state.transcriptHydrationOrder] : [];
+  const nextOrder = [...state.transcriptHydrationOrder];
   const pageItemIds = [];
 
   for (const entry of page.entries || []) {
@@ -566,13 +575,11 @@ export function createMergedTranscriptHydrationPagePatch(
     pageItemIds.push(itemId);
   }
 
-  const nextOrderValue = prepend
-    ? uniqueItemIds([...pageItemIds, ...nextOrder])
-    : mergeTailPageOrder(state.transcriptHydrationOrder, pageItemIds);
+  const nextOrderValue = uniqueItemIds([...pageItemIds, ...nextOrder]);
   const nextStatus =
     page.prev_cursor == null
       ? "complete"
-      : state.transcriptHydrationTailReady || !prepend
+      : state.transcriptHydrationTailReady
         ? "idle"
         : "loading";
 
@@ -587,44 +594,68 @@ export function createMergedTranscriptHydrationPagePatch(
   };
 }
 
-// Splice a TAIL page's ids into the window's order instead of replacing it.
-//
-// A tail page is authoritative for the ids it carries and for their relative
-// order — but it is NOT the whole window. Older pages the reader scrolled in sit
-// above it, and an id a live SSE delta appended after the page was built sits
-// below it. Replacing `order` with the page's ids therefore ORPHANED those:
-// still present in `entries`, never rendered again, and unrecoverable, because
-// both re-add sites only fire for ids that are new to `entries`.
-//
-// Everything in the window before the page's first known id stays above the
-// page; everything after it stays below. O(window), which is fine here — a page
-// merge is user-paced (cold hydration / scroll-up) and already copies the map;
-// it is the per-SNAPSHOT path that must stay proportional to the tail.
-function mergeTailPageOrder(existingOrder, pageItemIds) {
-  if (!existingOrder?.length) {
-    return uniqueItemIds(pageItemIds);
-  }
-  const pageIds = new Set(pageItemIds);
-  const above = [];
-  const below = [];
-  let reachedPage = false;
-  for (const itemId of existingOrder) {
-    if (pageIds.has(itemId)) {
-      reachedPage = true;
+// The non-prepend (tail-refresh) path delegates its order and never-shorten
+// merge policy to the shared primitive (authoritative-tail-merge.js) — the
+// same one Remote's session-ops.js uses for its own tail repair. This keeps
+// only what is genuinely store state: the `prepareEntry` hook (entry
+// normalization + any surface-specific cache patch) and the
+// status/tailReady/lastFetchAt fields.
+function createMergedTailPagePatch(state, page, prepareEntry) {
+  let workingState = state;
+  let accumulatedPatch = null;
+  // A page load (cold hydration / a client-detected gap repair) legitimately
+  // materializes the full window. This is user-paced, not a
+  // per-streaming-snapshot cost, so the O(n) copy here is acceptable.
+  noteFullWindowCopy();
+
+  const preparedPageEntries = [];
+  for (const entry of page.entries || []) {
+    const itemId = entry?.item_id;
+    if (!itemId) {
       continue;
     }
-    (reachedPage ? below : above).push(itemId);
+
+    const prepared = prepareEntry(
+      workingState,
+      page.thread_id || state.transcriptHydrationThreadId,
+      entry
+    ) || {};
+    if (prepared.patch) {
+      accumulatedPatch = {
+        ...(accumulatedPatch || {}),
+        ...prepared.patch,
+      };
+      workingState = {
+        ...workingState,
+        ...prepared.patch,
+      };
+    }
+    preparedPageEntries.push(toTranscriptEntry(prepared.entry || entry));
   }
-  if (!reachedPage) {
-    // Nothing in the window is in the page, so there is no split point. The
-    // window cannot be OLDER than a tail page it does not intersect — older
-    // pages are only ever prepended onto a window that already holds the tail —
-    // so whatever is here is NEWER: a live delta that landed before this page
-    // did (a just-cleared window on a thread switch can hold nothing else).
-    // Keep it below the page rather than stranding it above.
-    return uniqueItemIds([...pageItemIds, ...above]);
-  }
-  return uniqueItemIds([...above, ...pageItemIds, ...below]);
+
+  const result = reconcileAuthoritativeTail({
+    order: state.transcriptHydrationOrder,
+    entries: state.transcriptHydrationEntries,
+    pageEntries: preparedPageEntries,
+    // This layer does not own the session revision (that lives on the
+    // rendered session, not the hydration window) — no revision inputs are
+    // supplied, and `result.revision` below is deliberately ignored; that is
+    // not a dropped result.
+    prevCursor: page.prev_cursor,
+    mergeEntry: mergeTranscriptEntry,
+  });
+
+  const nextStatus = page.prev_cursor == null ? "complete" : "idle";
+
+  return {
+    ...(accumulatedPatch || {}),
+    transcriptHydrationEntries: result.entries,
+    transcriptHydrationLastFetchAt: Date.now(),
+    transcriptHydrationOrder: result.order,
+    transcriptHydrationOlderCursor: result.olderCursor,
+    transcriptHydrationStatus: nextStatus,
+    transcriptHydrationTailReady: result.order.length > 0,
+  };
 }
 
 // Merge an ORDERED run of ids — a snapshot tail, which arrives in the server's
@@ -1201,24 +1232,6 @@ function prepareSnapshotOverlayEntry(existing, entry) {
   return incoming;
 }
 
-function selectTranscriptText(existingText, incomingText, existingFull = true, incomingFull = true) {
-  if (incomingText == null) {
-    return existingText ?? null;
-  }
-  if (existingText == null) {
-    return incomingText;
-  }
-  // Keep a cached full body over a non-authoritative (preview) incoming body ONLY
-  // when our cache is at least as long — i.e. genuinely more complete. A stale
-  // partial cache is SHORTER than the grown preview the server now ships, so the
-  // longer one must win (otherwise the entry freezes on the partial). No
-  // "..."-suffix inference; fullness comes from content_state and length.
-  if (existingFull && !incomingFull && existingText.length >= incomingText.length) {
-    return existingText;
-  }
-  return incomingText.length >= existingText.length ? incomingText : existingText;
-}
-
 function mergeToolView(existingTool, incomingTool, existingFull = true, incomingFull = true) {
   if (!existingTool) {
     return incomingTool || null;
@@ -1283,17 +1296,4 @@ function collapseEntryParts(parts) {
     .sort((left, right) => (left?.part_index ?? 0) - (right?.part_index ?? 0))
     .map((part) => part?.text || "")
     .join("") || null;
-}
-
-function uniqueItemIds(itemIds) {
-  const seen = new Set();
-  const unique = [];
-  for (const itemId of itemIds) {
-    if (!itemId || seen.has(itemId)) {
-      continue;
-    }
-    seen.add(itemId);
-    unique.push(itemId);
-  }
-  return unique;
 }

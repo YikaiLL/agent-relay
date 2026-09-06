@@ -6000,6 +6000,138 @@ test("repairActiveTranscriptTail resyncs the loaded window to the repaired text 
   remoteQueryClient.clear();
 });
 
+// Regression for the shared authoritative-tail-merge primitive
+// (shared/authoritative-tail-merge.js): repairActiveTranscriptTail's merge is
+// now delegated to it end to end, replacing the old hand-rolled
+// olderKept/repairedTail block. This proves three of the primitive's
+// invariants actually reach `state.realSession.transcript` through that
+// seam, not just an internal patch:
+//   - an entry AFTER the page's intersection point stays after it — the old
+//     merge put every non-page entry first regardless of which side it was on;
+//   - a shorter authoritative page body never shortens already-visible text;
+//   - an entry with no item_id (Remote's array alone can hold these; they are
+//     not addressable) keeps its original relative position instead of being
+//     dropped by the id-keyed merge.
+test("repairActiveTranscriptTail's order/never-shorten/positionless invariants reach the rendered transcript", async () => {
+  activeBrowser = installBrowserStubs();
+  const sentPayloads = [];
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+  const { applySessionSnapshot, applyTranscriptDelta, clearSessionRuntime } =
+    await import("./session-ops.js");
+  const { remoteQueryClient } = await import("./query-client.js");
+
+  clearSessionRuntime();
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-repair-order-flip",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-order-flip" });
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+
+  applySessionSnapshot({
+    active_thread_id: "thread-order-flip",
+    active_turn_id: "turn-1",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript_truncated: false,
+    transcript_revision: 5,
+    transcript: [
+      { item_id: "item-before", kind: "agent_text", status: "completed", text: "Before", turn_id: "turn-0", tool: null },
+      // No item_id — not addressable by id, and must keep its place.
+      { kind: "system_notice", text: "connection restored" },
+      {
+        item_id: "item-shared",
+        kind: "agent_text",
+        status: "running",
+        text: "Hello world, the full streamed message",
+        turn_id: "turn-1",
+        tool: null,
+      },
+      { item_id: "item-after", kind: "agent_text", status: "completed", text: "After", turn_id: "turn-2", tool: null },
+    ],
+  });
+  state.transcriptHydrationThreadId = "thread-order-flip";
+  state.transcriptHydrationEntries = new Map([
+    ["item-before", { ...state.session.transcript[0], content_state: "full" }],
+    ["item-shared", { ...state.session.transcript[2], content_state: "full" }],
+    ["item-after", { ...state.session.transcript[3], content_state: "full" }],
+  ]);
+  state.transcriptHydrationOrder = ["item-before", "item-shared", "item-after"];
+
+  state.socket = {
+    readyState: 1,
+    send(frameText) {
+      const frame = JSON.parse(frameText);
+      sentPayloads.push(frame.payload);
+      setImmediate(async () => {
+        await handleRemoteBrokerPayload({
+          kind: "remote_action_result",
+          action_id: frame.payload.action_id,
+          action: "fetch_thread_transcript",
+          ok: true,
+          snapshot: {},
+          thread_transcript: {
+            thread_id: "thread-order-flip",
+            revision: 8,
+            // Only refreshes item-shared, with a body SHORTER than what is
+            // already visible — never-shorten must keep the longer one.
+            entries: [
+              { item_id: "item-shared", kind: "agent_text", text: "Hello", status: "completed", turn_id: "turn-1", tool: null },
+            ],
+            prev_cursor: null,
+          },
+        });
+      });
+    },
+  };
+
+  // A genuine offset gap forces the tail repair.
+  applyTranscriptDelta({
+    thread_id: "thread-order-flip",
+    item_id: "item-shared",
+    turn_id: "turn-1",
+    delta: "!!",
+    delta_kind: "agent_text",
+    text_offset: 999,
+  });
+
+  await waitFor(() =>
+    state.realSession?.transcript?.find((entry) => entry.item_id === "item-shared")?.status === "completed"
+  );
+  assert.equal(sentPayloads.length, 1);
+
+  assert.deepEqual(
+    state.realSession.transcript.map((entry) => entry.item_id || entry.kind),
+    ["item-before", "system_notice", "item-shared", "item-after"],
+    "item-after must stay AFTER the repaired entry, and the id-less entry must keep its original position"
+  );
+  assert.equal(
+    state.realSession.transcript.find((entry) => entry.item_id === "item-shared")?.text,
+    "Hello world, the full streamed message",
+    "a shorter authoritative page body must not shorten already-visible text"
+  );
+
+  clearSessionRuntime();
+  state.socket = null;
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+});
+
 // The resync above must not become a blanket "trust everything again": an
 // item the bounded repair page does NOT reach (still tracked in the window
 // from before, e.g. retained older history) has nothing authoritative to
