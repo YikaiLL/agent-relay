@@ -61,9 +61,12 @@ function flushMicrotasks(times = 30) {
   return chain;
 }
 
-function entriesFor(count) {
+// `salt` mints a distinct user-entry id for a thread the test already visited
+// under the same id, so a fire-once check exercises a genuinely fresh
+// message instead of accidentally colliding with one already anchored.
+function entriesFor(count, salt = "") {
   return Array.from({ length: count }, (_, index) => ({
-    item_id: `item-${index}`,
+    item_id: `item${salt}-${index}`,
     kind: index === 0 ? "user_text" : "assistant_text",
     text: `line ${index}`,
   }));
@@ -79,10 +82,11 @@ function baseProps(overrides = {}) {
     getStandbyEmptyContent: () => h("div", { className: "standby-empty-marker" }, "Standby"),
     getTranscriptOptions: () => ({}),
     hydrationLoading: false,
-    onAfterTranscriptCommit: () => {},
     onLoadOlderTranscript: () => {},
+    promotion: null,
     readyCopy: "The agent is connected.",
     requestedSessionLabel: "",
+    resetEpoch: 0,
     scrollElement: null,
     session: { active_thread_id: null },
     shortId: (value) => (value ? String(value).slice(0, 8) : "unknown"),
@@ -95,6 +99,40 @@ function baseProps(overrides = {}) {
     viewingDifferentThread: false,
     ...overrides,
   };
+}
+
+// Scroll-bookkeeping coverage below needs real geometry: height derives from
+// the rendered entries and scrollTop clamps like a real browser's. The
+// hook's own exhaustive behavior coverage lives in
+// local-transcript-scroll-bookkeeping.dom.test.mjs; these tests only prove
+// the panel wires activeThreadId/mode/promotion/resetEpoch through to it.
+const SCROLL_CLIENT_HEIGHT = 266;
+const SCROLL_ROW_HEIGHT = 46;
+const scrollLaidOut = new WeakSet();
+function installScrollLayout(element) {
+  if (scrollLaidOut.has(element)) {
+    return;
+  }
+  scrollLaidOut.add(element);
+  let top = 0;
+  const maxScrollTop = () => Math.max(0, element.scrollHeight - element.clientHeight);
+  Object.defineProperty(element, "clientHeight", { get: () => SCROLL_CLIENT_HEIGHT });
+  Object.defineProperty(element, "scrollHeight", {
+    get: () =>
+      Math.max(
+        SCROLL_CLIENT_HEIGHT,
+        element.querySelectorAll("[data-transcript-entry-id]").length * SCROLL_ROW_HEIGHT
+      ),
+  });
+  Object.defineProperty(element, "scrollTop", {
+    get: () => {
+      top = Math.min(top, maxScrollTop());
+      return top;
+    },
+    set: (value) => {
+      top = Math.max(0, Math.min(Number(value) || 0, maxScrollTop()));
+    },
+  });
 }
 
 function mount() {
@@ -247,43 +285,82 @@ test("branch 5 falls through to branch 6 when approval is truthy with zero entri
   }
 });
 
-test("onAfterTranscriptCommit fires once per commit on branches 5/6, and never on branches 1-4", () => {
+test("branches 1-4 never run a scroll action; branches 5/6 do, and a branch-5 first message anchors fresh", () => {
   const view = mount();
-  const commits = [];
-  const onAfterTranscriptCommit = (scrollElement) => commits.push(scrollElement);
+  installScrollLayout(view.host);
   try {
-    view.render({ viewingConversation: false, viewedThreadLocked: true, onAfterTranscriptCommit });
-    assert.equal(commits.length, 0, "branch 1 must not run scroll bookkeeping");
+    // Branch 6 lands on thread-a and the reader escapes to read history.
+    view.render({ activeThreadId: "thread-a", entries: entriesFor(8) });
+    const bottom = view.host.scrollTop;
+    view.host.scrollTop = bottom - 40;
 
-    view.render({
-      viewingConversation: false,
-      viewingDifferentThread: true,
-      onAfterTranscriptCommit,
-    });
-    assert.equal(commits.length, 0, "branch 2 must not run scroll bookkeeping");
+    // None of branches 1-4 may run a scroll action -- proven below by the
+    // retained offset surviving all four untouched.
+    view.render({ viewingConversation: false, viewedThreadLocked: true });
+    view.render({ viewingConversation: false, viewingDifferentThread: true });
+    view.render({ viewingConversation: false, activeThreadId: "thread-live" });
+    view.render({ entries: [], viewOnly: true });
 
-    view.render({
-      viewingConversation: false,
-      activeThreadId: "thread-live",
-      onAfterTranscriptCommit,
-    });
-    assert.equal(commits.length, 0, "branch 3 must not run scroll bookkeeping");
-
-    view.render({ entries: [], viewOnly: true, onAfterTranscriptCommit });
-    assert.equal(commits.length, 0, "branch 4 must not run scroll bookkeeping");
-
-    view.render({ entries: [], approval: null, onAfterTranscriptCommit });
-    assert.equal(commits.length, 1, "branch 5 must run scroll bookkeeping exactly once for this commit");
-    assert.equal(commits[0], view.host);
-
-    view.render({ entries: entriesFor(1), onAfterTranscriptCommit });
-    assert.equal(commits.length, 2, "branch 6 must run scroll bookkeeping exactly once for this commit");
-
-    view.render({ entries: entriesFor(2), onAfterTranscriptCommit });
+    view.render({ activeThreadId: "thread-a", entries: entriesFor(8) });
     assert.equal(
-      commits.length,
-      3,
-      "a re-render that stays on branch 6 still counts as its own commit"
+      view.host.scrollTop,
+      bottom - 40,
+      "branches 1-4 must not have run a scroll action against thread-a's retained offset"
+    );
+
+    // Branch 5 (a genuinely empty, ready thread) runs its own scroll action
+    // too: its first message must anchor at a fresh bottom, not restore
+    // stale history -- the observable proof branch 5 staged a commit (see
+    // local-transcript-scroll-bookkeeping.dom.test.mjs for the mechanism).
+    // Row count stays under transcript-react.js's virtualization threshold
+    // (20) so every row actually lands in the DOM for the fake layout to see.
+    view.render({ entries: [], approval: null, activeThreadId: "thread-b" });
+    view.render({ entries: entriesFor(15), activeThreadId: "thread-b" });
+    assert.equal(
+      view.host.scrollTop,
+      15 * SCROLL_ROW_HEIGHT - SCROLL_CLIENT_HEIGHT,
+      "branch 5's own scroll action landed the first message at a fresh bottom"
+    );
+  } finally {
+    view.unmount();
+  }
+});
+
+test("a promotion prop reaches the hook and rekeys the retained offset onto the new thread id", () => {
+  const view = mount();
+  installScrollLayout(view.host);
+  try {
+    view.render({ activeThreadId: "pend-A", entries: entriesFor(8) });
+    const bottom = view.host.scrollTop;
+    view.host.scrollTop = bottom - 40;
+    view.render({ activeThreadId: "decoy", entries: [] }); // evicts pend-A's offset
+
+    const promotion = { from: "pend-A", to: "real-A" };
+    view.render({ activeThreadId: "real-A", entries: entriesFor(15), promotion });
+    assert.equal(
+      view.host.scrollTop,
+      bottom - 40,
+      "the promotion prop must reach the hook and rekey pend-A's retained offset onto real-A"
+    );
+  } finally {
+    view.unmount();
+  }
+});
+
+test("a resetEpoch bump reaches the hook and clears the retained offset", () => {
+  const view = mount();
+  installScrollLayout(view.host);
+  try {
+    view.render({ activeThreadId: "thread-a", entries: entriesFor(8), resetEpoch: 0 });
+    const bottom = view.host.scrollTop;
+    view.host.scrollTop = bottom - 40;
+    view.render({ activeThreadId: "decoy", entries: [], resetEpoch: 0 }); // evicts the offset
+
+    view.render({ activeThreadId: "thread-a", entries: entriesFor(8), resetEpoch: 1 });
+    assert.equal(
+      view.host.scrollTop,
+      bottom,
+      "the resetEpoch bump must reach the hook and clear the retained offset"
     );
   } finally {
     view.unmount();

@@ -205,7 +205,6 @@ import { selectStatusBadge } from "./status-badge.js";
 import { selectHeaderLabels } from "../shared/header-labels.js";
 import { selectStandbyEmptyModel, buildStandbyEmptyActions } from "./standby-empty-state.js";
 import {
-  findPendingInputRequestIds,
   pendingAskUserQuestionsForThread,
   sessionIsWorking,
   threadAttention,
@@ -215,12 +214,6 @@ import {
   ensureNotificationPermission,
   isDocumentForeground,
 } from "../shared/thread-notify.js";
-import {
-  captureTranscriptScrollSnapshot,
-  readTranscriptScrollPosition,
-  rememberTranscriptScrollPosition,
-  restoreTranscriptScrollPosition,
-} from "../shared/transcript-scroll.js";
 import { LocalTranscriptPanel } from "./local-transcript-panel.js";
 
 const h = React.createElement;
@@ -1519,17 +1512,6 @@ export function createSessionRenderer({
     ));
   }
 
-  // Hoisted once per renderer instance for the same reason as
-  // getTranscriptOptions above: the panel's layout effect closes over this
-  // prop identity for the component's whole lifetime, so a fresh function
-  // every render would defeat the point of passing it as a prop rather than
-  // an inline callback. renderTranscript stages which commit (if any) applies
-  // to THIS render into `pendingScrollCommit` right before calling this.
-  let pendingScrollCommit = null;
-  function onAfterTranscriptCommit(scrollElement) {
-    pendingScrollCommit?.(scrollElement);
-  }
-
   function renderTranscript(session, approval) {
     const viewingConversation = isViewingConversation(session);
     const entries = session.transcript || [];
@@ -1562,9 +1544,8 @@ export function createSessionRenderer({
         activeThread?.name || activeThread?.preview || shortId(session.active_thread_id);
     }
 
-    // LocalTranscriptPanel re-derives the same dispatch from these same
-    // booleans (see there for the full six-branch order); mirrored here only
-    // far enough to know whether the scroll-bookkeeping half below applies.
+    // Mirrors LocalTranscriptPanel's six-branch dispatch (see there) just far
+    // enough to know whether pendingTranscriptOptionsInput below applies.
     const exitsViaOverviewBranches =
       !viewingConversation &&
       (viewedThreadLocked || viewingDifferentThread || Boolean(activeThreadId));
@@ -1572,122 +1553,6 @@ export function createSessionRenderer({
     const viewOnlyReviewView = viewOnlyEmpty ? Boolean(state.viewOnlyThread?.review) : false;
     const emptyReady = !exitsViaOverviewBranches && !viewOnlyEmpty && !entries.length && !approval;
     const showsEntries = !exitsViaOverviewBranches && !viewOnlyEmpty && !emptyReady;
-
-    // The pre-render half of scroll bookkeeping has to run here, before the
-    // swap: React mutates the DOM before any cleanup runs, so a layout effect
-    // would only ever see the new thread's already-clamped scrollTop. The
-    // post-commit half is staged as a closure below into `pendingScrollCommit`
-    // (reset first, in case neither branch below applies to this render), and
-    // the panel calls the STABLE onAfterTranscriptCommit dispatcher above from
-    // a layout effect once the commit lands.
-    pendingScrollCommit = null;
-
-    if (emptyReady) {
-      // Leaving another thread for this empty one: retain its reading offset
-      // BEFORE rendering the empty state — the swap shrinks the transcript
-      // and the browser clamps the live scrollTop, so reading it afterwards
-      // would retain a clamped (often zero) offset instead of the reader's
-      // place. Mirrors the ordering and bounded-eviction cleanup of the
-      // non-empty thread-switch path below.
-      const emptyThreadId = activeThreadId;
-      const previousEmptySnapshot = state.localTranscriptScrollSnapshot || null;
-      if (
-        previousEmptySnapshot?.activeThreadId
-        && previousEmptySnapshot.activeThreadId !== emptyThreadId
-      ) {
-        if (!state.localTranscriptScrollPositions) {
-          state.localTranscriptScrollPositions = new Map();
-        }
-        const evictedThreadId = rememberTranscriptScrollPosition(
-          state.localTranscriptScrollPositions,
-          previousEmptySnapshot.activeThreadId,
-          transcript
-        );
-        if (evictedThreadId) {
-          state.localTranscriptScrollAnchors?.delete?.(evictedThreadId);
-        }
-      }
-
-      // Record the (empty) scroll snapshot for this genuinely-empty ready
-      // thread. Without it, the FIRST entries would classify as "first view of
-      // a thread" (jump-bottom, which briefly makes the follower sticky)
-      // instead of "new user message" (anchor-user) — the first prompt must
-      // anchor exactly like every later send. Deliberately NOT done for the
-      // loading/view-only branches above: their entries arrive as loaded
-      // history and must keep landing via jump-bottom.
-      pendingScrollCommit = (scrollElement) => {
-        state.localTranscriptScrollSnapshot = captureTranscriptScrollSnapshot({
-          entries: [],
-          scrollElement,
-          threadId: emptyThreadId,
-        });
-      };
-    } else if (showsEntries) {
-      const previousSnapshot = state.localTranscriptScrollSnapshot || null;
-      const localThreadId = activeThreadId;
-      if (!state.localTranscriptScrollAnchors) {
-        state.localTranscriptScrollAnchors = new Map();
-      }
-      if (!state.localTranscriptScrollPositions) {
-        state.localTranscriptScrollPositions = new Map();
-      }
-      let restoredScrollPosition = null;
-      if (
-        previousSnapshot?.activeThreadId
-        && previousSnapshot.activeThreadId !== localThreadId
-      ) {
-        const evictedThreadId = rememberTranscriptScrollPosition(
-          state.localTranscriptScrollPositions,
-          previousSnapshot.activeThreadId,
-          transcript
-        );
-        if (evictedThreadId) {
-          state.localTranscriptScrollAnchors.delete(evictedThreadId);
-        }
-        restoredScrollPosition = readTranscriptScrollPosition(
-          state.localTranscriptScrollPositions,
-          localThreadId
-        );
-      }
-      const anchorsForThread =
-        state.localTranscriptScrollAnchors.get(localThreadId) || new Set();
-
-      pendingScrollCommit = (scrollElement) => {
-        const action = restoreTranscriptScrollPosition({
-          alreadyAnchoredUserIds: anchorsForThread,
-          nextEntries: entries,
-          nextThreadId: localThreadId,
-          // An approval / AskUser question is not a transcript entry, so it needs its
-          // own trigger to be brought into view when it arrives (it renders last, at
-          // the bottom). Fire-once, keyed on the request ids — plural because a
-          // second question can arrive while the first is still outstanding.
-          pendingInputRequestIds: findPendingInputRequestIds(session, localThreadId),
-          previousSnapshot,
-          restoredScrollPosition,
-          scrollElement,
-        });
-        // Record what this action handled. New-message actions use this to avoid
-        // re-jumping mid-stream; thread-transition actions use it to establish the
-        // loaded transcript as a baseline so the next snapshot cannot mistake
-        // retained history for a newly-sent message. One Set serves both kinds —
-        // request ids are namespaced, so they cannot collide with item ids.
-        const handledScrollIds = [
-          action?.userEntryId,
-          ...(action?.inputRequestIds || []),
-        ].filter(Boolean);
-        if (handledScrollIds.length) {
-          for (const handledId of handledScrollIds) {
-            anchorsForThread.add(handledId);
-          }
-          state.localTranscriptScrollAnchors.set(localThreadId, anchorsForThread);
-        }
-        state.localTranscriptScrollSnapshot = captureTranscriptScrollSnapshot({
-          entries,
-          scrollElement,
-          threadId: localThreadId,
-        });
-      };
-    }
 
     if (showsEntries) {
       const localUi = readLocalUiState(state.localUiStore);
@@ -1749,10 +1614,11 @@ export function createSessionRenderer({
         getStandbyEmptyContent: buildStandbyEmptyContent,
         getTranscriptOptions,
         hydrationLoading: shouldShowTranscriptLoading(session, state),
-        onAfterTranscriptCommit,
         onLoadOlderTranscript: loadOlderTranscript,
+        promotion: state.localTranscriptScrollPromotion,
         readyCopy: `${providerLabel(session?.provider) || "The agent"} is connected. Send the first prompt below when you're ready.`,
         requestedSessionLabel,
+        resetEpoch: state.localTranscriptScrollResetEpoch,
         scrollElement: transcript,
         session,
         shortId,

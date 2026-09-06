@@ -3,15 +3,13 @@ import React, { useLayoutEffect, useRef } from "react";
 import { ConversationEmptyState } from "../shared/conversation.js";
 import { TranscriptPane } from "../shared/transcript-pane.js";
 import { attachTranscriptHistoryLoader } from "../shared/transcript-history-loader.js";
+import { useLocalTranscriptScrollBookkeeping } from "./use-local-transcript-scroll-bookkeeping.js";
 
 const h = React.createElement;
 
 // Owns the six branches render-session.js's renderTranscript used to pick
-// imperatively, plus the transcript history loader's attach/sync/detach
-// lifecycle. renderTranscript keeps the pre-render half of scroll bookkeeping
-// (React commits DOM mutations before any cleanup here runs, so the old
-// thread's pre-swap geometry can only be read there) and hands the post-commit
-// half in as `onAfterTranscriptCommit`. See .sealwire/PLAN.md.
+// imperatively, the transcript history loader's attach/sync/detach lifecycle,
+// and (via the hook) the transcript scroll bookkeeping. See .sealwire/PLAN.md.
 export function LocalTranscriptPanel({
   activeThreadId,
   activeThreadLabel,
@@ -21,10 +19,11 @@ export function LocalTranscriptPanel({
   getStandbyEmptyContent,
   getTranscriptOptions,
   hydrationLoading,
-  onAfterTranscriptCommit,
   onLoadOlderTranscript,
+  promotion,
   readyCopy,
   requestedSessionLabel,
+  resetEpoch,
   scrollElement,
   session,
   shortId,
@@ -112,10 +111,11 @@ export function LocalTranscriptPanel({
   }
 
   // Branches 1-4 above never touch scroll bookkeeping; the two below are the
-  // only ones renderTranscript builds an onAfterTranscriptCommit for.
+  // only ones the hook runs for (see mode below).
   const inScrollBranch = content === null;
+  const emptyReady = inScrollBranch && !entries.length && !approval;
 
-  if (content === null && !entries.length && !approval) {
+  if (content === null && emptyReady) {
     content = h(TranscriptPane, {
       canWrite: standbyCanWrite,
       emptyContent: activeThreadId ? null : getStandbyEmptyContent(),
@@ -138,13 +138,16 @@ export function LocalTranscriptPanel({
     });
   }
 
-  // Effect 2 (scroll): the post-commit half of the bookkeeping renderTranscript
-  // started before the render. No dep array — this must run after every
-  // commit, the same as the old flushSync body did.
-  useLayoutEffect(() => {
-    if (inScrollBranch) {
-      onAfterTranscriptCommit?.(scrollElement);
-    }
+  // Effect 2 (scroll): the hook owns both halves of the bookkeeping — its own
+  // render-body capture plus a dep-less layout effect for the commit half.
+  useLocalTranscriptScrollBookkeeping({
+    activeThreadId,
+    entries,
+    mode: inScrollBranch ? (emptyReady ? "empty-ready" : "entries") : null,
+    promotion,
+    resetEpoch,
+    scrollElement,
+    session,
   });
 
   // Effect 3 (sync): re-attach to whichever sentinel is live. The entries

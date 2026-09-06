@@ -26,7 +26,6 @@ import {
   deleteReview as deleteReviewApi,
 } from "../api.js";
 import { loadLastEffort, saveLastApprovalPolicy } from "../../shared/last-used-settings.js";
-import { retargetTranscriptScrollThread } from "../../shared/transcript-scroll.js";
 import { detectDeferredThreadPromotion } from "../../shared/thread-promotion.js";
 import { resolveOutgoingEffort } from "../../shared/reasoning-efforts.js";
 import { providerLabel } from "../../shared/provider-labels.js";
@@ -1045,11 +1044,10 @@ export function createLifecycleController(ctx) {
       nextThreadPromotedFrom: snapshot?.active_thread_promoted_from || null,
     });
     if (threadPromotion) {
-      // Same logical thread, new public id: move the scroll bookkeeping over,
-      // or the first reply classifies as a thread switch (jump-bottom, which
-      // briefly re-enables the stick-to-bottom follow) instead of keeping the
-      // user's freshly anchored message in place.
-      retargetTranscriptScrollThread(state, threadPromotion.from, threadPromotion.to);
+      // Same logical thread, new public id: stage the rekey as a signal for
+      // the scroll hook to apply once, instead of writing into fields this
+      // module no longer owns.
+      state.localTranscriptScrollPromotion = threadPromotion;
       // Rekey every canonical workspace and the route in one queued command. The
       // controller preserves tab identity/pin/order and uses history.replace when the
       // promoted thread is currently visible.

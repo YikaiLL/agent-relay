@@ -181,9 +181,9 @@ export function createTranscriptController(ctx) {
   function resetTranscriptHydrationState() {
     clearTranscriptHydration(state);
     state.transcriptPreserveScroll = false;
-    state.localTranscriptScrollSnapshot = null;
-    state.localTranscriptScrollPositions?.clear?.();
-    state.localTranscriptScrollAnchors?.clear?.();
+    // Bumped, not cleared directly: the scroll store lives in the hook's ref
+    // now, so this is the signal it clears itself on.
+    state.localTranscriptScrollResetEpoch = (state.localTranscriptScrollResetEpoch || 0) + 1;
   }
 
   function toggleTranscriptExpandKey(expandKey) {
