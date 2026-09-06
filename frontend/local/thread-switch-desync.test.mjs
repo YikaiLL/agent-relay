@@ -1,8 +1,8 @@
 // Tests for the view-only navigation contract behind the "one running thread
 // becomes un-enterable" bug: with two claude threads running and the user
 // switching between them, one thread gets stuck on the "Loading thread"
-// placeholder (the one with the "Back to console" button,
-// render-session.js:1100-1120) in the CENTER.
+// placeholder (the one with the "Back to console" button, LocalTranscriptPanel's
+// second branch in local-transcript-panel.js) in the CENTER.
 //
 // Root cause: the center's render is gated on the live, flipping `active_thread_id`
 // (SessionSnapshot carries only the active thread's transcript), so a non-active
@@ -12,7 +12,7 @@
 //
 // - viewOnlySelfHealThreadId() is REAL code (view-only-thread.js) — this is the
 //   red→green regression guard.
-// - centerDecision() mirrors render-session.js's branch order (render-session.js
+// - centerDecision() mirrors LocalTranscriptPanel's branch order (render-session.js
 //   manipulates the DOM at module load and can't be imported under node --test)
 //   to document WHY a missing pin surfaces as "Loading thread / Back to console".
 
@@ -51,8 +51,9 @@ function isViewingConversation(viewThreadId, session) {
   return Boolean(session?.active_thread_id && viewThreadId === session.active_thread_id);
 }
 
-// renderTranscript branch order (render-session.js:1021-1102) applied to the
-// PROJECTED session (render-session.js:251 projects before rendering).
+// LocalTranscriptPanel's branch order (local-transcript-panel.js) applied to
+// the PROJECTED session (render-session.js's renderSession projects it before
+// calling renderTranscript).
 function centerDecision(viewThreadId, viewOnlyThread, realSession) {
   const session = projectViewOnlySession(realSession, { viewThreadId, viewOnlyThread });
   if (!session) return { kind: "no-session" };
@@ -61,9 +62,9 @@ function centerDecision(viewThreadId, viewOnlyThread, realSession) {
       return { kind: "review", threadId: viewThreadId };
     }
     if (viewThreadId && viewThreadId !== session.active_thread_id) {
-      return { kind: "loading", threadId: viewThreadId }; // :1100 "Back to console"
+      return { kind: "loading", threadId: viewThreadId }; // "Back to console"
     }
-    return { kind: "console-home" }; // :1123 "Relay console home"
+    return { kind: "console-home" }; // "Relay console home"
   }
   const entries = session.transcript || [];
   return { kind: "thread", threadId: session.active_thread_id, empty: entries.length === 0 };

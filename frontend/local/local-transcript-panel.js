@@ -1,0 +1,158 @@
+import React, { useLayoutEffect, useRef } from "react";
+
+import { ConversationEmptyState } from "../shared/conversation.js";
+import { TranscriptPane } from "../shared/transcript-pane.js";
+import { attachTranscriptHistoryLoader } from "../shared/transcript-history-loader.js";
+
+const h = React.createElement;
+
+// Owns the six branches render-session.js's renderTranscript used to pick
+// imperatively, plus the transcript history loader's attach/sync/detach
+// lifecycle. renderTranscript keeps the pre-render half of scroll bookkeeping
+// (React commits DOM mutations before any cleanup here runs, so the old
+// thread's pre-swap geometry can only be read there) and hands the post-commit
+// half in as `onAfterTranscriptCommit`. See .sealwire/PLAN.md.
+export function LocalTranscriptPanel({
+  activeThreadId,
+  activeThreadLabel,
+  approval,
+  entries,
+  entriesCanWrite,
+  getStandbyEmptyContent,
+  getTranscriptOptions,
+  hydrationLoading,
+  onAfterTranscriptCommit,
+  onLoadOlderTranscript,
+  readyCopy,
+  requestedSessionLabel,
+  scrollElement,
+  session,
+  shortId,
+  standbyCanWrite,
+  viewOnly,
+  viewOnlyReviewView,
+  viewedThreadLocked,
+  viewedThreadWorkflowLocked,
+  viewingConversation,
+  viewingDifferentThread,
+}) {
+  const loaderRef = useRef(null);
+  // Ref-latched so a changing onLoadOlderTranscript identity never forces the
+  // attach effect (deps: [scrollElement]) to re-run and re-attach.
+  const onLoadOlderTranscriptRef = useRef(onLoadOlderTranscript);
+  onLoadOlderTranscriptRef.current = onLoadOlderTranscript;
+
+  // Effect 1 (attach): bound to scrollElement's lifetime, not the render
+  // cycle — the sentinel it watches comes and goes with the branch below.
+  useLayoutEffect(() => {
+    if (!scrollElement) {
+      return undefined;
+    }
+    const loader = attachTranscriptHistoryLoader({
+      onLoad: () => onLoadOlderTranscriptRef.current?.(),
+      scrollElement,
+    });
+    loaderRef.current = loader;
+    return () => {
+      loaderRef.current = null;
+      loader.detach();
+    };
+  }, [scrollElement]);
+
+  let content = null;
+
+  if (!viewingConversation && viewedThreadLocked) {
+    content = h(ConversationEmptyState, {
+      badge: viewedThreadWorkflowLocked ? "Code Flow" : "Review",
+      className: "thread-empty-ready",
+      copy: viewedThreadWorkflowLocked
+        ? "Code Flow owns this conversation. Its progress and result show up in the Reviewer panel."
+        : "Another agent is reviewing this conversation. Its progress and result show up in the Reviewer panel, and the review is posted back here when it finishes.",
+      title: viewedThreadWorkflowLocked ? "Code Flow in progress" : "Review in progress",
+    });
+  } else if (!viewingConversation && viewingDifferentThread) {
+    content = h(ConversationEmptyState, {
+      actions: [
+        {
+          attrs: { "data-go-console-home": "true" },
+          label: "Back to console",
+        },
+      ],
+      copy: "This saved session is loading.",
+      details: [`Requested session: ${requestedSessionLabel}`],
+      title: "Loading session",
+    });
+  } else if (!viewingConversation && activeThreadId) {
+    content = h(ConversationEmptyState, {
+      actions: [
+        {
+          attrs: { "data-open-thread-id": activeThreadId },
+          label: "Open live conversation",
+        },
+      ],
+      badge: "Live",
+      className: "thread-empty-ready",
+      copy: "A live session is running, but the conversation stays behind its own session page so the local home does not default into chat.",
+      details: [`Current session: ${activeThreadLabel}`],
+      title: "Relay console home",
+    });
+  } else if (!entries.length && viewOnly) {
+    // A view-only thread whose transcript hasn't loaded yet — calm placeholder
+    // instead of the live "send the first prompt" ready-state. The review flavor
+    // keeps its reviewer-panel wording; a plain saved thread must not be mislabeled
+    // "Review in progress".
+    content = h(ConversationEmptyState, {
+      badge: viewOnlyReviewView ? "Review" : "Read-only",
+      className: "thread-empty-ready",
+      copy: viewOnlyReviewView
+        ? "Loading this session's conversation. Another agent is reviewing it — its progress shows in the Reviewer panel."
+        : "Loading this saved session's conversation…",
+      title: viewOnlyReviewView ? "Review in progress" : "Read-only view",
+    });
+  }
+
+  // Branches 1-4 above never touch scroll bookkeeping; the two below are the
+  // only ones renderTranscript builds an onAfterTranscriptCommit for.
+  const inScrollBranch = content === null;
+
+  if (content === null && !entries.length && !approval) {
+    content = h(TranscriptPane, {
+      canWrite: standbyCanWrite,
+      emptyContent: activeThreadId ? null : getStandbyEmptyContent(),
+      readyState: activeThreadId
+        ? {
+            readyCopy,
+            session,
+            shortId,
+            waitingCopy: "This session is open, but another device currently has control. Take over to send the first prompt from here.",
+          }
+        : null,
+    });
+  } else if (content === null) {
+    content = h(TranscriptPane, {
+      approval,
+      canWrite: entriesCanWrite,
+      entries,
+      hydrationLoading,
+      transcriptOptions: getTranscriptOptions(),
+    });
+  }
+
+  // Effect 2 (scroll): the post-commit half of the bookkeeping renderTranscript
+  // started before the render. No dep array — this must run after every
+  // commit, the same as the old flushSync body did.
+  useLayoutEffect(() => {
+    if (inScrollBranch) {
+      onAfterTranscriptCommit?.(scrollElement);
+    }
+  });
+
+  // Effect 3 (sync): re-attach to whichever sentinel is live. The entries
+  // branch is the only one with a sentinel, and branches can swap on any
+  // commit, so this also runs unconditionally, after every commit.
+  useLayoutEffect(() => {
+    loaderRef.current?.sync();
+  });
+
+  return content;
+}
