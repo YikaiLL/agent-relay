@@ -170,7 +170,9 @@ npm run test:browser:install   # chromium, once
 
 [`AGENTS.md`](AGENTS.md) has the code map and the commands to run after a
 change; [`docs/testing-matrix.md`](docs/testing-matrix.md) covers what each
-suite actually exercises.
+suite actually exercises. The task-team orchestration privacy boundary is
+documented in
+[`docs/content-blind-orchestration.md`](docs/content-blind-orchestration.md).
 
 ## Current focus
 

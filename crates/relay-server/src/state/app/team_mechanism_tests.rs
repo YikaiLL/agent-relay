@@ -60,9 +60,29 @@ fn team_input(cwd: &str) -> crate::state::app::team::TeamStartRequest {
     }
 }
 
+fn cloud_backend() -> relay_api::orchestration::OrchestrationBackendRef {
+    relay_api::orchestration::OrchestrationBackendRef::Cloud {
+        protocol_version: relay_api::orchestration::SupportedProtocolVersion::current(),
+        driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
+        cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+    }
+}
+
 struct ReturningTeamDriver;
 struct PanickingTeamDriver;
 struct BlockingTeamDriver;
+struct RecordingTeamDriver {
+    drove: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+struct ResumeAttemptDriver {
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    finished_notify: std::sync::Arc<tokio::sync::Notify>,
+    outcome: std::sync::Arc<Mutex<Option<relay_api::team::TeamTurnOutcome>>>,
+}
+struct ParkedTeamDriver {
+    entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
 
 #[async_trait::async_trait]
 impl relay_api::TeamDriver for ReturningTeamDriver {
@@ -96,6 +116,51 @@ impl relay_api::TeamDriver for BlockingTeamDriver {
     }
 }
 
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for RecordingTeamDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, _port: std::sync::Arc<dyn relay_api::TeamPort>, _run_id: String) {
+        self.drove.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for ResumeAttemptDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, port: std::sync::Arc<dyn relay_api::TeamPort>, run_id: String) {
+        let outcome = port
+            .turn(
+                &run_id,
+                relay_api::team::TeamThreadSlot::SubTaskDev(0),
+                relay_api::team::TeamRole::Dev,
+                "resume should not reach the provider",
+            )
+            .await;
+        *self.outcome.lock().await = Some(outcome);
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.finished_notify.notify_one();
+    }
+}
+
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for ParkedTeamDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, _port: std::sync::Arc<dyn relay_api::TeamPort>, _run_id: String) {
+        self.entered.store(true, Ordering::Relaxed);
+        self.release.notified().await;
+    }
+}
+
 async fn wait_for_team_status(
     app: &AppState,
     run_id: &str,
@@ -110,6 +175,961 @@ async fn wait_for_team_status(
         sleep(Duration::from_millis(5)).await;
     }
     panic!("task {run_id} never reached {expected:?}");
+}
+
+async fn wait_until_condition(label: &str, mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label}"));
+}
+
+async fn wait_for_released_threads(
+    provider: &ReviewTestProvider,
+    expected: &[String],
+) -> Vec<String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let released = provider.released_threads().await;
+            if expected
+                .iter()
+                .all(|thread_id| released.contains(thread_id))
+            {
+                return released;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected provider releases for {expected:?}"))
+}
+
+#[tokio::test]
+async fn start_team_run_records_legacy_backend_before_driver_spawn() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let drove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = app.with_team_driver(std::sync::Arc::new(RecordingTeamDriver {
+        drove: drove.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Interrupted).await;
+
+    assert!(
+        drove.load(std::sync::atomic::Ordering::Relaxed),
+        "the embedded backend gate must allow the freshly-created legacy run to reach the driver"
+    );
+    assert_eq!(
+        run.orchestration_backend,
+        relay_api::orchestration::OrchestrationBackendRef::LegacyEmbedded
+    );
+}
+
+#[tokio::test]
+async fn resume_team_run_refuses_non_embedded_backend_before_status_flip() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-resume".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    let pause_error = app
+        .pause_team_run(
+            Some("team-cloud-resume".to_string()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect_err("Pause must refuse a Cloud-pinned run in this build");
+    assert!(pause_error.contains("Cloud orchestration"), "{pause_error}");
+
+    let error = app
+        .resume_team_run(
+            Some("team-cloud-resume".to_string()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect_err("resume must refuse a Cloud-pinned run in this build");
+
+    assert!(error.contains("Cloud orchestration"), "{error}");
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-resume")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Paused);
+    assert_eq!(run.orchestration_backend, cloud_backend());
+}
+
+#[tokio::test]
+async fn resume_team_run_allows_malformed_progress_on_legacy_backend() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let drove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = app.with_team_driver(std::sync::Arc::new(RecordingTeamDriver {
+        drove: drove.clone(),
+    }));
+    let run_id = "team-legacy-malformed-progress-resume".to_string();
+    let mut run = crate::state::TeamRun::new(
+        run_id.clone(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.driver_progress = serde_json::from_str(r#"{"future_progress_field":1}"#)
+        .expect("unknown progress fields must decode fail-closed");
+    assert!(run.driver_progress.is_malformed());
+    app.relay.write().await.insert_team_run(run);
+
+    let status = app
+        .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect("legacy embedded runs may continue without consuming driver progress");
+
+    assert_eq!(status, crate::state::TeamRunStatus::Running);
+    let run =
+        wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Interrupted).await;
+    assert!(
+        run.driver_progress.is_malformed(),
+        "resuming the legacy driver must not clear a future progress marker"
+    );
+    assert!(
+        drove.load(std::sync::atomic::Ordering::Relaxed),
+        "malformed future progress must not block the legacy embedded driver"
+    );
+}
+
+#[tokio::test]
+async fn stop_on_an_already_paused_embedded_run_is_a_truthful_noop() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-paused-stop".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    app.relay.write().await.insert_team_run(run);
+
+    let status = app
+        .force_stop_team_run(
+            Some("team-paused-stop".to_string()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("stopping an already paused local task is a no-op");
+
+    assert_eq!(status, crate::state::TeamRunStatus::Paused);
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-paused-stop")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Paused);
+    assert!(!run.pause_requested);
+    assert!(!run.stopping);
+    assert_eq!(run.in_flight_thread, None);
+}
+
+#[tokio::test]
+async fn stop_on_a_paused_embedded_run_still_drains_unconfirmed_turns() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-paused-stop-hung".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.in_flight_thread = Some("stale-mid-start".to_string());
+    app.relay.write().await.insert_team_run(run);
+
+    let error = app
+        .force_stop_team_run(
+            Some("team-paused-stop-hung".to_string()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect_err("a paused run with an unconfirmed turn is not quiescent");
+
+    assert!(error.contains("did not confirm stopping"), "{error}");
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-paused-stop-hung")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Blocked);
+    assert!(!run.pause_requested);
+    assert!(!run.stopping);
+    assert_eq!(run.in_flight_thread.as_deref(), Some("stale-mid-start"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stop_revalidates_after_a_queued_resume_wins_the_drive_gate() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let codex = providers.get("codex").unwrap().clone();
+    codex
+        .settle_turn_before_start_returns
+        .store(true, Ordering::Relaxed);
+
+    let run_id = "team-stop-after-resume".to_string();
+    let dev_thread = codex.summary("codex-resume-dev", &root);
+    codex
+        .threads
+        .lock()
+        .await
+        .insert(dev_thread.id.clone(), dev_thread.clone());
+    codex
+        .start_thread_cwds
+        .lock()
+        .await
+        .push((dev_thread.id.clone(), root.clone()));
+    {
+        let mut relay = app.relay.write().await;
+        relay.register_background_thread(
+            dev_thread.clone(),
+            &root,
+            "codex-model",
+            "on-request",
+            "workspace-write",
+            "medium",
+        );
+        let mut run = crate::state::TeamRun::new(
+            run_id.clone(),
+            crate::state::TaskSpec::default(),
+            root.clone(),
+            "device-1".to_string(),
+        );
+        run.status = crate::state::TeamRunStatus::Paused;
+        run.phase = relay_api::team::TeamPhase::SubTasks;
+        run.sub_tasks.push(crate::state::SubTask {
+            id: "st-1".to_string(),
+            title: "Parser".to_string(),
+            brief: "write the parser".to_string(),
+            status: crate::state::SubTaskStatus::Pending,
+            dev_thread_id: Some(dev_thread.id.clone()),
+            ..Default::default()
+        });
+        relay.insert_team_run(run);
+    }
+
+    let driver_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let driver_finished_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let driver_outcome = std::sync::Arc::new(Mutex::new(None));
+    let app = app.with_team_driver(std::sync::Arc::new(ResumeAttemptDriver {
+        finished: driver_finished.clone(),
+        finished_notify: driver_finished_notify.clone(),
+        outcome: driver_outcome.clone(),
+    }));
+
+    let driver_pre_gate = app.hold_team_gated_barrier().await;
+    let gate = app.team_drive_gate.lock().await;
+    let stop_pre_gate = app.hold_team_stop_pre_gate_barrier().await;
+    let stop_pre_gate_before = app.team_stop_pre_gate_arrivals();
+    let stop_waiter_before = app.team_stop_gate_waiter_arrivals();
+
+    let resume_task = {
+        let app = app.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            app.resume_team_run(Some(run_id), Some("device-1".to_string()))
+                .await
+        })
+    };
+    wait_until_condition("resume should queue at the held drive gate", || {
+        app.driving_team_runs
+            .lock()
+            .expect("drive set")
+            .contains(&run_id)
+    })
+    .await;
+
+    let stop_task = {
+        let app = app.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            app.force_stop_team_run(Some(run_id), Some("device-1".to_string()))
+                .await
+        })
+    };
+    wait_until_condition("stop should park before drive-gate admission", || {
+        app.team_stop_pre_gate_arrivals() > stop_pre_gate_before
+    })
+    .await;
+
+    drop(stop_pre_gate);
+    wait_until_condition("stop should queue behind Resume at the drive gate", || {
+        app.team_stop_gate_waiter_arrivals() > stop_waiter_before
+    })
+    .await;
+    drop(gate);
+
+    let resumed = tokio::time::timeout(Duration::from_secs(5), resume_task)
+        .await
+        .expect("resume should not hang behind Stop")
+        .expect("resume task should not panic")
+        .expect("resume should win the gate first");
+    assert_eq!(resumed, crate::state::TeamRunStatus::Running);
+
+    let stopped = tokio::time::timeout(Duration::from_secs(5), stop_task)
+        .await
+        .expect("Stop should not hang after gate admission")
+        .expect("stop task should not panic")
+        .expect("stop should re-read the resumed Running status and stop it");
+    assert_eq!(stopped, crate::state::TeamRunStatus::Paused);
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run(&run_id)
+        .cloned()
+        .expect("run remains recorded");
+    assert_eq!(run.status, crate::state::TeamRunStatus::Paused);
+    assert_eq!(run.pause_kind, Some(relay_api::team::TeamPauseKind::User));
+    assert_eq!(run.pause_reason.as_deref(), Some("stopped by the user"));
+    assert!(
+        codex.turns.lock().await.is_empty(),
+        "Stop returned before any resumed provider turn dispatched"
+    );
+
+    drop(driver_pre_gate);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !driver_finished.load(Ordering::Relaxed) {
+            driver_finished_notify.notified().await;
+        }
+    })
+    .await
+    .expect("the resumed driver should release its ticket after Stop settles");
+
+    match driver_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => {
+            assert!(reason.contains("settled as paused"), "{reason}");
+        }
+        other => panic!("the resumed driver should be refused after Stop settles: {other:?}"),
+    }
+    assert!(
+        codex.turns.lock().await.is_empty(),
+        "the resumed driver must never dispatch a provider turn after Stop settles"
+    );
+    wait_until_condition("the resumed driver's drive ticket should release after the refused turn", || {
+        !app.driving_team_runs
+            .lock()
+            .expect("drive set")
+            .contains(&run_id)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pause_revalidates_after_a_queued_resume_wins_the_drive_gate() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let run_id = "team-pause-after-resume".to_string();
+    let driver_entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release_driver = std::sync::Arc::new(tokio::sync::Notify::new());
+    let app = app.with_team_driver(std::sync::Arc::new(ParkedTeamDriver {
+        entered: driver_entered.clone(),
+        release: release_driver.clone(),
+    }));
+    let mut run = crate::state::TeamRun::new(
+        run_id.clone(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    app.relay.write().await.insert_team_run(run);
+
+    let gate = app.team_drive_gate.lock().await;
+    let pause_arrivals_before = app.team_pause_pre_gate_arrivals();
+    let resume_task = {
+        let app = app.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            app.resume_team_run(Some(run_id), Some("device-1".to_string()))
+                .await
+        })
+    };
+    wait_until_condition("resume should queue at the held drive gate", || {
+        app.driving_team_runs
+            .lock()
+            .expect("drive set")
+            .contains(&run_id)
+    })
+    .await;
+
+    let pause_task = {
+        let app = app.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            app.pause_team_run(Some(run_id), Some("device-1".to_string()))
+                .await
+        })
+    };
+    wait_until_condition("Pause should queue behind Resume at the drive gate", || {
+        app.team_pause_pre_gate_arrivals() > pause_arrivals_before
+    })
+    .await;
+    drop(gate);
+
+    let resumed = tokio::time::timeout(Duration::from_secs(5), resume_task)
+        .await
+        .expect("resume should not hang behind Pause")
+        .expect("resume task should not panic")
+        .expect("resume should win the gate first");
+    assert_eq!(resumed, crate::state::TeamRunStatus::Running);
+    let pause_status = tokio::time::timeout(Duration::from_secs(5), pause_task)
+        .await
+        .expect("Pause should not hang after gate admission")
+        .expect("pause task should not panic")
+        .expect("Pause should re-read the resumed Running status");
+    assert_eq!(pause_status, crate::state::TeamRunStatus::PausePending);
+
+    let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::PausePending);
+    assert!(run.pause_requested);
+
+    wait_until_condition("the resumed driver should start", || {
+        driver_entered.load(Ordering::Relaxed)
+    })
+    .await;
+    release_driver.notify_one();
+    wait_until_condition("the resumed driver should release its drive ticket", || {
+        !app.driving_team_runs
+            .lock()
+            .expect("drive set")
+            .contains(&run_id)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn stop_refuses_non_embedded_backend_without_setting_markers() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-stop".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Running;
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    let error = app
+        .force_stop_team_run(
+            Some("team-cloud-stop".to_string()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect_err("stop must refuse a Cloud-pinned run in this build");
+
+    assert!(error.contains("Cloud orchestration"), "{error}");
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-stop")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Running);
+    assert!(!run.pause_requested);
+    assert!(!run.stopping);
+}
+
+#[tokio::test]
+async fn stranded_cleanup_leaves_non_embedded_records_inert() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-stranded".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Running;
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    app.interrupt_team_run_if_stranded("team-cloud-stranded")
+        .await;
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-stranded")
+        .cloned()
+        .expect("run remains visible");
+    assert_eq!(run.status, crate::state::TeamRunStatus::Running);
+    assert_eq!(run.error, None);
+    assert!(!run.stopping);
+}
+
+#[tokio::test]
+async fn inert_records_can_be_archived_but_not_marked_done() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-archive".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    let error = app
+        .mark_team_run(
+            Some("team-cloud-archive".to_string()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Done,
+        )
+        .await
+        .expect_err("mark_done would be a false success on an inert run");
+    assert!(error.contains("Cloud orchestration"), "{error}");
+
+    let status = app
+        .mark_team_run(
+            Some("team-cloud-archive".to_string()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect("mark_cancelled is the explicit archival escape");
+    assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+
+    let status = app
+        .mark_team_run(
+            Some("team-cloud-archive".to_string()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect("archival is idempotent");
+    assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+
+    app.relay
+        .write()
+        .await
+        .update_team_run("team-cloud-archive", |run| {
+            run.force_mark_status(crate::state::TeamRunStatus::Done);
+        });
+
+    let status = app
+        .mark_team_run(
+            Some("team-cloud-archive".to_string()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Done,
+        )
+        .await
+        .expect("mark_done should acknowledge an already-done inert row as a no-op");
+    assert_eq!(status, crate::state::TeamRunStatus::Done);
+
+    let status = app
+        .mark_team_run(
+            Some("team-cloud-archive".to_string()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect("explicit archival may relabel an already-done inert row");
+    assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn mark_cancelled_archives_inert_blocked_run_and_releases_provider_seats() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let codex = providers.get("codex").unwrap().clone();
+    let run_id = "team-cloud-archive-release".to_string();
+    {
+        let mut run = crate::state::TeamRun::new(
+            run_id.clone(),
+            crate::state::TaskSpec::default(),
+            root.clone(),
+            "device-1".to_string(),
+        );
+        run.tl_provider = "codex".to_string();
+        run.dev_provider = "codex".to_string();
+        run.reviewer_provider = "codex".to_string();
+        app.relay.write().await.insert_team_run(run);
+    }
+
+    let tl_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Tl,
+    )
+    .await
+    .expect("tl provider-backed thread");
+    let dev_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Dev,
+    )
+    .await
+    .expect("dev provider-backed thread");
+    let reviewer_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Reviewer,
+    )
+    .await
+    .expect("reviewer provider-backed thread");
+    {
+        let mut relay = app.relay.write().await;
+        relay.update_team_run(&run_id, |run| {
+            run.tl_thread_id = tl_thread.clone();
+            run.phase = relay_api::team::TeamPhase::SubTasks;
+            run.sub_tasks.push(crate::state::SubTask {
+                id: "st-1".to_string(),
+                title: "Parser".to_string(),
+                brief: "write the parser".to_string(),
+                status: crate::state::SubTaskStatus::Pending,
+                dev_thread_id: Some(dev_thread.clone()),
+                reviewer_thread_id: Some(reviewer_thread.clone()),
+                ..Default::default()
+            });
+        });
+        relay.notify();
+    }
+
+    let backend = cloud_backend();
+    let backend_reason = backend.non_executing_reason().unwrap().to_string();
+    let owned = {
+        let mut relay = app.relay.write().await;
+        let mut run = relay
+            .remove_team_run(&run_id)
+            .expect("test run should be recorded");
+        let owned = run.owned_thread_ids();
+        assert_eq!(
+            owned.len(),
+            3,
+            "the fixture should own the TL, dev, and reviewer seats"
+        );
+        run.status = crate::state::TeamRunStatus::Paused;
+        run.orchestration_backend = backend;
+        run.error = Some(backend_reason.clone());
+        relay.insert_team_run(run);
+        relay.notify();
+        owned
+    };
+    assert!(
+        codex.released_threads().await.is_empty(),
+        "making the run inert is only restore modelling; archival is what releases seats"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove temporary task worktree");
+    app.validate_paused_team_runs().await;
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run(&run_id)
+        .cloned()
+        .expect("run remains visible after validation");
+    assert_eq!(run.status, crate::state::TeamRunStatus::Blocked);
+    let error = run.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("no longer exists"),
+        "missing worktree validation should make an inert pause diagnostically blocked: {error}"
+    );
+    assert!(
+        error.contains(backend_reason.as_str()),
+        "the blocked diagnostic should retain the unsupported-backend reason: {error}"
+    );
+
+    let resolve_error = app
+        .resolve_blocked_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect_err("blocked recovery cannot execute an inert backend");
+    assert!(
+        resolve_error.contains(backend_reason.as_str()),
+        "blocked recovery should refuse the inert backend before pretending to drain: {resolve_error}"
+    );
+
+    let status = app
+        .mark_team_run(
+            Some(run_id.clone()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect("mark_cancelled is the current-build archival escape for inert runs");
+    assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+
+    let released = wait_for_released_threads(&codex, &owned).await;
+    for thread_id in &owned {
+        assert!(
+            released.contains(thread_id),
+            "explicit archival should release every restored local seat: {thread_id} missing from {released:?}"
+        );
+    }
+    assert_eq!(
+        app.relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.status),
+        Some(crate::state::TeamRunStatus::Cancelled)
+    );
+}
+
+#[tokio::test]
+async fn mark_cancelled_drains_malformed_legacy_run_and_releases_provider_seats() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let codex = providers.get("codex").unwrap().clone();
+    let run_id = "team-legacy-malformed-progress-cancel".to_string();
+    let mut run = crate::state::TeamRun::new(
+        run_id.clone(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.tl_provider = "codex".to_string();
+    run.dev_provider = "codex".to_string();
+    run.reviewer_provider = "codex".to_string();
+    run.status = crate::state::TeamRunStatus::Running;
+    run.driver_progress = serde_json::from_str(r#"{"future_progress_field":1}"#)
+        .expect("unknown progress fields must decode fail-closed");
+    assert!(run.driver_progress.is_malformed());
+    app.relay.write().await.insert_team_run(run);
+
+    let tl_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Tl,
+    )
+    .await
+    .expect("tl provider-backed thread");
+    let dev_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Dev,
+    )
+    .await
+    .expect("dev provider-backed thread");
+    let reviewer_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Reviewer,
+    )
+    .await
+    .expect("reviewer provider-backed thread");
+    let owned = vec![tl_thread.clone(), dev_thread.clone(), reviewer_thread.clone()];
+    {
+        let mut relay = app.relay.write().await;
+        relay.update_team_run(&run_id, |run| {
+            run.tl_thread_id = tl_thread;
+            run.phase = relay_api::team::TeamPhase::SubTasks;
+            run.sub_tasks.push(crate::state::SubTask {
+                id: "st-1".to_string(),
+                status: crate::state::SubTaskStatus::Pending,
+                dev_thread_id: Some(dev_thread),
+                reviewer_thread_id: Some(reviewer_thread),
+                ..Default::default()
+            });
+        });
+        relay.notify();
+    }
+
+    let status = app
+        .mark_team_run(
+            Some(run_id.clone()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect("malformed progress must not remove the legacy run's archival exit");
+
+    assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+    let released = wait_for_released_threads(&codex, &owned).await;
+    for thread_id in &owned {
+        assert!(
+            released.contains(thread_id),
+            "ordinary cancellation should release the legacy run's seat {thread_id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reopen_team_run_refuses_non_embedded_backend_before_mutating() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-reopen".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Failed;
+    run.phase = relay_api::team::TeamPhase::MrGate;
+    run.error = Some("older failure".to_string());
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    let error = app
+        .reopen_team_run(
+            Some("team-cloud-reopen".to_string()),
+            "try again",
+            &relay_api::team::TaskSpecUpdates::default(),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect_err("reopen must refuse a Cloud-pinned run in this build");
+
+    assert!(error.contains("Cloud orchestration"), "{error}");
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-reopen")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Failed);
+    assert_eq!(run.phase, relay_api::team::TeamPhase::MrGate);
+    assert_eq!(run.error.as_deref(), Some("older failure"));
+    assert!(run.pending_user_notes.is_empty());
+    assert_eq!(run.orchestration_backend, cloud_backend());
+}
+
+#[tokio::test]
+async fn paused_restore_validation_blocks_missing_non_embedded_worktree() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let backend = cloud_backend();
+    let reason = backend.non_executing_reason().unwrap().to_string();
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-restore".to_string(),
+        crate::state::TaskSpec::default(),
+        std::path::Path::new(&root)
+            .join("missing-worktree")
+            .to_string_lossy()
+            .into_owned(),
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.orchestration_backend = backend;
+    run.error = Some(reason.clone());
+    app.relay.write().await.insert_team_run(run);
+
+    app.validate_paused_team_runs().await;
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-restore")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Blocked);
+    let error = run.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("no longer exists"),
+        "missing worktree validation must still run for inert pauses: {error}"
+    );
+    assert!(
+        error.contains(reason.as_str()),
+        "the backend refusal reason should remain visible beside the worktree diagnosis: {error}"
+    );
+}
+
+#[tokio::test]
+async fn paused_restore_validation_does_not_reseed_an_inert_run() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-dead-tl".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.tl_thread_id = "missing-cloud-tl".to_string();
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    app.validate_paused_team_runs().await;
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-dead-tl")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Paused);
+    assert_eq!(run.tl_thread_id, "missing-cloud-tl");
+    assert!(
+        run.tl_reseed_reason.is_none(),
+        "a backend this build cannot execute must not schedule local TL recovery"
+    );
+}
+
+#[tokio::test]
+async fn spawned_team_driver_refuses_non_embedded_backend_without_driving() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let drove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = app.with_team_driver(std::sync::Arc::new(RecordingTeamDriver {
+        drove: drove.clone(),
+    }));
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-drive".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    let ticket = app
+        .claim_team_drive("team-cloud-drive")
+        .expect("test run is not already driving");
+    app.spawn_team_driver_for_test("team-cloud-drive".to_string(), ticket);
+    let run = wait_for_team_status(
+        &app,
+        "team-cloud-drive",
+        crate::state::TeamRunStatus::Failed,
+    )
+    .await;
+
+    assert!(
+        !drove.load(std::sync::atomic::Ordering::Relaxed),
+        "the driver body must not run once the backend gate refuses it"
+    );
+    assert!(
+        run.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Cloud orchestration"),
+        "the failure should surface the backend-pin reason: {:?}",
+        run.error
+    );
 }
 
 #[tokio::test]
@@ -163,6 +1183,114 @@ async fn the_public_host_preserves_a_deliberately_blocked_driver_return() {
     let still_blocked = app.relay.read().await.team_run(&run_id).cloned().unwrap();
     assert_eq!(still_blocked.status, crate::state::TeamRunStatus::Blocked);
     assert_eq!(still_blocked.error, run.error);
+}
+
+#[tokio::test]
+async fn team_port_update_run_records_rejected_backend_retargets() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    {
+        let mut run = crate::state::TeamRun::new(
+            "team-retarget".to_string(),
+            crate::state::TaskSpec::default(),
+            root,
+            "device-1".to_string(),
+        );
+        run.status = crate::state::TeamRunStatus::Running;
+        app.relay.write().await.insert_team_run(run);
+    }
+
+    let before_revision = app.snapshot().await.revision;
+    let cloud = cloud_backend();
+
+    let updated = relay_api::TeamPort::update_run(
+        &app,
+        "team-retarget",
+        Box::new(move |run| {
+            run.orchestration_backend = cloud;
+            run.phase = crate::state::TeamPhase::MrGate;
+        }),
+    )
+    .await;
+
+    assert!(!updated, "the TeamPort wrapper must surface the rejection");
+    assert_ne!(
+        app.snapshot().await.revision,
+        before_revision,
+        "rejected updates must notify surfaces because a failure was recorded"
+    );
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-retarget")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        run.orchestration_backend,
+        relay_api::orchestration::OrchestrationBackendRef::LegacyEmbedded
+    );
+    assert_eq!(run.phase, crate::state::TeamPhase::MrGate);
+    assert_eq!(run.status, crate::state::TeamRunStatus::Failed);
+    assert!(
+        run.error
+            .as_deref()
+            .is_some_and(|error| error.contains("orchestration backend after execution began")),
+        "the immutable-backend rejection should be recorded explicitly: {:?}",
+        run.error
+    );
+}
+
+#[tokio::test]
+async fn rejected_backend_retarget_notifies_for_settled_runs_but_not_missing_ids() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-paused-retarget".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    app.relay.write().await.insert_team_run(run);
+
+    let before_revision = app.snapshot().await.revision;
+    let updated = relay_api::TeamPort::update_run(
+        &app,
+        "team-paused-retarget",
+        Box::new(|run| {
+            run.orchestration_backend = cloud_backend();
+            run.phase = crate::state::TeamPhase::MrGate;
+        }),
+    )
+    .await;
+    assert!(!updated);
+    assert_ne!(app.snapshot().await.revision, before_revision);
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-paused-retarget")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Paused);
+    assert_eq!(run.phase, crate::state::TeamPhase::MrGate);
+    assert!(run.orchestration_backend.is_legacy_embedded());
+
+    let before_missing = app.snapshot().await.revision;
+    let updated = relay_api::TeamPort::update_run(
+        &app,
+        "team-does-not-exist",
+        Box::new(|run| run.phase = crate::state::TeamPhase::Finished),
+    )
+    .await;
+    assert!(!updated);
+    assert_eq!(
+        app.snapshot().await.revision,
+        before_missing,
+        "an unknown run id must not fabricate a state change"
+    );
 }
 
 #[tokio::test]
@@ -2378,11 +3506,13 @@ impl relay_api::TeamDriver for RaceWindowDriver {
 
 /// [P1 fix] The early reviewer-gate check (before any thread is resolved) is
 /// NOT sufficient by itself: `team_turn` still has to resolve the thread and
-/// reach `team_drive_gate` before it can dispatch — and a stop's `request_stop`
-/// sets its flags without ever taking that gate, so it can land in exactly that
-/// window. This pins that the gate is REPEATED once `team_drive_gate` is held,
-/// using the pre-side-effect latch (`hold_team_turn_barrier`) to land the stop
-/// deterministically rather than racing real wall-clock timing.
+/// reach `team_drive_gate` before it can dispatch. A user Stop reaches
+/// `request_stop` through that same drive gate, but a driver-side
+/// `TeamPort::update_run` can set the same flags while holding only the relay
+/// write lock, so it can land in exactly that window. This pins that the
+/// refusal is REPEATED once `team_drive_gate` is held, using the pre-side-effect
+/// latch (`hold_team_turn_barrier`) to land the stop deterministically rather
+/// than racing real wall-clock timing.
 #[tokio::test]
 async fn a_stop_landing_between_the_reviewer_gates_early_check_and_the_drive_gate_is_still_caught()
 {
@@ -2759,10 +3889,10 @@ async fn a_stop_settling_after_phase_stamp_before_drive_gate_must_not_dispatch()
 ///
 /// The fix folds decide-and-commit into ONE write-lock hold, so nothing can
 /// land between them. This proves it directly: park the refusal on a latch
-/// AFTER it has decided but BEFORE it commits — still holding the write lock
-/// `request_stop` also needs — and show a concurrent stop cannot even start
-/// until the refusal releases it, so it can only ever observe an already-
-/// consistent outcome, never corrupt one mid-flight.
+/// AFTER it has decided but BEFORE it commits — still holding the write lock a
+/// driver-side `TeamPort::update_run` needs to call `request_stop` — and show
+/// that update cannot even start until the refusal releases it, so it can only
+/// ever observe an already-consistent outcome, never corrupt one mid-flight.
 #[tokio::test]
 async fn a_stop_racing_the_atomic_refusal_cannot_land_between_its_decision_and_its_commit() {
     let (_repo, root) = init_team_repo().await;
@@ -2791,8 +3921,8 @@ async fn a_stop_racing_the_atomic_refusal_cannot_land_between_its_decision_and_i
     let run_id = app.start_team_run(team_input(&root)).await.expect("start");
 
     // The refusal has now decided (fresh flags: nothing pausing, landed == 0)
-    // and is parked on our latch — still holding the SAME write lock a stop
-    // needs for its very first step, `request_stop`.
+    // and is parked on our latch — still holding the SAME write lock this test's
+    // driver-side `request_stop` update needs.
     for _ in 0..2_000 {
         if app.reviewer_refusal_arrivals() > before {
             break;
@@ -2804,32 +3934,38 @@ async fn a_stop_racing_the_atomic_refusal_cannot_land_between_its_decision_and_i
         "the refusal should have reached its decided-but-not-committed latch by now"
     );
 
-    let stop_task = {
+    let stop_update_task = {
         let app = app.clone();
         let run_id = run_id.clone();
         tokio::spawn(async move {
-            app.force_stop_team_run(Some(run_id), Some("device-1".to_string()))
-                .await
+            relay_api::TeamPort::update_run(
+                &app,
+                &run_id,
+                Box::new(|run| run.request_stop("driver-stop")),
+            )
+            .await
         })
     };
     // Give the spawned stop every chance to run if it somehow could; it must
     // not, because it cannot even acquire the lock the parked refusal holds.
     sleep(Duration::from_millis(50)).await;
     assert!(
-        !stop_task.is_finished(),
-        "a stop cannot complete while the refusal it raced still holds the \
-write lock its own first step (`request_stop`) requires"
+        !stop_update_task.is_finished(),
+        "a driver-side stop update cannot complete while the refusal it raced \
+still holds the write lock its `request_stop` mutation requires"
     );
 
     drop(latch);
 
-    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
-    let stop_result = stop_task.await.expect("the stop task must not panic");
+    let stop_updated = tokio::time::timeout(Duration::from_secs(5), stop_update_task)
+        .await
+        .expect("the driver-side stop update should finish after the refusal releases")
+        .expect("the stop update task must not panic");
     assert!(
-        stop_result.is_ok(),
-        "a stop that only gets to run after the refusal already committed \
-must be a graceful no-op, not an error: {stop_result:?}"
+        stop_updated,
+        "the driver-side stop update must still find the run after the refusal commits"
     );
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
 
     // The refusal's own decision — made and committed atomically before the
     // stop could interleave — is what must have stuck: `Boundary`, not

@@ -1,0 +1,73 @@
+{
+  "schema_version": 2,
+  "active_thread_id": "thread-future",
+  "active_controller_device_id": "device-future",
+  "active_controller_last_seen_at": 1700000100,
+  "current_status": "idle",
+  "active_flags": [],
+  "current_cwd": "/tmp/content-blind/repo",
+  "model": "test-model",
+  "approval_policy": "untrusted",
+  "sandbox": "workspace-write",
+  "reasoning_effort": "medium",
+  "provider_name": "codex",
+  "allowed_roots_trust_migrated": true,
+  "team_runs": {
+    "team_future": {
+      "id": "team_future",
+      "status": "paused",
+      "phase": "sub_tasks",
+      "spec": {
+        "title": "CANARY_FUTURE_TITLE",
+        "context": "CANARY_FUTURE_CONTEXT",
+        "acceptance_criteria": "CANARY_FUTURE_ACCEPTANCE",
+        "agreed_scope": "CANARY_FUTURE_SCOPE",
+        "quality_rules": "CANARY_FUTURE_RULES"
+      },
+      "sub_tasks": [
+        {
+          "id": "st-future",
+          "title": "CANARY_FUTURE_SUBTASK",
+          "brief": "CANARY_FUTURE_BRIEF",
+          "status": "implementing",
+          "rounds_used": 1,
+          "base_commit": "future-base",
+          "owned_thread_ids": ["future-dev-thread"]
+        }
+      ],
+      "orchestration_backend": {
+        "kind": "cloud_v99",
+        "future_backend_id": "opaque-future-id",
+        "future_protocol_version": 99
+      },
+      "driver_progress": {
+        "state_revision": 42,
+        "last_command_seq": 7,
+        "last_event_seq": 6,
+        "in_flight_command_id": "cmd-future",
+        "future_progress_field": 123
+      },
+      "slug": "future-task",
+      "branch": "task/future-task",
+      "target_ref": "refs/heads/main",
+      "base_commit": "base456",
+      "repo_main_worktree": "/tmp/content-blind/repo",
+      "cwd": "/tmp/content-blind/repo/.sealwire/worktrees/future-task",
+      "plan_rel_path": ".sealwire/PLAN.md",
+      "design_rel_path": ".sealwire/DESIGN.md",
+      "report_rel_path": ".sealwire/REPORT.md",
+      "tl_thread_id": "future-tl-thread",
+      "tl_provider": "codex",
+      "tl_model": "gpt-test",
+      "dev_provider": "codex",
+      "dev_model": "gpt-test",
+      "reviewer_provider": "codex",
+      "reviewer_model": "gpt-test",
+      "max_review_rounds": 2,
+      "max_mr_rounds": 2,
+      "requested_by_device_id": "device-future",
+      "requested_at": 1700000100,
+      "updated_at": 1700000102
+    }
+  }
+}

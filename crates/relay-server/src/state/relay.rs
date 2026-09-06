@@ -22,7 +22,7 @@ use crate::{
 
 use super::{
     ensure_path_within_device_scope, persistence::PersistedRelayState, unix_now, ReviewJob,
-    RunStatus, SecurityProfile, TeamPauseKind, TeamRun, TeamRunStatus, TeamThreadGate, WorkflowRun,
+    RunStatus, SecurityProfile, TeamRun, TeamRunStatus, TeamThreadGate, WorkflowRun,
     CONTROLLER_LEASE_SECS, DEFAULT_APPROVAL_POLICY, DEFAULT_EFFORT, DEFAULT_MODEL, DEFAULT_SANDBOX,
     STALE_TURN_PROGRESS_TIMEOUT_SECS,
 };
@@ -1686,7 +1686,7 @@ impl RelayState {
     /// a finished task has nothing left to steer.
     pub(crate) fn seat_run_id_for_thread(&self, thread_id: &str) -> Option<String> {
         self.team_runs_snapshot()
-            .filter(|run| !run.status.is_terminal())
+            .filter(|run| run.is_live_in_current_build())
             .find(|run| {
                 run.owned_thread_ids()
                     .iter()
@@ -2042,7 +2042,7 @@ impl RelayState {
     /// way to ask a person something — see `team_thread_gate`.
     pub(crate) fn is_thread_team_locked(&self, thread_id: &str) -> bool {
         self.team_runs.values().any(|run| {
-            !run.status.is_terminal()
+            run.is_live_in_current_build()
                 && run
                     .owned_thread_ids()
                     .iter()
@@ -2250,7 +2250,7 @@ impl RelayState {
     pub(crate) fn is_cwd_team_locked(&self, cwd: &str) -> bool {
         let candidate = super::normalize_cwd(cwd);
         self.team_runs.values().any(|run| {
-            !run.status.is_terminal()
+            run.is_live_in_current_build()
                 && !run.cwd.is_empty()
                 && super::path_within_allowed_roots(&candidate, std::slice::from_ref(&run.cwd))
         })
@@ -2260,7 +2260,11 @@ impl RelayState {
     ///
     /// The authority a user action on a team thread is authorized against: the
     /// run's own cwd path-scope, exactly as pause / stop / resume use. A team
-    /// thread has no other workspace of its own to check.
+    /// thread has no other workspace of its own to check. This is not a lock:
+    /// inert records must stay non-actionable, but their non-terminal lingering
+    /// questions still need the run's path scope rather than a device-only
+    /// fallback. Terminal history is excluded so a stale question from a finished
+    /// run cannot bypass the foreground-session approval gate.
     pub(crate) fn team_run_cwd_for_thread(&self, thread_id: &str) -> Option<String> {
         self.team_runs
             .values()
@@ -2283,7 +2287,7 @@ impl RelayState {
     /// than each guard inventing its own notion of "is this thread busy".
     pub(crate) fn team_thread_gate(&self, thread_id: &str) -> TeamThreadGate {
         for run in self.team_runs.values() {
-            if run.status.is_terminal() {
+            if !run.is_live_in_current_build() {
                 continue;
             }
             if !run.owned_thread_ids().iter().any(|id| id == thread_id) {
@@ -2491,8 +2495,17 @@ impl RelayState {
     pub(crate) fn update_team_run<F: FnOnce(&mut TeamRun)>(&mut self, id: &str, update: F) -> bool {
         match self.team_runs.get_mut(id) {
             Some(run) => {
+                let orchestration_backend_before = run.orchestration_backend.clone();
+                let execution_started_before = run.orchestration_execution_started();
                 update(run);
-                true
+                if execution_started_before
+                    && run.orchestration_backend != orchestration_backend_before
+                {
+                    run.orchestration_backend = orchestration_backend_before;
+                    false
+                } else {
+                    true
+                }
             }
             None => false,
         }
@@ -2523,7 +2536,7 @@ impl RelayState {
         let live: Vec<&TeamRun> = self
             .team_runs
             .values()
-            .filter(|run| !run.status.is_terminal())
+            .filter(|run| run.is_live_in_current_build())
             .collect();
         match live.as_slice() {
             [] => Err("there is no active task".to_string()),
@@ -2546,7 +2559,7 @@ impl RelayState {
         let live: Vec<&TeamRun> = self
             .team_runs
             .values()
-            .filter(|run| !run.status.is_terminal())
+            .filter(|run| run.is_live_in_current_build())
             .collect();
         match live.as_slice() {
             [run] => Ok(run.id.clone()),
@@ -2564,6 +2577,10 @@ impl RelayState {
     pub(crate) fn blocked_team_run_id(&self, run_id: Option<&str>) -> Result<String, String> {
         if let Some(run_id) = run_id {
             return match self.team_runs.get(run_id) {
+                Some(run) if !run.is_executable_by_current_build() => Err(run
+                    .non_executing_backend_reason()
+                    .unwrap_or("this task is pinned to an orchestration backend this relay build cannot execute")
+                    .to_string()),
                 Some(run) if matches!(run.status, TeamRunStatus::Blocked) => Ok(run.id.clone()),
                 Some(run) if matches!(run.status, TeamRunStatus::Resolving) => {
                     Err("this task is already being resolved".to_string())
@@ -2575,6 +2592,7 @@ impl RelayState {
         let blocked: Vec<&TeamRun> = self
             .team_runs
             .values()
+            .filter(|run| run.is_live_in_current_build())
             .filter(|run| matches!(run.status, TeamRunStatus::Blocked))
             .collect();
         match blocked.as_slice() {
@@ -2601,6 +2619,7 @@ impl RelayState {
         let done: Vec<&TeamRun> = self
             .team_runs
             .values()
+            .filter(|run| run.is_executable_by_current_build())
             .filter(|run| finished(run))
             .collect();
         match done.as_slice() {
@@ -2631,38 +2650,23 @@ impl RelayState {
 
     /// Clone persisted team runs for restore.
     ///
-    /// Three cases, and only the first is unlike every other run map here:
-    /// - `Paused` restores VERBATIM. It has no driver on purpose; resuming it is
-    ///   the whole feature. `mark_interrupted_if_stranded` enforces the exemption.
-    /// - `PausePending` / `AwaitingUser` settle to `Paused`. Both had a live
-    ///   driver that is now gone, but both are a boundary away from a legitimate
-    ///   pause, so degrading beats discarding. `AwaitingUser` additionally rolls
-    ///   its round back, because the pending question lived only in memory (and
-    ///   the Claude worker died with the relay), so nobody can answer it now.
-    /// - everything else non-terminal reconciles to `Interrupted`, as usual.
+    /// Restore delegates to `TeamRun` so every persisted run shape is reconciled
+    /// by one state-machine rule:
+    /// - Future or unknown orchestration backends are kept in the session but
+    ///   inert; non-terminal unsupported active records fail closed with an
+    ///   appended backend-pin diagnostic.
+    /// - `Paused` remains recoverable but clears transient pause, stop, and
+    ///   awaiting markers left by the dead process.
+    /// - `PausePending` / `AwaitingUser` settle to `Paused`; `AwaitingUser`
+    ///   additionally rolls its round back because the pending question lived
+    ///   only in memory.
+    /// - other stranded executable legacy records reconcile to `Interrupted`.
     fn restored_team_runs(persisted: &HashMap<String, TeamRun>) -> HashMap<String, TeamRun> {
         persisted
             .iter()
             .map(|(id, run)| {
                 let mut run = run.clone();
-                match run.status {
-                    TeamRunStatus::PausePending => {
-                        run.settle_paused(
-                            "the relay restarted while the team was pausing",
-                            TeamPauseKind::Boundary,
-                        );
-                    }
-                    TeamRunStatus::AwaitingUser => {
-                        run.rollback_current_round();
-                        run.settle_paused(
-                            "the relay restarted while the team was waiting on your answer; that step will be re-run",
-                            TeamPauseKind::Boundary,
-                        );
-                    }
-                    _ => {
-                        run.mark_interrupted_if_stranded();
-                    }
-                }
+                run.reconcile_after_restore();
                 (id.clone(), run)
             })
             .collect()
@@ -5325,8 +5329,8 @@ fn remote_action_cache_key(device_id: &str, action_id: &str) -> String {
 mod tests {
     use super::{
         BrokerPendingMessage, PendingPairingResult, PendingTranscriptDelta, PersistedRelayState,
-        RelayState, ReviewJob, SecurityProfile, TeamRun, TeamRunStatus, TranscriptDeltaKind,
-        WorkflowRun, MAX_WORKFLOW_RUNS,
+        RelayState, ReviewJob, SecurityProfile, TeamRun, TeamRunStatus, TeamThreadGate,
+        TranscriptDeltaKind, WorkflowRun, MAX_WORKFLOW_RUNS,
     };
     use crate::protocol::ThreadSummaryView;
     use crate::state::{ReviewMode, RunStatus};
@@ -5757,6 +5761,177 @@ mod tests {
         run
     }
 
+    fn cloud_backend() -> relay_api::orchestration::OrchestrationBackendRef {
+        relay_api::orchestration::OrchestrationBackendRef::Cloud {
+            protocol_version: relay_api::orchestration::SupportedProtocolVersion::current(),
+            driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
+            cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+        }
+    }
+
+    fn inert_team_run_with_status(id: &str, status: TeamRunStatus) -> TeamRun {
+        let mut run = team_run_with_status(id, status);
+        run.orchestration_backend = cloud_backend();
+        run
+    }
+
+    #[test]
+    fn inert_team_runs_do_not_lock_threads_or_worktrees() {
+        let mut relay = test_relay();
+        let mut inert = inert_team_run_with_status("future", TeamRunStatus::Paused);
+        inert.cwd = "/tmp/task-future".to_string();
+        inert.tl_thread_id = "tl-future".to_string();
+        relay.insert_team_run(inert);
+
+        assert!(
+            !relay.is_thread_team_locked("tl-future"),
+            "an inert owned thread must not be treated as locally locked"
+        );
+        assert_eq!(
+            relay.team_thread_gate("tl-future"),
+            TeamThreadGate::Free,
+            "an inert paused TL is visible history, not a conversable local seat"
+        );
+        assert_eq!(relay.seat_run_id_for_thread("tl-future"), None);
+        assert_eq!(
+            relay.team_run_cwd_for_thread("tl-future").as_deref(),
+            Some("/tmp/task-future"),
+            "authorization still needs the owning run's path scope"
+        );
+        assert!(
+            !relay.is_cwd_team_locked("/tmp/task-future/src"),
+            "an inert run must not retain workspace authority"
+        );
+
+        let mut terminal = team_run_with_status("terminal", TeamRunStatus::Done);
+        terminal.cwd = "/tmp/task-terminal".to_string();
+        terminal.tl_thread_id = "tl-terminal".to_string();
+        relay.insert_team_run(terminal);
+        assert_eq!(
+            relay.team_run_cwd_for_thread("tl-terminal"),
+            None,
+            "terminal lingering questions must fall back to foreground-session authorization"
+        );
+    }
+
+    #[test]
+    fn implicit_active_team_resolution_ignores_inert_runs() {
+        let mut relay = test_relay();
+        let mut live = team_run_with_status("legacy", TeamRunStatus::Running);
+        live.cwd = "/tmp/task-legacy".to_string();
+        relay.insert_team_run(live);
+
+        let mut inert = inert_team_run_with_status("future", TeamRunStatus::Paused);
+        inert.cwd = "/tmp/task-future".to_string();
+        relay.insert_team_run(inert);
+
+        assert_eq!(relay.active_team_run_id(None).unwrap(), "legacy");
+
+        relay.remove_team_run("legacy");
+        assert_eq!(
+            relay.active_team_run_id(None).unwrap_err(),
+            "there is no active task"
+        );
+        assert_eq!(
+            relay.active_team_run_id(Some("future")).unwrap(),
+            "future",
+            "explicit callers may still name the inert record and get a backend-level refusal"
+        );
+    }
+
+    #[test]
+    fn inert_blocked_runs_do_not_enter_blocked_recovery() {
+        let mut relay = test_relay();
+        relay.insert_team_run(inert_team_run_with_status("future", TeamRunStatus::Blocked));
+
+        assert_eq!(
+            relay.blocked_team_run_id(None).unwrap_err(),
+            "there is no blocked task to resolve"
+        );
+        let error = relay
+            .blocked_team_run_id(Some("future"))
+            .expect_err("explicit inert blocked recovery must refuse before Resolving");
+        assert!(error.contains("Cloud orchestration"), "{error}");
+    }
+
+    #[test]
+    fn implicit_reopen_resolution_ignores_inert_finished_runs() {
+        let mut relay = test_relay();
+        relay.insert_team_run(team_run_with_status("legacy", TeamRunStatus::Done));
+        relay.insert_team_run(inert_team_run_with_status("future", TeamRunStatus::Failed));
+
+        assert_eq!(relay.reopenable_team_run_id(None).unwrap(), "legacy");
+
+        relay.remove_team_run("legacy");
+        assert_eq!(
+            relay.reopenable_team_run_id(None).unwrap_err(),
+            "no task has finished, so there is nothing to reopen"
+        );
+        assert_eq!(
+            relay.reopenable_team_run_id(Some("future")).unwrap(),
+            "future",
+            "explicit callers still reach backend-specific refusal in the action layer"
+        );
+    }
+
+    #[test]
+    fn team_run_retention_never_prunes_non_terminal_runs_from_any_backend() {
+        let mut relay = test_relay();
+        for i in 0..=MAX_WORKFLOW_RUNS {
+            let mut run = inert_team_run_with_status(&format!("future-{i}"), TeamRunStatus::Paused);
+            run.requested_at = i as u64;
+            run.updated_at = i as u64;
+            relay.insert_team_run(run);
+        }
+        assert_eq!(
+            relay.team_runs.len(),
+            MAX_WORKFLOW_RUNS + 1,
+            "a newer backend's non-terminal records must survive this older build"
+        );
+        assert!(
+            relay.team_runs.contains_key("future-0"),
+            "an active run cannot be treated as disposable terminal history"
+        );
+
+        let mut relay = test_relay();
+        for i in 0..=MAX_WORKFLOW_RUNS {
+            let mut run = team_run_with_status(&format!("legacy-{i}"), TeamRunStatus::Paused);
+            run.requested_at = i as u64;
+            run.updated_at = i as u64;
+            relay.insert_team_run(run);
+        }
+        assert_eq!(
+            relay.team_runs.len(),
+            MAX_WORKFLOW_RUNS + 1,
+            "locally live records must not be evicted to satisfy the cap"
+        );
+
+        let mut relay = test_relay();
+        let mut finished = team_run_with_status("finished", TeamRunStatus::Done);
+        finished.requested_at = 100;
+        finished.updated_at = 1;
+        relay.insert_team_run(finished);
+        for i in 0..MAX_WORKFLOW_RUNS - 1 {
+            let mut run = team_run_with_status(&format!("live-{i}"), TeamRunStatus::Paused);
+            run.requested_at = 200 + i as u64;
+            run.updated_at = 200 + i as u64;
+            relay.insert_team_run(run);
+        }
+        let mut restored_inert =
+            inert_team_run_with_status("restored-inert", TeamRunStatus::Paused);
+        restored_inert.requested_at = 0;
+        restored_inert.updated_at = 10_000;
+        relay.insert_team_run(restored_inert);
+        assert!(
+            relay.team_runs.contains_key("restored-inert"),
+            "the newly inserted inert record must not evict itself"
+        );
+        assert!(
+            !relay.team_runs.contains_key("finished"),
+            "old terminal history should be pruned before the new insert when already at cap"
+        );
+    }
+
     #[test]
     fn teams_revision_moves_for_any_change_a_client_can_see() {
         // The cache key for the Teams channel. A content hash rather than a bumped
@@ -6003,6 +6178,316 @@ mod tests {
         let decoded: PersistedRelayState = serde_json::from_value(encoded)
             .expect("an unknown status must not fail the whole file");
         assert_eq!(decoded.team_runs["t1"].status, TeamRunStatus::Failed);
+    }
+
+    #[test]
+    fn legacy_team_run_session_fixture_preserves_all_canaries_and_run_fields() {
+        let fixture = include_str!("fixtures/team_run_legacy_session.json");
+        let persisted: PersistedRelayState =
+            serde_json::from_str(fixture).expect("legacy persisted session fixture must load");
+        let encoded = serde_json::to_string(&persisted).expect("legacy fixture must re-serialize");
+
+        let mut missing = Vec::new();
+        for canary in [
+            "CANARY_ACCEPTANCE",
+            "CANARY_CONTEXT_PROSE",
+            "CANARY_FINDING_TEXT",
+            "CANARY_PAUSE_REASON",
+            "CANARY_RESEED_REASON",
+            "CANARY_RESULT_SUMMARY",
+            "CANARY_RULES",
+            "CANARY_RUN_ERROR",
+            "CANARY_SCOPE",
+            "CANARY_SUBTASK_BRIEF",
+            "CANARY_SUBTASK_ERROR",
+            "CANARY_SUBTASK_TITLE",
+            "CANARY_TASK_TITLE",
+            "CANARY_UNRESOLVED_FINDING",
+            "CANARY_USER_NOTE",
+            "CANARY_VERDICT_SUMMARY",
+        ] {
+            if !encoded.contains(canary) {
+                missing.push(canary);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "legacy local-only canaries must survive decode/encode: {missing:?}"
+        );
+
+        let original: serde_json::Value =
+            serde_json::from_str(fixture).expect("legacy fixture must parse");
+        let round_tripped: serde_json::Value =
+            serde_json::from_str(&encoded).expect("re-encoded fixture must parse");
+        let round_tripped_run = &round_tripped["team_runs"]["team_legacy"];
+
+        fn assert_json_subset(
+            expected: &serde_json::Value,
+            actual: &serde_json::Value,
+            path: &str,
+        ) {
+            match (expected, actual) {
+                (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
+                    for (key, expected_value) in expected {
+                        let child_path = format!("{path}.{key}");
+                        let actual_value = actual
+                            .get(key)
+                            .unwrap_or_else(|| panic!("missing legacy field {child_path}"));
+                        assert_json_subset(expected_value, actual_value, &child_path);
+                    }
+                }
+                (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
+                    assert_eq!(
+                        actual.len(),
+                        expected.len(),
+                        "array length changed at {path}"
+                    );
+                    for (index, expected_value) in expected.iter().enumerate() {
+                        assert_json_subset(
+                            expected_value,
+                            &actual[index],
+                            &format!("{path}[{index}]"),
+                        );
+                    }
+                }
+                _ => assert_eq!(actual, expected, "legacy value changed at {path}"),
+            }
+        }
+
+        assert_json_subset(
+            &original["team_runs"]["team_legacy"],
+            round_tripped_run,
+            "team_runs.team_legacy",
+        );
+    }
+
+    #[test]
+    fn legacy_team_run_session_fixture_loads_as_legacy_embedded_without_losing_fields() {
+        let fixture = include_str!("fixtures/team_run_legacy_session.json");
+        let persisted: PersistedRelayState =
+            serde_json::from_str(fixture).expect("legacy persisted session fixture must load");
+        let run = persisted
+            .team_runs
+            .get("team_legacy")
+            .expect("fixture names a team run");
+
+        assert_eq!(
+            run.orchestration_backend,
+            relay_api::orchestration::OrchestrationBackendRef::LegacyEmbedded
+        );
+        assert_eq!(run.driver_progress, Default::default());
+        assert_eq!(run.status, TeamRunStatus::Paused);
+        assert_eq!(run.phase, crate::state::TeamPhase::SubTasks);
+        assert_eq!(run.spec.title, "CANARY_TASK_TITLE");
+        assert_eq!(run.spec.context, "CANARY_CONTEXT_PROSE");
+        assert_eq!(run.sub_tasks[0].brief, "CANARY_SUBTASK_BRIEF");
+        assert_eq!(
+            run.sub_tasks[0].last_verdict.as_ref().unwrap().findings[0],
+            "CANARY_FINDING_TEXT"
+        );
+        assert_eq!(run.pending_user_notes[0], "CANARY_USER_NOTE");
+        assert_eq!(run.unresolved[0], "CANARY_UNRESOLVED_FINDING");
+        assert_eq!(run.error.as_deref(), Some("CANARY_RUN_ERROR"));
+
+        let encoded = serde_json::to_string(&persisted).expect("re-serialize fixture");
+        for canary in [
+            "CANARY_TASK_TITLE",
+            "CANARY_CONTEXT_PROSE",
+            "CANARY_SUBTASK_BRIEF",
+            "CANARY_FINDING_TEXT",
+            "CANARY_USER_NOTE",
+            "CANARY_UNRESOLVED_FINDING",
+            "CANARY_RUN_ERROR",
+        ] {
+            assert!(
+                encoded.contains(canary),
+                "legacy local-only field {canary} must survive decode/encode"
+            );
+        }
+
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        let restored_run = restored.team_run("team_legacy").unwrap();
+        assert_eq!(restored_run.status, TeamRunStatus::Paused);
+        assert!(restored_run.status.is_resumable());
+        assert_eq!(
+            restored_run.orchestration_backend,
+            relay_api::orchestration::OrchestrationBackendRef::LegacyEmbedded
+        );
+    }
+
+    #[test]
+    fn unknown_backend_session_fixture_loads_but_restores_non_executing() {
+        let fixture = include_str!("fixtures/team_run_unknown_backend_session.json");
+        let persisted: PersistedRelayState =
+            serde_json::from_str(fixture).expect("future backend session fixture must load");
+        let run = persisted
+            .team_runs
+            .get("team_future")
+            .expect("fixture names a team run");
+
+        assert_eq!(
+            run.orchestration_backend.kind(),
+            relay_api::orchestration::OrchestrationBackendKind::UnknownNonExecuting
+        );
+        assert_eq!(
+            run.orchestration_backend.original_unknown_kind(),
+            Some("cloud_v99")
+        );
+        assert_eq!(run.driver_progress.state_revision, 42);
+        assert_eq!(run.driver_progress.last_command_seq, 7);
+        assert_eq!(run.driver_progress.last_event_seq, 6);
+        assert_eq!(
+            run.driver_progress
+                .in_flight_command_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some("cmd-future")
+        );
+        assert_eq!(run.spec.title, "CANARY_FUTURE_TITLE");
+
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        let restored_run = restored
+            .team_run("team_future")
+            .expect("unknown backend run must survive restore");
+        assert_eq!(restored_run.status, TeamRunStatus::Paused);
+        assert!(restored_run.status.is_resumable());
+        assert!(!restored_run.is_live_in_current_build());
+        assert!(
+            restored_run
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does not understand"),
+            "the restored run should explain why it cannot execute"
+        );
+        assert_eq!(
+            restored_run.orchestration_backend.kind(),
+            relay_api::orchestration::OrchestrationBackendKind::UnknownNonExecuting
+        );
+        assert_eq!(
+            restored_run.orchestration_backend.original_unknown_kind(),
+            Some("cloud_v99")
+        );
+    }
+
+    #[test]
+    fn unknown_backend_fixture_with_malformed_progress_still_loads_the_session() {
+        let fixture = include_str!("fixtures/team_run_unknown_backend_session.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(fixture).expect("fixture must parse as json");
+        raw["team_runs"]["team_future"]["driver_progress"]["in_flight_command_id"] =
+            serde_json::Value::String("https://example.test/cmd".to_string());
+        raw["team_runs"]["team_future"]["driver_progress"]["last_event_seq"] =
+            serde_json::json!({"future": true});
+
+        let persisted: PersistedRelayState =
+            serde_json::from_value(raw).expect("malformed future progress must not drop session");
+        let run = persisted
+            .team_runs
+            .get("team_future")
+            .expect("fixture names a team run");
+        assert_eq!(
+            run.orchestration_backend.kind(),
+            relay_api::orchestration::OrchestrationBackendKind::UnknownNonExecuting
+        );
+        assert_eq!(
+            run.orchestration_backend.original_unknown_kind(),
+            Some("cloud_v99")
+        );
+        assert_eq!(run.driver_progress.state_revision, 42);
+        assert_eq!(run.driver_progress.last_command_seq, 7);
+        assert_eq!(run.driver_progress.last_event_seq, 0);
+        assert!(run.driver_progress.in_flight_command_id.is_none());
+        assert!(run.driver_progress.is_malformed());
+
+        let rewritten = serde_json::to_value(&persisted).expect("rewrite persisted state");
+        assert_eq!(
+            rewritten["team_runs"]["team_future"]["driver_progress"]["malformed"],
+            serde_json::Value::Bool(true),
+            "a load/save cycle must retain the fail-closed progress marker"
+        );
+
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        let restored_run = restored.team_run("team_future").unwrap();
+        assert_eq!(restored_run.status, TeamRunStatus::Paused);
+        assert!(restored_run.status.is_resumable());
+        assert!(!restored_run.is_live_in_current_build());
+        assert!(restored_run.driver_progress.is_malformed());
+        assert!(
+            restored_run
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does not understand"),
+            "the restored run should explain why it cannot execute"
+        );
+    }
+
+    #[test]
+    fn relay_update_run_preserves_backend_after_execution_starts() {
+        let mut relay = test_relay();
+        relay.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+
+        let cloud = relay_api::orchestration::OrchestrationBackendRef::Cloud {
+            protocol_version: relay_api::orchestration::SupportedProtocolVersion::current(),
+            driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
+            cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+        };
+        assert!(
+            !relay.update_team_run("t1", |run| {
+                run.orchestration_backend = cloud;
+                run.phase = crate::state::TeamPhase::MrGate;
+            }),
+            "backend retargeting after execution begins must be rejected"
+        );
+
+        let run = relay.team_run("t1").unwrap();
+        assert_eq!(
+            run.orchestration_backend,
+            relay_api::orchestration::OrchestrationBackendRef::LegacyEmbedded,
+            "the closure seam must not retarget a run after execution begins"
+        );
+        assert_eq!(
+            run.phase,
+            crate::state::TeamPhase::MrGate,
+            "only the illegal backend retarget is rolled back"
+        );
+    }
+
+    #[test]
+    fn relay_update_run_allows_backend_selection_before_starting_execution() {
+        let mut relay = test_relay();
+        relay.insert_team_run(TeamRun::new(
+            "t1".to_string(),
+            crate::state::TaskSpec::default(),
+            "/tmp/wt".to_string(),
+            "device".to_string(),
+        ));
+
+        let cloud = relay_api::orchestration::OrchestrationBackendRef::Cloud {
+            protocol_version: relay_api::orchestration::SupportedProtocolVersion::current(),
+            driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
+            cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
+        };
+        assert!(
+            relay.update_team_run("t1", |run| {
+                run.set_orchestration_backend(cloud.clone())
+                    .expect("backend selection before execution starts should be legal");
+                run.status = TeamRunStatus::Running;
+            }),
+            "backend selection and the first execution marker may be committed atomically"
+        );
+
+        let run = relay.team_run("t1").unwrap();
+        assert_eq!(run.orchestration_backend, cloud);
+        assert_eq!(run.status, TeamRunStatus::Running);
+        assert!(
+            run.orchestration_execution_started(),
+            "the closure should have started execution after selecting the backend"
+        );
     }
 
     #[test]
