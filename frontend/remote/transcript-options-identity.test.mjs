@@ -1,52 +1,184 @@
-// react-app.js cannot be imported directly in this test runner: it transitively
-// pulls in shared/build-badge.js, which reads import.meta.env.BASE_URL — a
-// Vite-only global that does not exist under plain `node --test`. So these
-// two guards check the source text directly instead of executing RemoteApp.
+// react-app.js cannot be imported as a plain ES module under `node --test`:
+// it transitively pulls in shared/build-badge.js, which reads
+// import.meta.env.BASE_URL — a Vite-only global Node's loader never
+// populates. This follows the same fix as
+// remote-transcript-panel-empty-states.test.mjs: a module loader stub
+// redirects build-badge.js to an inert stub so the REAL react-app.js loads
+// with everything else intact. It additionally wraps
+// ../shared/transcript-options-identity.js with a spy that records every
+// `next` object handed to stableTranscriptOptions, forwarding to the real
+// implementation — so the tests below assert on the ACTUAL handler
+// references RemoteTranscriptPanel produces across real re-renders, instead
+// of grepping source text for `useCallback`.
 //
-// P1 regression this guards: stableTranscriptOptions (see
-// ../shared/transcript-options-identity.js) only reuses the previous
-// transcriptOptions object when every field is equal, which requires
-// ensureFileChangeDetail and the ask-user-answers handler to be stable
-// references. Both used to be recreated every render (a plain per-render
-// `async function` and an inline method respectively), which silently
-// defeated stableTranscriptOptions. These tests pin the useCallback fix.
+// P1 regression this guards: stableTranscriptOptions only reuses the
+// previous transcriptOptions object when every field is equal, which
+// requires the ask-user-answers handler RemoteTranscriptPanel builds
+// (handleSubmitAskUserAnswers) to keep the same reference across an
+// unrelated re-render. It used to be an inline method recreated every
+// render, silently defeating stableTranscriptOptions. (RemoteApp's own
+// ensureFileChangeDetail useCallback — the other half of that regression —
+// lives in the unexported top-level RemoteApp component, which would need a
+// full broker/session render harness to exercise; out of reach here.)
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { register } from "node:module";
+import { JSDOM } from "jsdom";
 
-const source = readFileSync(new URL("./react-app.js", import.meta.url), "utf8");
+const realHelperUrl = new URL("../shared/transcript-options-identity.js", import.meta.url).href;
+const spySource = [
+  `import { transcriptOptionValueEqual as realValueEqual, stableTranscriptOptions as realStable } from ${JSON.stringify(realHelperUrl)};`,
+  "export const transcriptOptionValueEqual = realValueEqual;",
+  "export const stableTranscriptOptionsCalls = [];",
+  "export function stableTranscriptOptions(previous, next) {",
+  "  stableTranscriptOptionsCalls.push(next);",
+  "  return realStable(previous, next);",
+  "}",
+].join("\n");
 
-test("ensureFileChangeDetail is hoisted via useCallback, not recreated as a plain function every render", () => {
-  assert.doesNotMatch(
-    source,
-    /async function ensureFileChangeDetail\(/,
-    "ensureFileChangeDetail must not be a plain per-render function declaration — it flows into " +
-      "transcriptOptions and a fresh reference every render defeats stableTranscriptOptions"
+register(
+  `data:text/javascript,
+    export async function resolve(specifier, context, nextResolve) {
+      if (specifier.endsWith("/shared/build-badge.js")) {
+        return { url: "build-badge-stub:main", shortCircuit: true };
+      }
+      if (specifier.endsWith("/shared/transcript-options-identity.js") && !specifier.startsWith("file:")) {
+        return { url: "transcript-options-identity-spy:main", shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    }
+    export async function load(url, context, nextLoad) {
+      if (url === "build-badge-stub:main") {
+        return {
+          format: "module",
+          shortCircuit: true,
+          source: "export async function fetchBuildInfo() { return { label: '', title: '' }; }\\nexport async function mountBuildBadge() {}",
+        };
+      }
+      if (url === "transcript-options-identity-spy:main") {
+        return {
+          format: "module",
+          shortCircuit: true,
+          source: ${JSON.stringify(spySource)},
+        };
+      }
+      return nextLoad(url, context);
+    }
+  `,
+  import.meta.url
+);
+
+const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost/" });
+global.window = dom.window;
+global.document = dom.window.document;
+global.HTMLElement = dom.window.HTMLElement;
+global.Node = dom.window.Node;
+global.CustomEvent = dom.window.CustomEvent;
+global.IS_REACT_ACT_ENVIRONMENT = true;
+
+const React = (await import("react")).default;
+const { act } = await import("react");
+const { createRoot } = await import("react-dom/client");
+const { RemoteTranscriptPanel } = await import("./react-app.js");
+const { stableTranscriptOptionsCalls } = await import("../shared/transcript-options-identity.js");
+
+const h = React.createElement;
+
+function baseProps(overrides = {}) {
+  return {
+    currentState: {},
+    emptyStateModel: { showRelayHome: false, showServerDisconnected: false },
+    onApplyFileChange: () => {},
+    onForkFromMessage: () => {},
+    onSelectRelay: () => {},
+    onToggleExpandableBlock: () => {},
+    onSubmitDecision: () => {},
+    onSubmitAskUserAnswers: () => {},
+    onToggleTranscriptItem: () => {},
+    onEnsureFileChangeDetail: () => {},
+    pendingAskUserQuestions: [],
+    session: null,
+    sessionView: null,
+    transcriptDetailEntries: new Map(),
+    askUserDetailErrors: new Map(),
+    askUserDetailLoadingRequestIds: new Set(),
+    uiState: {
+      transcriptExpandedItemIds: new Set(),
+      transcriptLoadingItemIds: new Set(),
+      askUserSubmittingRequestId: "",
+      askUserErrors: new Map(),
+    },
+    ...overrides,
+  };
+}
+
+// Re-renders the SAME root (unlike remote-transcript-panel-empty-states.test.mjs's
+// per-scenario `mount`), so transcriptOptionsRef and the useCallback closures
+// inside RemoteTranscriptPanel persist across renders exactly like a real update.
+function mountHarness(initialProps) {
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  act(() => {
+    root.render(h(RemoteTranscriptPanel, initialProps));
+  });
+  return {
+    rerender(nextProps) {
+      act(() => {
+        root.render(h(RemoteTranscriptPanel, nextProps));
+      });
+    },
+    cleanup() {
+      act(() => root.unmount());
+      host.remove();
+    },
+  };
+}
+
+test("the ask-user-answers handler RemoteTranscriptPanel builds keeps a stable reference across an unrelated re-render", () => {
+  const onSubmitAskUserAnswers = () => {};
+  const onEnsureFileChangeDetail = () => {};
+  stableTranscriptOptionsCalls.length = 0;
+
+  const harness = mountHarness(baseProps({ onSubmitAskUserAnswers, onEnsureFileChangeDetail }));
+  // Fresh (but equal) collection instances on the second render, mirroring what
+  // every real re-render produces — only an unrelated field changes here.
+  harness.rerender(
+    baseProps({
+      onSubmitAskUserAnswers,
+      onEnsureFileChangeDetail,
+      transcriptDetailEntries: new Map(),
+      askUserDetailErrors: new Map(),
+      askUserDetailLoadingRequestIds: new Set(),
+    })
   );
-  assert.match(
-    source,
-    /const ensureFileChangeDetail = useCallback\(/,
-    "ensureFileChangeDetail must be hoisted via useCallback so its identity survives an unrelated re-render"
+
+  assert.equal(stableTranscriptOptionsCalls.length, 2);
+  const [firstCall, secondCall] = stableTranscriptOptionsCalls;
+  assert.equal(
+    secondCall.onSubmitAskUserAnswers,
+    firstCall.onSubmitAskUserAnswers,
+    "handleSubmitAskUserAnswers must not be recreated when its onSubmitAskUserAnswers prop is unchanged"
   );
+
+  harness.cleanup();
 });
 
-test("the ask-user-answers handler passed into the transcript props is a hoisted, stable reference", () => {
-  assert.doesNotMatch(
-    source,
-    /onSubmitAskUserAnswers\(requestId, answers\) \{/,
-    "the transcript props must not carry an inline onSubmitAskUserAnswers method — a fresh closure " +
-      "every render defeats stableTranscriptOptions exactly like ensureFileChangeDetail did"
+test("the ask-user-answers handler RemoteTranscriptPanel builds changes when its onSubmitAskUserAnswers prop changes", () => {
+  stableTranscriptOptionsCalls.length = 0;
+
+  const harness = mountHarness(baseProps({ onSubmitAskUserAnswers: () => {} }));
+  harness.rerender(baseProps({ onSubmitAskUserAnswers: () => {} }));
+
+  assert.equal(stableTranscriptOptionsCalls.length, 2);
+  const [firstCall, secondCall] = stableTranscriptOptionsCalls;
+  assert.notEqual(
+    secondCall.onSubmitAskUserAnswers,
+    firstCall.onSubmitAskUserAnswers,
+    "a changed onSubmitAskUserAnswers prop must produce a new handler — proves the useCallback " +
+      "dependency array isn't stale/empty"
   );
-  assert.match(
-    source,
-    /onSubmitAskUserAnswers: handleSubmitAskUserAnswers,/,
-    "the transcript props must reference a hoisted, useCallback-stabilized handler"
-  );
-  assert.match(
-    source,
-    /const handleSubmitAskUserAnswers = useCallback\(/,
-    "handleSubmitAskUserAnswers must itself be a useCallback with an empty dependency array " +
-      "(it only ever reads handlersRef.current, never closure-captures `handlers` directly)"
-  );
+
+  harness.cleanup();
 });
