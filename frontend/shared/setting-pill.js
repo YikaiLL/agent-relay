@@ -16,6 +16,7 @@ export function SettingPill({
   id = null,
   inherited = false,
   label,
+  onOpen = null,
   onSelect = null,
   options = null,
   tag = null,
@@ -91,7 +92,10 @@ export function SettingPill({
         className: "setting-pill-trigger",
         disabled: disabled || undefined,
         id: id || undefined,
-        onClick: () => setOpen((wasOpen) => !wasOpen),
+        onClick: () => {
+          if (!open) onOpen?.();
+          setOpen((wasOpen) => !wasOpen);
+        },
         ref: triggerRef,
         type: "button",
       },

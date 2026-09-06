@@ -115,7 +115,11 @@ import {
   isOmittedFileChangeDetail,
   setLiveTranscriptEntryDetail,
 } from "./transcript/details.js";
-import { ensureProviderModels, fetchModelsWithRetry } from "./provider-model-fetch.js";
+import {
+  ensureModelPickerCatalogs,
+  ensureProviderModels,
+  fetchModelsWithRetry,
+} from "./provider-model-fetch.js";
 import { useRemoteSessionRuntime } from "./use-remote-session-runtime.js";
 import { useRemoteTranscriptScrollBookkeeping } from "./use-transcript-scroll-bookkeeping.js";
 import {
@@ -908,6 +912,12 @@ function RemoteApp() {
     modelsStatus: selectedProviderModels.length
       ? "ready"
       : remoteUi.providerModelsStatus[selectedProvider] || "loading",
+    onOpenModelPicker() {
+      void ensureModelPickerCatalogs(
+        remoteUiStore,
+        (provider) => handlers.onFetchProviderModels?.(provider)
+      );
+    },
     startPending: remoteUi.sessionStartPending,
     workspaceSuggestions: selectWorkspaceSuggestionsModel({
       session,

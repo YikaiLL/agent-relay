@@ -28,6 +28,7 @@ export function StartSessionDialog({
   modelsStatus = "ready",
   onCreateProject = null,
   onFieldChange = null,
+  onOpenModelPicker = null,
   // Its own callback, not two onFieldChange calls: provider, model and effort must
   // move together, and the second of two sequential calls reads a stale render.
   onSelectModel = null,
@@ -169,6 +170,7 @@ export function StartSessionDialog({
         id: `${id}-model`,
         key: "model",
         label: "Model",
+        onOpen: onOpenModelPicker,
         onSelect: (value, option) => {
           onSelectModel?.({ model: value, provider: option.provider || provider });
         },

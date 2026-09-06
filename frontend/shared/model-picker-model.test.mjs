@@ -120,6 +120,11 @@ test("a selected model missing from its catalog is still listed, so the choice i
     groups[0].options.map((option) => [option.value, option.selected]),
     [["claude-opus-4-6", true]]
   );
+  assert.equal(
+    groups[0].empty,
+    true,
+    "the synthetic current-model row must not masquerade as a loaded catalog"
+  );
 });
 
 test("a provider with no catalog yet is still CHOOSABLE, not just visible", () => {

@@ -43,7 +43,11 @@ export function buildModelPickerGroups({
     return {
       // A cold catalogue still gets a CHOOSABLE row carrying an empty model id:
       // zero options read as "offered but disabled" and stranded the user.
-      empty: rendered.length === 0,
+      // buildModelSelectOptions keeps a selected foreign id visible even when
+      // the real catalog is empty. That safety row is not evidence that the
+      // catalog loaded: mark the section unavailable so a one-row menu never
+      // masquerades as the complete model list.
+      empty: models.length === 0,
       label: providerLabel(provider),
       options: rendered.length
         ? rendered

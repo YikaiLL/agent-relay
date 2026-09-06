@@ -56,3 +56,23 @@ export async function ensureProviderModels(store, provider, fetchFn, options) {
     store.getState().setProviderModelsStatus(provider, "error");
   }
 }
+
+// The boot pre-fetch is deliberately bounded. If it exhausts its retries, the
+// New Session picker used to stay on its synthetic current-model row forever:
+// opening the picker was not another fetch edge. Retry missing/error catalogs
+// when the user asks to see them. A still-running boot fetch remains deduped by
+// ensureProviderModels's "loading" guard.
+export async function ensureModelPickerCatalogs(store, fetchFn, options) {
+  const ui = store.getState();
+  const providers = ui.providers?.length
+    ? ui.providers
+    : [ui.sessionDraft?.provider].filter(Boolean);
+  const needsCatalog = providers.filter((provider) => (
+    !ui.providerModels?.[provider]?.length
+    || ui.providerModelsStatus?.[provider] === "error"
+  ));
+
+  await Promise.all(
+    needsCatalog.map((provider) => ensureProviderModels(store, provider, fetchFn, options))
+  );
+}

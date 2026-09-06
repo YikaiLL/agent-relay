@@ -191,7 +191,12 @@ export function WorkspacePicker({
       const at = rowsRef.current.findIndex((row) => row.isSelected);
       return at >= 0 ? at : 0;
     });
-    inputRef.current?.focus();
+    // The search field is portalled out of the scrolling dialog body. Android
+    // Chrome otherwise scrolls that body to "reveal" an input which is already
+    // visible in the fixed panel: the trigger moves with the body while the
+    // panel stays put, leaving the two hundreds of pixels apart. The visual
+    // viewport resize from the keyboard is still handled by useAnchoredMenu.
+    inputRef.current?.focus({ preventScroll: true });
     // Identifies WHICH picker: rail, sheet and review panel share one store.
     onOpenRef.current?.(panelId);
     // Also fires on unmount: a thread switch never runs a close handler.

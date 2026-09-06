@@ -83,6 +83,29 @@ const open = (host) => click(host.querySelector(".workspace-picker-trigger"));
 const rows = (host) => [...host.querySelectorAll(".workspace-picker-row")];
 const rowText = (host) => rows(host).map((row) => row.textContent);
 
+test("opening focuses the portalled search without scrolling its dialog", () => {
+  const focus = dom.window.HTMLInputElement.prototype.focus;
+  let focusOptions = null;
+  dom.window.HTMLInputElement.prototype.focus = function recordFocus(options) {
+    focusOptions = options;
+    return focus.call(this, options);
+  };
+
+  try {
+    const view = mount(WorkspacePicker, { suggestions: [], value: SESSION_CWD });
+    open(view.host);
+
+    assert.deepEqual(
+      focusOptions,
+      { preventScroll: true },
+      "a mobile browser must not move the trigger away from its fixed menu while focusing"
+    );
+    view.cleanup();
+  } finally {
+    dom.window.HTMLInputElement.prototype.focus = focus;
+  }
+});
+
 test("the panel groups worktrees under the repo, branch first", () => {
   const view = mount(WorkspacePicker, { roots: ROOTS, value: SESSION_CWD });
   open(view.host);

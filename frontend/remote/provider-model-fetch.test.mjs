@@ -27,7 +27,7 @@ function installBrowserStubs() {
 installBrowserStubs();
 
 const { createRemoteUiStore } = await import("./remote-ui-store.js");
-const { ensureProviderModels } = await import("./provider-model-fetch.js");
+const { ensureModelPickerCatalogs, ensureProviderModels } = await import("./provider-model-fetch.js");
 
 const NO_SLEEP = { baseDelayMs: 0, sleep: () => Promise.resolve() };
 const CATALOG = [{ model: "gpt-5.5", display_name: "GPT-5.5" }];
@@ -85,4 +85,39 @@ test("ensureProviderModels ignores an empty provider name", async () => {
     return CATALOG;
   });
   assert.equal(calls, 0);
+});
+
+test("opening the model picker retries a catalog that boot left in error", async () => {
+  const store = createRemoteUiStore({
+    providerModels: { codex: [] },
+    providerModelsStatus: { codex: "error" },
+    providers: ["codex"],
+  });
+  let calls = 0;
+
+  await ensureModelPickerCatalogs(store, async (provider) => {
+    calls += 1;
+    assert.equal(provider, "codex");
+    return CATALOG;
+  }, NO_SLEEP);
+
+  assert.equal(calls, 1);
+  assert.deepEqual(store.getState().providerModels.codex, CATALOG);
+  assert.equal(store.getState().providerModelsStatus.codex, "ready");
+});
+
+test("opening the model picker keeps ready catalogs and dedupes a boot fetch", async () => {
+  const store = createRemoteUiStore({
+    providerModels: { claude_code: CATALOG, codex: [] },
+    providerModelsStatus: { claude_code: "ready", codex: "loading" },
+    providers: ["claude_code", "codex"],
+  });
+  let calls = 0;
+
+  await ensureModelPickerCatalogs(store, async () => {
+    calls += 1;
+    return CATALOG;
+  }, NO_SLEEP);
+
+  assert.equal(calls, 0, "ready catalogs stay cached and the in-flight boot pull is not duplicated");
 });

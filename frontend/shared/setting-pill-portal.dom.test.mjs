@@ -36,7 +36,7 @@ const PROVIDER_MODELS = {
   })),
 };
 
-function mountDialog() {
+function mountDialog({ onOpenModelPicker = null } = {}) {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
@@ -55,6 +55,7 @@ function mountDialog() {
           provider: "codex",
         },
         id: "grouped-model-dialog",
+        onOpenModelPicker,
         providerModels: PROVIDER_MODELS,
         providers: PROVIDERS,
       })
@@ -94,5 +95,21 @@ test("the grouped model menu escapes the pill wrapper and is placed by JS", () =
     "grouped menus must run through shared placement"
   );
 
+  view.cleanup();
+});
+
+test("opening the grouped model picker asks its host to refresh the catalog", () => {
+  let opens = 0;
+  const view = mountDialog({ onOpenModelPicker: () => { opens += 1; } });
+  const trigger = view.host.querySelector("#grouped-model-dialog-model");
+
+  click(trigger);
+  assert.equal(opens, 1);
+
+  click(trigger);
+  assert.equal(opens, 1, "closing the picker is not another refresh request");
+
+  click(trigger);
+  assert.equal(opens, 2, "a later opening may retry a catalog that failed again");
   view.cleanup();
 });

@@ -152,6 +152,7 @@ export function SessionPanel({
     // one shape of input instead of one field plus a special case.
     fields: model.fields,
     onFieldChange,
+    onOpenModelPicker: model.onOpenModelPicker,
     onSelectModel,
     onStart: onStartSession,
     startPending: model.startPending,
