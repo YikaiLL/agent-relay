@@ -215,6 +215,7 @@ import {
   isDocumentForeground,
 } from "../shared/thread-notify.js";
 import { LocalTranscriptPanel } from "./local-transcript-panel.js";
+import { stableTranscriptOptions } from "../shared/transcript-options-identity.js";
 
 const h = React.createElement;
 const reactRoots = new WeakMap();
@@ -252,63 +253,6 @@ function renderConversationContent(content) {
   flushSync(() => {
     transcriptRoot.render(content);
   });
-}
-
-// transcriptOptions carries a few collection fields (readLocalUiState
-// defensively copies its Sets/Maps, buildExpandedTranscriptDetailEntries
-// always builds a fresh Map) that are reallocated every render even when
-// nothing changed, so a reference check alone would never see "nothing
-// changed" here. Compared by value for the collection shapes transcriptOptions
-// actually carries; everything else (primitives, and the two handlers hoisted
-// in createSessionRenderer below) compares by reference.
-function transcriptOptionValueEqual(a, b) {
-  if (Object.is(a, b)) {
-    return true;
-  }
-  if (Array.isArray(a) && Array.isArray(b)) {
-    return a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
-  }
-  if (a instanceof Set && b instanceof Set) {
-    if (a.size !== b.size) {
-      return false;
-    }
-    for (const value of a) {
-      if (!b.has(value)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  if (a instanceof Map && b instanceof Map) {
-    if (a.size !== b.size) {
-      return false;
-    }
-    for (const [key, value] of a) {
-      if (!b.has(key) || !Object.is(b.get(key), value)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  return false;
-}
-
-// Reuses the PREVIOUS transcriptOptions object when every field is equal to
-// this render's, so React.memo on each transcript entry actually short-
-// circuits on a render tick that didn't touch anything it reads, instead of
-// re-rendering the whole transcript because the options object is a fresh
-// literal every time.
-function stableTranscriptOptions(previous, next) {
-  if (previous) {
-    const nextKeys = Object.keys(next);
-    if (
-      nextKeys.length === Object.keys(previous).length
-      && nextKeys.every((key) => transcriptOptionValueEqual(previous[key], next[key]))
-    ) {
-      return previous;
-    }
-  }
-  return next;
 }
 
 export function createSessionRenderer({

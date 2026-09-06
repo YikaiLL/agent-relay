@@ -16,6 +16,7 @@ import { StartSessionSplitButton } from "../shared/start-session-split-button.js
 import { ConversationHeader } from "../shared/conversation-header.js";
 import { ClientLog } from "../shared/client-log.js";
 import { createAskUserQuestionDetailLoader } from "../shared/ask-user-question-detail-loader.js";
+import { stableTranscriptOptions } from "../shared/transcript-options-identity.js";
 import {
   loadLastApprovalPolicy,
   loadLastEffort,
@@ -3282,64 +3283,6 @@ function RemoteThreadPanel({
       })
     )
   );
-}
-
-// transcriptOptions carries a few collection fields (transcriptDetailEntries
-// is rebuilt as a fresh Map by buildExpandedTranscriptDetailEntries on every
-// render regardless of content, and the askUserDetail*/askUserErrors
-// fallbacks allocate a fresh empty Map/Set) that would defeat a plain
-// useMemo — its dependency check is Object.is per entry, which a freshly
-// allocated collection always fails even when empty/identical. Compared by
-// value for the collection shapes transcriptOptions actually carries;
-// everything else compares by reference.
-export function transcriptOptionValueEqual(a, b) {
-  if (Object.is(a, b)) {
-    return true;
-  }
-  if (Array.isArray(a) && Array.isArray(b)) {
-    return a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
-  }
-  if (a instanceof Set && b instanceof Set) {
-    if (a.size !== b.size) {
-      return false;
-    }
-    for (const value of a) {
-      if (!b.has(value)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  if (a instanceof Map && b instanceof Map) {
-    if (a.size !== b.size) {
-      return false;
-    }
-    for (const [key, value] of a) {
-      if (!b.has(key) || !Object.is(b.get(key), value)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  return false;
-}
-
-// Reuses the PREVIOUS transcriptOptions object when every field is equal to
-// this render's, so React.memo on each transcript entry actually short-
-// circuits on a render tick that didn't touch anything it reads, instead of
-// re-rendering the whole transcript because the options object is a fresh
-// literal every time.
-export function stableTranscriptOptions(previous, next) {
-  if (previous) {
-    const nextKeys = Object.keys(next);
-    if (
-      nextKeys.length === Object.keys(previous).length
-      && nextKeys.every((key) => transcriptOptionValueEqual(previous[key], next[key]))
-    ) {
-      return previous;
-    }
-  }
-  return next;
 }
 
 export function RemoteTranscriptPanel({
