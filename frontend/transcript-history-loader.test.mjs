@@ -649,3 +649,111 @@ test("scroll fallback: a frame that survives cancellation is still suppressed by
     delete globalThis.requestAnimationFrame;
   }
 });
+
+test("scroll fallback: detach cancels via the canceller matching how the frame was scheduled", async () => {
+  // The original teardown always reached for cancelAnimationFrame, which
+  // cannot cancel a setTimeout handle. Assert each branch hands its OWN handle
+  // to its OWN canceller, rather than only observing that onLoad stayed quiet.
+  const rafCancelled = [];
+  const timeoutCancelled = [];
+  const realClearTimeout = globalThis.clearTimeout;
+  globalThis.clearTimeout = (handle) => {
+    timeoutCancelled.push(handle);
+    return realClearTimeout(handle);
+  };
+
+  try {
+    // --- rAF available: cancelAnimationFrame gets the rAF handle ---
+    globalThis.requestAnimationFrame = () => 4242;
+    globalThis.cancelAnimationFrame = (handle) => rafCancelled.push(handle);
+    const rafScrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+    const disposeRaf = createTranscriptHistoryLoader({
+      ObserverCtor: null,
+      onLoad: () => {},
+      scrollElement: rafScrollEl,
+      sentinelElement: { id: "raf" },
+    });
+    rafScrollEl.emitScroll();
+    disposeRaf();
+    assert.deepEqual(rafCancelled, [4242], "the rAF handle goes to cancelAnimationFrame");
+    assert.deepEqual(timeoutCancelled, [], "clearTimeout is not used for a rAF handle");
+
+    // --- rAF absent: clearTimeout gets the timeout handle ---
+    delete globalThis.requestAnimationFrame;
+    delete globalThis.cancelAnimationFrame;
+    const timeoutScrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+    const disposeTimeout = createTranscriptHistoryLoader({
+      ObserverCtor: null,
+      onLoad: () => {},
+      scrollElement: timeoutScrollEl,
+      sentinelElement: { id: "timeout" },
+    });
+    timeoutScrollEl.emitScroll();
+    disposeTimeout();
+    assert.equal(timeoutCancelled.length, 1, "the timeout handle goes to clearTimeout");
+    assert.deepEqual(rafCancelled, [4242], "no extra cancelAnimationFrame call");
+  } finally {
+    globalThis.clearTimeout = realClearTimeout;
+    delete globalThis.requestAnimationFrame;
+    delete globalThis.cancelAnimationFrame;
+  }
+});
+
+// --- detach inside the queued-microtask window ------------------------------
+//
+// Both async paths check `disposed` and then queue a microtask before reaching
+// onLoad. detach() landing inside that window still has to suppress the call.
+
+test("observer path: detach after the intersection queues its burst, before the burst runs, suppresses onLoad", async () => {
+  const { FakeObserver, instances } = makeFakeObserverFactory();
+  let calls = 0;
+  const dispose = createTranscriptHistoryLoader({
+    ObserverCtor: FakeObserver,
+    onLoad: () => {
+      calls += 1;
+      return true;
+    },
+    scrollElement: makeScrollEl({ scrollTop: 0 }),
+    sentinelElement: { id: "sentinel" },
+  });
+
+  // Fire the callback WITHOUT awaiting: scheduleBurst has queued
+  // runPrefetchBurst as a microtask that has not run yet.
+  instances[0].callback([{ isIntersecting: true }]);
+  dispose();
+
+  await flushBurst();
+  assert.equal(calls, 0, "a burst queued before detach must not reach onLoad");
+});
+
+test("scroll fallback: detach after the frame runs, before its queued microtask, suppresses onLoad", async () => {
+  const scrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+  let calls = 0;
+  let queuedFrame = null;
+  globalThis.requestAnimationFrame = (cb) => {
+    queuedFrame = cb;
+    return 1;
+  };
+
+  try {
+    const dispose = createTranscriptHistoryLoader({
+      ObserverCtor: null,
+      onLoad: () => {
+        calls += 1;
+      },
+      scrollElement: scrollEl,
+      sentinelElement: { id: "sentinel" },
+    });
+
+    scrollEl.emitScroll();
+    // The frame body runs and queues Promise.then(onLoad) — but that microtask
+    // has not run yet.
+    queuedFrame();
+    dispose();
+
+    await flushBurst();
+    assert.equal(calls, 0, "a microtask queued before detach must not reach onLoad");
+  } finally {
+    delete globalThis.requestAnimationFrame;
+  }
+});

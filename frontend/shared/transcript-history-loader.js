@@ -49,12 +49,12 @@ export function createTranscriptHistoryLoader({
   // IntersectionObserver transition or a sync() poke after a re-render — clears
   // it, so a cursor that only appears after hydration still starts a burst.
   let awaitingExternalPoke = false;
-  // `disconnect()` alone doesn't stop an in-flight burst: `runPrefetchBurst`'s
-  // `await onLoad()` can still be pending when `dispose()` runs (sentinel
-  // removed/replaced, or the component unmounting), and its eventual `true`
-  // would otherwise loop into another onLoad call from a loader nothing owns
-  // any more — overlapping whatever loader replaced it. Checked after every
-  // await in the burst loop, and up front by anything that could restart one.
+  // `disconnect()` alone doesn't stop a burst: it can be queued as a microtask
+  // or awaiting `onLoad()` when `dispose()` runs (sentinel removed/replaced, or
+  // the component unmounting), and would then keep calling onLoad from a loader
+  // nothing owns any more — overlapping whatever loader replaced it. Checked
+  // immediately before every onLoad call, after every await, and up front by
+  // anything that could start a burst.
   let disposed = false;
 
   const observer = new ObserverCtor(
@@ -112,6 +112,13 @@ export function createTranscriptHistoryLoader({
     const startScrollTop = readScrollTop();
     let loaded = 0;
     while (loaded < MAX_PREFETCH_PAGES_PER_BURST) {
+      // Immediately before the call, every iteration. scheduleBurst's own
+      // `disposed` check happens a microtask earlier, so dispose() can land
+      // between that check and this first onLoad — and on later iterations it
+      // can land during either await below.
+      if (disposed) {
+        return;
+      }
       const result = await onLoad();
       // dispose() can land while the call above was in flight (sentinel
       // removed/replaced, or unmount) — a `true` result must not loop into
@@ -135,9 +142,6 @@ export function createTranscriptHistoryLoader({
       loaded += 1;
       // Let the prepend lay out (scroll anchoring) before measuring the band.
       await nextFrame();
-      if (disposed) {
-        return;
-      }
       if (!stillWithinPrefetchBand()) {
         return; // enough buffered above the fold; user scroll re-triggers
       }
@@ -238,7 +242,9 @@ function attachScrollFallback({ scrollElement, onLoad }) {
       }
       pending = true;
       Promise.resolve()
-        .then(() => onLoad())
+        // Re-checked here, not just above: dispose() can land between this
+        // frame body and the microtask it queues.
+        .then(() => (disposed ? undefined : onLoad()))
         .catch(() => {})
         .finally(() => {
           pending = false;

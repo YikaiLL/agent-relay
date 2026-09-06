@@ -437,3 +437,76 @@ test("a branch swap that removes the sentinel while a load is pending does not l
     delete global.IntersectionObserver;
   }
 });
+
+// --- scroll-fallback lifecycle (no IntersectionObserver) --------------------
+//
+// jsdom provides neither IntersectionObserver nor requestAnimationFrame, so
+// simply NOT installing the fake above puts the panel on the real scroll
+// fallback and its setTimeout(cb, 16) frame. Every other loader test here
+// covers only the IntersectionObserver path.
+
+// Past the fallback's own 16ms frame, so a still-live one would have fired.
+const flushFallbackFrame = () => new Promise((resolve) => setTimeout(resolve, 40));
+
+function assertOnFallbackPath() {
+  assert.equal(
+    typeof global.IntersectionObserver,
+    "undefined",
+    "precondition: no IntersectionObserver, so the panel uses the scroll fallback"
+  );
+}
+
+test("scroll fallback: unmounting with a frame queued does not call onLoad afterwards", async () => {
+  assertOnFallbackPath();
+  const view = mount();
+  const onLoadCalls = [];
+  const onLoadOlderTranscript = () => {
+    onLoadCalls.push(true);
+  };
+
+  view.render({ entries: entriesFor(2), onLoadOlderTranscript });
+  // The fallback listens on the scroll element the panel was handed.
+  view.host.dispatchEvent(new dom.window.Event("scroll"));
+
+  view.unmount();
+  await flushFallbackFrame();
+  assert.deepEqual(
+    onLoadCalls,
+    [],
+    "a fallback frame queued before unmount must not call onLoad afterwards"
+  );
+});
+
+test("scroll fallback: a sentinel swap with a frame queued does not overlap the replacement loader", async () => {
+  assertOnFallbackPath();
+  const view = mount();
+  const onLoadCalls = [];
+  let generation = "first";
+  const onLoadOlderTranscript = () => {
+    onLoadCalls.push(generation);
+  };
+
+  try {
+    view.render({ entries: entriesFor(2), onLoadOlderTranscript });
+    view.host.dispatchEvent(new dom.window.Event("scroll"));
+
+    // Branch swap removes the sentinel, so sync() disposes the loader while
+    // its frame is still queued.
+    view.render({ viewingConversation: false, viewedThreadLocked: true, onLoadOlderTranscript });
+    await flushFallbackFrame();
+    assert.deepEqual(onLoadCalls, [], "the superseded loader's queued frame must stay silent");
+
+    // The sentinel returns; only this replacement loader may load.
+    generation = "second";
+    view.render({ entries: entriesFor(3), onLoadOlderTranscript });
+    view.host.dispatchEvent(new dom.window.Event("scroll"));
+    await flushFallbackFrame();
+    assert.deepEqual(
+      onLoadCalls,
+      ["second"],
+      "only the replacement loader loads, with no overlap from the detached one"
+    );
+  } finally {
+    view.unmount();
+  }
+});
