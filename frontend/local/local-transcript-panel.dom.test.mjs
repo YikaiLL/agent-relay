@@ -28,11 +28,17 @@ const h = React.createElement;
 
 // Counts construct/disconnect so "exactly one live observer" can be asserted
 // against the real attachTranscriptHistoryLoader path, not a mock of it.
+// Also keeps each instance (with its captured callback) so a test can fire a
+// real intersection and drive the loader's own state machine instead of
+// calling attachTranscriptHistoryLoader's internals directly.
 function installFakeIntersectionObserver() {
   const counts = { constructs: 0, disconnects: 0 };
+  const instances = [];
   class FakeIntersectionObserver {
-    constructor() {
+    constructor(callback) {
       counts.constructs += 1;
+      this.callback = callback;
+      instances.push(this);
     }
     observe() {}
     disconnect() {
@@ -41,7 +47,18 @@ function installFakeIntersectionObserver() {
     unobserve() {}
   }
   global.IntersectionObserver = FakeIntersectionObserver;
-  return counts;
+  return { counts, instances };
+}
+
+// createTranscriptHistoryLoader's promise chain (scheduleBurst -> runPrefetchBurst
+// -> await onLoad()) is a handful of microtask hops deep; chaining .then()s (rather
+// than a single await) waits out all of them without depending on their exact count.
+function flushMicrotasks(times = 30) {
+  let chain = Promise.resolve();
+  for (let i = 0; i < times; i += 1) {
+    chain = chain.then(() => {});
+  }
+  return chain;
 }
 
 function entriesFor(count) {
@@ -274,7 +291,7 @@ test("onAfterTranscriptCommit fires once per commit on branches 5/6, and never o
 });
 
 test("the history loader syncs to whichever sentinel is live, with exactly one observer alive across a branch swap, and detaches on unmount", () => {
-  const counts = installFakeIntersectionObserver();
+  const { counts } = installFakeIntersectionObserver();
   const view = mount();
   try {
     view.render({ entries: entriesFor(2) });
@@ -293,4 +310,46 @@ test("the history loader syncs to whichever sentinel is live, with exactly one o
     delete global.IntersectionObserver;
   }
   assert.equal(counts.disconnects, 2, "unmounting the panel detaches the loader");
+});
+
+test("sync() resumes a loader that backed off awaiting an external poke, on a same-branch re-render with no sentinel change", async () => {
+  // The bug this guards: sync() only rebuilds the loader when the sentinel node
+  // ITSELF changes. A commit that stays on branch 6 (same sentinel) still runs
+  // sync() every time, but earlier coverage only ever exercised that call on an
+  // unchanged, already-satisfied loader — never on one sitting in the real
+  // "attach-transcript-history-loader.js" backoff state, so a `sync()` that quietly
+  // stopped poking it would not have been caught.
+  const { instances } = installFakeIntersectionObserver();
+  const view = mount();
+  const onLoadCalls = [];
+  // Always "not definitive" (neither true nor false): the exact shape that makes
+  // the real loader set awaitingExternalPoke and stop rescheduling itself.
+  const onLoadOlderTranscript = () => {
+    onLoadCalls.push(true);
+    return Promise.resolve(undefined);
+  };
+  try {
+    view.render({ entries: entriesFor(2), onLoadOlderTranscript });
+    assert.equal(instances.length, 1, "the entries branch attaches one observer");
+
+    // Drive the REAL loader's state machine: an intersection starts a burst.
+    instances[0].callback([{ isIntersecting: true }]);
+    await flushMicrotasks();
+    assert.equal(onLoadCalls.length, 1, "the intersection triggers exactly one load attempt");
+
+    // The loader is now backed off and will not fire again on its own. A
+    // re-render that stays on branch 6 (same entries shape, same sentinel node)
+    // must still call sync() — and sync()'s poke() must resume it.
+    view.render({ entries: entriesFor(2), onLoadOlderTranscript });
+    assert.equal(instances.length, 1, "the sentinel is unchanged, so sync() must not rebuild the observer");
+    await flushMicrotasks();
+    assert.equal(
+      onLoadCalls.length,
+      2,
+      "sync() after a same-branch, same-sentinel commit must poke the backed-off loader back into loading"
+    );
+  } finally {
+    view.unmount();
+    delete global.IntersectionObserver;
+  }
 });

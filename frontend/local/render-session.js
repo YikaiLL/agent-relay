@@ -1519,6 +1519,17 @@ export function createSessionRenderer({
     ));
   }
 
+  // Hoisted once per renderer instance for the same reason as
+  // getTranscriptOptions above: the panel's layout effect closes over this
+  // prop identity for the component's whole lifetime, so a fresh function
+  // every render would defeat the point of passing it as a prop rather than
+  // an inline callback. renderTranscript stages which commit (if any) applies
+  // to THIS render into `pendingScrollCommit` right before calling this.
+  let pendingScrollCommit = null;
+  function onAfterTranscriptCommit(scrollElement) {
+    pendingScrollCommit?.(scrollElement);
+  }
+
   function renderTranscript(session, approval) {
     const viewingConversation = isViewingConversation(session);
     const entries = session.transcript || [];
@@ -1565,9 +1576,11 @@ export function createSessionRenderer({
     // The pre-render half of scroll bookkeeping has to run here, before the
     // swap: React mutates the DOM before any cleanup runs, so a layout effect
     // would only ever see the new thread's already-clamped scrollTop. The
-    // post-commit half is built as a closure below and handed to the panel to
-    // call from a layout effect once the commit lands.
-    let onAfterTranscriptCommit = null;
+    // post-commit half is staged as a closure below into `pendingScrollCommit`
+    // (reset first, in case neither branch below applies to this render), and
+    // the panel calls the STABLE onAfterTranscriptCommit dispatcher above from
+    // a layout effect once the commit lands.
+    pendingScrollCommit = null;
 
     if (emptyReady) {
       // Leaving another thread for this empty one: retain its reading offset
@@ -1602,7 +1615,7 @@ export function createSessionRenderer({
       // anchor exactly like every later send. Deliberately NOT done for the
       // loading/view-only branches above: their entries arrive as loaded
       // history and must keep landing via jump-bottom.
-      onAfterTranscriptCommit = (scrollElement) => {
+      pendingScrollCommit = (scrollElement) => {
         state.localTranscriptScrollSnapshot = captureTranscriptScrollSnapshot({
           entries: [],
           scrollElement,
@@ -1639,7 +1652,7 @@ export function createSessionRenderer({
       const anchorsForThread =
         state.localTranscriptScrollAnchors.get(localThreadId) || new Set();
 
-      onAfterTranscriptCommit = (scrollElement) => {
+      pendingScrollCommit = (scrollElement) => {
         const action = restoreTranscriptScrollPosition({
           alreadyAnchoredUserIds: anchorsForThread,
           nextEntries: entries,
