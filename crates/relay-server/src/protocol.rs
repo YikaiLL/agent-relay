@@ -1077,19 +1077,39 @@ impl SessionSnapshot {
                 // empty thread and makes surfaces drop real visible history.
                 // Reduce the surviving tail to identity shells (keep
                 // item_id/kind/status/turn_id and a lightweight tool shell, drop
-                // the heavy text/diff/file_changes), mark each entry
-                // `content_state: omitted`, and flag the snapshot truncated so
-                // the client renders a loading placeholder and fetches the full
-                // body instead of rendering the clipped shell.
+                // heavy text/diff/file_changes). Every entry stays hydration-eligible
+                // even when its current text already fits the 24-character shell:
+                // clients treat `Full` as authoritative, and a compacted snapshot may
+                // race ahead of longer live deltas. The only safe exemption is a
+                // completed, bodyless reasoning marker. It cannot grow and the
+                // renderer intentionally drops it; marking it omitted instead creates
+                // a phantom loading row for content that does not exist.
                 transcript_truncated = true;
                 for entry in &mut self.transcript {
-                    entry
-                        .content_state
-                        .downgrade_to(TranscriptContentState::Omitted);
-                    if let Some(text) = &mut entry.text {
-                        truncate_with_ellipsis(text, EMERGENCY_TRANSCRIPT_SHELL_CHARS);
+                    let is_settled_empty_reasoning = entry.kind == TranscriptEntryKind::Reasoning
+                        && entry.status == "completed"
+                        && entry.tool.is_none()
+                        && entry
+                            .text
+                            .as_ref()
+                            .is_none_or(|text| text.trim().is_empty());
+                    if is_settled_empty_reasoning {
+                        // Canonicalize even very long whitespace-only bodies to null.
+                        // Clipping them would manufacture a literal `...`, which the
+                        // renderer would correctly mistake for real authoritative text.
+                        entry.text = None;
+                    } else {
+                        entry
+                            .content_state
+                            .downgrade_to(TranscriptContentState::Omitted);
+                        if let Some(text) = &mut entry.text {
+                            truncate_with_ellipsis(text, EMERGENCY_TRANSCRIPT_SHELL_CHARS);
+                        }
                     }
                     if let Some(tool) = &mut entry.tool {
+                        if !tool.file_changes.is_empty() || tool.diff.is_some() {
+                            tool.file_changes_omitted = true;
+                        }
                         tool.detail = None;
                         tool.input_preview = None;
                         tool.result_preview = None;

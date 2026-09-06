@@ -81,10 +81,19 @@
   "remote_omitted_authoritative_entries": [
     {
       "content_state": "full",
-      "item_id": "u-omitted",
-      "kind": "user_text",
+      "item_id": "r-empty-full",
+      "kind": "reasoning",
       "status": "completed",
-      "text": "please summarize the whole project in detail",
+      "text": null,
+      "tool": null,
+      "turn_id": "turn-omitted"
+    },
+    {
+      "content_state": "full",
+      "item_id": "a-empty-omitted",
+      "kind": "agent_text",
+      "status": "completed",
+      "text": null,
       "tool": null,
       "turn_id": "turn-omitted"
     },
@@ -144,11 +153,20 @@
     "thread_activity": [],
     "transcript": [
       {
-        "content_state": "omitted",
-        "item_id": "u-omitted",
-        "kind": "user_text",
+        "content_state": "full",
+        "item_id": "r-empty-full",
+        "kind": "reasoning",
         "status": "completed",
-        "text": "please summarize the ...",
+        "text": null,
+        "tool": null,
+        "turn_id": "turn-omitted"
+      },
+      {
+        "content_state": "omitted",
+        "item_id": "a-empty-omitted",
+        "kind": "agent_text",
+        "status": "completed",
+        "text": null,
         "tool": null,
         "turn_id": "turn-omitted"
       },

@@ -79,25 +79,41 @@ function makeStore() {
   };
 }
 
-test("real relay-compacted omitted shells render as loading, never the shell text or (empty)", () => {
+test("real emergency tail drops bodyless reasoning while omitted bodies render as loading", () => {
   const snapshot = fixture.remote_omitted_snapshot;
-  // Sanity: this is genuinely the omitted scenario from the relay.
-  assert.ok(snapshot.transcript.every((entry) => entry.content_state === "omitted"));
+  // Sanity: this is genuinely the mixed emergency-tail shape from the relay.
+  const bodyless = snapshot.transcript.find((entry) => entry.item_id === "r-empty-full");
+  const bodylessAgent = snapshot.transcript.find(
+    (entry) => entry.item_id === "a-empty-omitted"
+  );
+  const omitted = snapshot.transcript.filter((entry) => entry.content_state === "omitted");
+  assert.equal(bodyless.content_state, "full");
+  assert.equal(bodyless.text, null);
+  assert.equal(bodylessAgent.content_state, "omitted");
+  assert.equal(bodylessAgent.text, null);
+  assert.equal(omitted.length, 2);
   assert.equal(snapshot.transcript_truncated, true);
 
   const markup = renderTranscript(snapshot.transcript);
 
-  // The user only sees a loading placeholder per omitted entry.
+  // The user only sees a loading placeholder per genuinely omitted entry. A
+  // settled, fully-loaded empty reasoning marker carries no information and is
+  // dropped instead of becoming the phantom ellipsis this fixture guards.
   assert.match(markup, /data-transcript-pending="true"/);
   assert.match(markup, /Loading message/);
   assert.equal((markup.match(/data-transcript-pending="true"/g) || []).length, 2);
+  assert.ok(!markup.includes('data-transcript-entry-id="r-empty-full"'));
+  assert.match(markup, /data-transcript-entry-id="a-empty-omitted"/);
 
   // The 24-character identity shell text never reaches the DOM...
-  for (const entry of snapshot.transcript) {
-    assert.ok(
-      typeof entry.text === "string" && entry.text.length > 0,
-      "fixture shells should still carry clipped text on the wire"
-    );
+  const textBearingOmitted = omitted.filter(
+    (entry) => typeof entry.text === "string" && entry.text.length > 0
+  );
+  assert.ok(
+    textBearingOmitted.length > 0,
+    "fixture must retain at least one clipped omitted shell"
+  );
+  for (const entry of textBearingOmitted) {
     assert.ok(
       !markup.includes(entry.text),
       `omitted shell text must not render: ${JSON.stringify(entry.text)}`

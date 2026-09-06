@@ -856,18 +856,28 @@ fn emit_cross_layer_compacted_snapshot_fixture() {
     // run against a REAL relay-compacted snapshot, not a separately hand-authored
     // JS fixture that can silently drift from the Rust contract. This test is the
     // single source of truth: it builds two realistic compacted snapshots
-    // (RemoteSurface with omitted shells, LocalWeb with a preview + full mix) plus
-    // the authoritative full entries a page fetch would return, and writes them to
-    // a committed fixture the JS cross-layer test consumes verbatim.
+    // (RemoteSurface with omitted shells plus one settled empty-reasoning Full
+    // marker, LocalWeb with a preview + full mix) plus the authoritative full
+    // entries a page fetch would return, and writes them to a committed fixture
+    // the JS cross-layer test consumes verbatim.
     //
     // Without UPDATE_FIXTURES it asserts the committed bytes still match freshly
     // compacted output, so any change to the Rust compaction contract fails here
     // until the fixture (and the JS expectations) are regenerated.
     let authoritative_entries: Vec<TranscriptEntryView> = vec![
         TranscriptEntryView {
-            item_id: Some("u-omitted".to_string()),
-            kind: TranscriptEntryKind::UserText,
-            text: Some("please summarize the whole project in detail".to_string()),
+            item_id: Some("r-empty-full".to_string()),
+            kind: TranscriptEntryKind::Reasoning,
+            text: None,
+            status: "completed".to_string(),
+            turn_id: Some("turn-omitted".to_string()),
+            tool: None,
+            content_state: TranscriptContentState::Full,
+        },
+        TranscriptEntryView {
+            item_id: Some("a-empty-omitted".to_string()),
+            kind: TranscriptEntryKind::AgentText,
+            text: None,
             status: "completed".to_string(),
             turn_id: Some("turn-omitted".to_string()),
             tool: None,
@@ -901,12 +911,20 @@ fn emit_cross_layer_compacted_snapshot_fixture() {
     remote.transcript = authoritative_entries.clone();
     remote.transcript_truncated = false;
     let remote_compacted = remote.compact_for(SessionSnapshotCompactProfile::RemoteSurface);
+    assert_eq!(remote_compacted.transcript.len(), 3);
+    assert_eq!(
+        remote_compacted.transcript[0].item_id.as_deref(),
+        Some("r-empty-full")
+    );
+    assert_eq!(
+        remote_compacted.transcript[0].content_state,
+        TranscriptContentState::Full
+    );
     assert!(
-        remote_compacted
-            .transcript
+        remote_compacted.transcript[1..]
             .iter()
             .all(|entry| entry.content_state == TranscriptContentState::Omitted),
-        "fixture scenario must actually omit the tail"
+        "fixture scenario must mix one settled empty-reasoning Full marker with omitted bodies"
     );
 
     // LocalWeb snapshot with a long (preview) message, a short message whose
@@ -1099,6 +1117,247 @@ fn compact_shelled_entries_are_marked_omitted_not_inferred_from_ellipsis() {
         );
         assert_eq!(entry.status, "completed");
     }
+}
+
+#[test]
+fn compact_emergency_shell_only_exempts_settled_empty_reasoning() {
+    // `Full` is final on clients: even a short real body must remain hydration-
+    // eligible because this snapshot can race with longer live deltas. A completed
+    // empty reasoning entry is different — it has no body to recover, cannot still
+    // grow, and is deliberately dropped by the renderer. No other kind or lifecycle
+    // state is safe to exempt.
+    let make_entry = |item_id: &str,
+                      kind: TranscriptEntryKind,
+                      text: Option<String>,
+                      status: &str| TranscriptEntryView {
+        item_id: Some(item_id.to_string()),
+        kind,
+        text,
+        status: status.to_string(),
+        turn_id: Some("turn-1".to_string()),
+        tool: None,
+        content_state: TranscriptContentState::Full,
+    };
+    let compact_target = |target: TranscriptEntryView| {
+        let mut snapshot = make_snapshot();
+        snapshot.current_cwd = "/tmp/".to_string() + &"超长路径".repeat(3_000);
+        snapshot.logs.clear();
+        snapshot.pending_approvals.clear();
+        snapshot.transcript = vec![
+            target,
+            make_entry(
+                "filler-1",
+                TranscriptEntryKind::AgentText,
+                Some("authoritative assistant body ".repeat(80)),
+                "completed",
+            ),
+            make_entry(
+                "filler-2",
+                TranscriptEntryKind::AgentText,
+                Some("authoritative assistant body ".repeat(80)),
+                "completed",
+            ),
+        ];
+
+        let compacted = snapshot.compact_for(SessionSnapshotCompactProfile::RemoteSurface);
+        assert!(compacted.transcript_truncated);
+        assert_eq!(compacted.transcript.len(), 3);
+        compacted.transcript.into_iter().next().unwrap()
+    };
+
+    for (item_id, text) in [
+        ("empty-reasoning", None),
+        ("blank-reasoning", Some(String::new())),
+        ("whitespace-reasoning", Some(" ".repeat(80))),
+    ] {
+        let entry = compact_target(make_entry(
+            item_id,
+            TranscriptEntryKind::Reasoning,
+            text,
+            "completed",
+        ));
+        assert_eq!(entry.content_state, TranscriptContentState::Full);
+        assert_eq!(
+            entry.text, None,
+            "{item_id} must not manufacture an ellipsis"
+        );
+    }
+
+    for entry in [
+        make_entry(
+            "running-reasoning",
+            TranscriptEntryKind::Reasoning,
+            None,
+            "running",
+        ),
+        make_entry(
+            "empty-agent",
+            TranscriptEntryKind::AgentText,
+            None,
+            "completed",
+        ),
+        make_entry(
+            "blank-user",
+            TranscriptEntryKind::UserText,
+            Some(String::new()),
+            "completed",
+        ),
+        make_entry(
+            "short-agent",
+            TranscriptEntryKind::AgentText,
+            Some("done".to_string()),
+            "completed",
+        ),
+    ] {
+        let item_id = entry.item_id.clone().unwrap();
+        let entry = compact_target(entry);
+        assert_eq!(
+            entry.content_state,
+            TranscriptContentState::Omitted,
+            "{item_id} must remain hydratable"
+        );
+    }
+}
+
+#[test]
+fn compact_local_emergency_shell_keeps_empty_reasoning_full() {
+    // LocalWeb has a larger byte budget than RemoteSurface. Four entries are its
+    // minimum retained tail, so give three tool entries enough independent heavy
+    // fields to remain over budget even after the fallback preview pass. This is
+    // the shape seen in long Codex sessions: large command/output entries force
+    // the emergency shell while completed bodyless reasoning entries sit among
+    // them. Those reasoning entries must not become phantom loading rows.
+    let mut snapshot = make_snapshot();
+    snapshot.logs.clear();
+    snapshot.pending_approvals.clear();
+    snapshot.transcript = vec![TranscriptEntryView {
+        item_id: Some("empty-reasoning".to_string()),
+        kind: TranscriptEntryKind::Reasoning,
+        text: None,
+        status: "completed".to_string(),
+        turn_id: Some("turn-1".to_string()),
+        tool: None,
+        content_state: TranscriptContentState::Full,
+    }];
+    snapshot
+        .transcript
+        .extend((0..3).map(|index| TranscriptEntryView {
+            item_id: Some(format!("large-{index}")),
+            kind: TranscriptEntryKind::ToolCall,
+            text: Some(format!("entry {index} ") + &"large body ".repeat(300)),
+            status: "completed".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            tool: Some(ToolCallView {
+                item_type: "commandExecution".to_string(),
+                name: "shell".to_string(),
+                title: "Run command".to_string(),
+                kind: None,
+                detail: Some("detail ".repeat(300)),
+                query: (index == 0).then(|| "query ".repeat(20)),
+                path: None,
+                url: (index == 1).then(|| "https://example.com/".repeat(20)),
+                command: Some("printf test".to_string()),
+                input_preview: Some("input ".repeat(300)),
+                result_preview: Some("result ".repeat(300)),
+                diff: Some("diff ".repeat(400)),
+                file_changes: if index == 0 {
+                    Vec::new()
+                } else {
+                    (0..6)
+                        .map(|change_index| FileChangeDiffView {
+                            path: format!("src/file-{index}-{change_index}.rs"),
+                            change_type: "modify".to_string(),
+                            diff: "-old\n+new\n".repeat(200),
+                        })
+                        .collect()
+                },
+                apply_state: None,
+                file_changes_omitted: false,
+                can_apply: None,
+            }),
+            content_state: TranscriptContentState::Full,
+        }));
+
+    let compacted = snapshot.compact_for(SessionSnapshotCompactProfile::LocalWeb);
+
+    assert!(compacted.transcript_truncated);
+    assert_eq!(compacted.transcript.len(), 4);
+    assert_eq!(
+        compacted.transcript[0].item_id.as_deref(),
+        Some("empty-reasoning")
+    );
+    assert_eq!(
+        compacted.transcript[0].content_state,
+        TranscriptContentState::Full
+    );
+    assert_eq!(compacted.transcript[0].text, None);
+    assert!(
+        compacted.transcript[1..]
+            .iter()
+            .all(|entry| entry.content_state == TranscriptContentState::Omitted),
+        "the fixture must reach LocalWeb's emergency shell"
+    );
+    assert!(compacted.transcript[1..].iter().all(|entry| {
+        entry
+            .tool
+            .as_ref()
+            .is_some_and(|tool| tool.file_changes.is_empty() && tool.file_changes_omitted)
+    }));
+    let diff_only_tool = compacted.transcript[1]
+        .tool
+        .as_ref()
+        .expect("first heavy entry must keep its tool shell");
+    assert!(diff_only_tool.diff.is_none());
+    assert!(diff_only_tool.file_changes_omitted);
+    assert!(diff_only_tool
+        .query
+        .as_ref()
+        .is_some_and(|query| query.chars().count() <= EMERGENCY_TRANSCRIPT_SHELL_CHARS));
+    assert!(compacted.transcript[2]
+        .tool
+        .as_ref()
+        .and_then(|tool| tool.url.as_ref())
+        .is_some_and(|url| url.chars().count() <= EMERGENCY_TRANSCRIPT_SHELL_CHARS));
+}
+
+#[test]
+fn compact_emergency_shell_preserves_bodyless_entries_existing_states() {
+    let mut snapshot = make_snapshot();
+    snapshot.current_cwd = "/tmp/".to_string() + &"oversized-path".repeat(2_000);
+    snapshot.logs.clear();
+    snapshot.pending_approvals.clear();
+    snapshot.transcript = vec![
+        TranscriptEntryView {
+            item_id: Some("bodyless-preview".to_string()),
+            kind: TranscriptEntryKind::Reasoning,
+            text: None,
+            status: "completed".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            tool: None,
+            content_state: TranscriptContentState::Preview,
+        },
+        TranscriptEntryView {
+            item_id: Some("bodyless-omitted".to_string()),
+            kind: TranscriptEntryKind::Reasoning,
+            text: None,
+            status: "completed".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            tool: None,
+            content_state: TranscriptContentState::Omitted,
+        },
+    ];
+
+    let compacted = snapshot.compact_for(SessionSnapshotCompactProfile::RemoteSurface);
+
+    assert_eq!(compacted.transcript.len(), 2);
+    assert_eq!(
+        compacted.transcript[0].content_state,
+        TranscriptContentState::Preview
+    );
+    assert_eq!(
+        compacted.transcript[1].content_state,
+        TranscriptContentState::Omitted
+    );
 }
 
 #[test]
@@ -1927,6 +2186,7 @@ fn compact_for_broker_shells_tool_entries_dropping_heavy_content() {
     let tool = entry.tool.as_ref().expect("tool shell should survive");
     assert_eq!(tool.name, "turn_diff");
     assert!(tool.file_changes.is_empty());
+    assert!(tool.file_changes_omitted);
     assert!(tool.diff.is_none());
     assert!(tool.detail.is_none());
     assert!(tool.input_preview.is_none());
