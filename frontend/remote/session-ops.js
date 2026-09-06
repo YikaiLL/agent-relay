@@ -92,6 +92,7 @@ import {
   reduceTranscriptDeltaEvent,
   reduceTranscriptEntryPatchEvent,
 } from "../shared/transcript-event-reducer.js";
+import { reconcileAuthoritativeTail } from "../shared/authoritative-tail-merge.js";
 
 const fetchTranscriptPageOverBroker = createTranscriptPageFetcher(dispatchOrRecover);
 const fetchRawTranscriptPage = fetchTranscriptPageOverBroker;
@@ -619,67 +620,102 @@ async function repairActiveTranscriptTail(threadId, targetRevision) {
   }
 
   const pageEntries = Array.isArray(page.entries) ? page.entries : [];
-  const pageItemIds = new Set(pageEntries.map((entry) => entry?.item_id).filter(Boolean));
   const current = Array.isArray(liveSession.transcript) ? liveSession.transcript : [];
-  const currentByItemId = new Map(
-    current.filter((entry) => entry?.item_id).map((entry) => [entry.item_id, entry])
-  );
+  // The array holds entries with no `item_id` (never addressable) alongside
+  // the normal, id-keyed ones — build the id order/lookup the shared
+  // primitive expects from the addressable ones, and remember where the rest
+  // sat so they can be restitched back in afterward instead of dropped.
+  const { order, entries, positionless } = splitTranscriptArrayById(current);
 
-  // Older entries the bounded tail page did not reach keep their place; the
-  // page's entries (server-authoritative) replace the visible tail.
-  const olderKept = current.filter(
-    (entry) => !entry?.item_id || !pageItemIds.has(entry.item_id)
-  );
-  const repairedTail = pageEntries.map((entry) => {
-    const existing = currentByItemId.get(entry?.item_id);
-    if (!existing) {
-      return entry;
-    }
-    return {
-      ...existing,
-      ...entry,
-      // The page is authoritative, but never let an unexpectedly short page
-      // entry shorten already-visible text. Pure length comparison — no
-      // "..."-suffix inference.
-      text: selectLongerVisibleText(existing.text, entry.text),
-    };
+  const result = reconcileAuthoritativeTail({
+    order,
+    entries,
+    pageEntries,
+    currentRevision: numericRevision(liveSession.transcript_revision),
+    pageRevision: numericRevision(page.revision),
+    targetRevision: numericRevision(targetRevision),
+    prevCursor: page.prev_cursor,
   });
-
-  const currentRevision = numericRevision(liveSession.transcript_revision) ?? 0;
-  const pageRevision = numericRevision(page.revision) ?? 0;
-  const nextRevision = Math.max(
-    currentRevision,
-    pageRevision,
-    numericRevision(targetRevision) ?? 0
-  );
 
   const nextSession = {
     ...liveSession,
-    transcript: [...olderKept, ...repairedTail],
-    transcript_truncated: page.prev_cursor != null,
+    transcript: joinTranscriptArrayById(current, positionless, result.order, result.entries),
+    transcript_truncated: result.truncated,
   };
-  if (nextRevision > 0) {
-    nextSession.transcript_revision = nextRevision;
+  if (result.revision != null) {
+    nextSession.transcript_revision = result.revision;
   }
   // The repaired tail replaces the array directly, same as local's tail
   // repair — but if the window happens to be loaded for this same thread,
   // its cached copies are now stale relative to what was just fetched.
   if (transcriptWindowIsLoaded(state, threadId)) {
     // Distrust everything first — covers whatever the bounded tail page did
-    // NOT reach (`olderKept`, above), the same signal a lagged stream raises.
+    // NOT reach (the retained older ids), the same signal a lagged stream raises.
     invalidateTranscriptWindowForRepair(state);
-    // Then resync exactly what the repair DID reach. `repairedTail` is
-    // freshly fetched, authoritative content — a hydration/snapshot-merge
-    // case the plan sanctions writing directly (.sealwire/PLAN.md, "Invalidate;
-    // do not write" only bans a PATCH, which carries no body, from writing).
-    // Downgrading to preview without ALSO updating the cached text left the
-    // window holding the PRE-repair (wrong, shorter) text at `full`-adjacent
-    // trust; the next delta's offset check reads that stale length as `have`
-    // (applyTranscriptDelta, above), so a delta already valid against the
-    // just-repaired array was wrongly reported as a second offset_gap.
-    syncTranscriptWindowWithRepairedEntries(state, threadId, repairedTail);
+    // Then resync exactly what the repair DID reach — the primitive's own
+    // page-ordered overlay. This is freshly fetched, authoritative content —
+    // a hydration/snapshot-merge case the plan sanctions writing directly
+    // (.sealwire/PLAN.md, "Invalidate; do not write" only bans a PATCH, which
+    // carries no body, from writing). Downgrading to preview without ALSO
+    // updating the cached text left the window holding the PRE-repair
+    // (wrong, shorter) text at `full`-adjacent trust; the next delta's offset
+    // check reads that stale length as `have` (applyTranscriptDelta, above),
+    // so a delta already valid against the just-repaired array was wrongly
+    // reported as a second offset_gap.
+    syncTranscriptWindowWithRepairedEntries(state, threadId, result.repaired);
   }
   commit(nextSession);
+}
+
+// Converts a plain transcript array into the id-ordered lookup the shared
+// primitive (authoritative-tail-merge.js) expects. `positionless` records
+// each non-addressable entry's original index so `joinTranscriptArrayById`
+// can restore its place — it cannot join `order`/`entries`, which are keyed
+// by `item_id`.
+function splitTranscriptArrayById(transcript) {
+  const order = [];
+  const entries = new Map();
+  const positionless = [];
+  for (let index = 0; index < transcript.length; index += 1) {
+    const entry = transcript[index];
+    const itemId = entry?.item_id;
+    if (!itemId) {
+      positionless.push({ index, entry });
+      continue;
+    }
+    order.push(itemId);
+    entries.set(itemId, entry);
+  }
+  return { order, entries, positionless };
+}
+
+// Rebuilds a plain transcript array from the primitive's id order/lookup,
+// reinserting each positionless entry immediately before whichever id-bearing
+// entry followed it in the ORIGINAL array (or at the end, if none did).
+// `mergeTailPageOrder` never drops an id already in `order`, so that anchor
+// (when there is one) is always still present in the result.
+function joinTranscriptArrayById(originalTranscript, positionless, order, entries) {
+  const rebuilt = order.map((itemId) => entries.get(itemId)).filter(Boolean);
+  for (const { index, entry } of positionless) {
+    const anchorId = nextAddressableItemId(originalTranscript, index + 1);
+    const at = anchorId ? rebuilt.findIndex((candidate) => candidate?.item_id === anchorId) : -1;
+    if (at < 0) {
+      rebuilt.push(entry);
+    } else {
+      rebuilt.splice(at, 0, entry);
+    }
+  }
+  return rebuilt;
+}
+
+function nextAddressableItemId(transcript, fromIndex) {
+  for (let index = fromIndex; index < transcript.length; index += 1) {
+    const itemId = transcript[index]?.item_id;
+    if (itemId) {
+      return itemId;
+    }
+  }
+  return null;
 }
 
 // Only touches items the window already tracks — never adds a new id or
@@ -955,16 +991,6 @@ function preserveVisibleTranscriptText(currentSession, snapshot) {
 function isFullSnapshotEntry(entry) {
   const state = entry?.content_state;
   return state !== "preview" && state !== "omitted";
-}
-
-function selectLongerVisibleText(existingText, incomingText) {
-  if (incomingText == null) {
-    return existingText ?? null;
-  }
-  if (existingText == null) {
-    return incomingText;
-  }
-  return incomingText.length >= existingText.length ? incomingText : existingText;
 }
 
 function selectVisibleSnapshotEntry(current, incoming) {

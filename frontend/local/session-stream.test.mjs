@@ -2294,3 +2294,96 @@ test("a text-replacement patch is not silently discarded by a later delta for th
     "the replacement must survive a later delta for the same item — never revert to the pre-patch text"
   );
 });
+
+// Regression for the shared authoritative-tail-merge primitive
+// (shared/authoritative-tail-merge.js): repairActiveTranscriptTail's merge is
+// now delegated to it end to end. This proves both of the primitive's
+// invariants actually reach the RENDERED transcript through that seam, not
+// just the raw patch: an id the repair page does not cover keeps its place
+// above the repaired entry, and an unexpectedly shorter authoritative body
+// never overwrites already-visible text.
+test("a tail repair keeps a retained older id above the repaired entry and never shortens its text, end to end", async () => {
+  const fetchFreshTranscriptPage = () =>
+    Promise.resolve({
+      thread_id: "thread-1",
+      entries: [
+        {
+          item_id: "agent-1",
+          kind: "agent_text",
+          status: "completed",
+          text: "short",
+          tool: null,
+          turn_id: "turn-1",
+        },
+      ],
+      prev_cursor: "cursor-older",
+    });
+  const { controller, state } = makeController({ fetchFreshTranscriptPage });
+
+  state.transcriptHydrationThreadId = "thread-1";
+  state.transcriptHydrationOrder = ["older", "agent-1"];
+  state.transcriptHydrationEntries = new Map([
+    [
+      "older",
+      {
+        item_id: "older",
+        kind: "user_text",
+        status: "completed",
+        text: "older retained history",
+        tool: null,
+        entry_seq: null,
+        content_state: "full",
+      },
+    ],
+    [
+      "agent-1",
+      {
+        item_id: "agent-1",
+        kind: "agent_text",
+        status: "running",
+        text: "hello world, the full streamed message",
+        tool: null,
+        entry_seq: null,
+        content_state: "full",
+      },
+    ],
+  ]);
+  state.session.transcript = [
+    { item_id: "older", kind: "user_text", status: "completed", text: "older retained history", tool: null, turn_id: null },
+    state.session.transcript[0],
+  ];
+
+  // A refused (gapped) delta for "agent-1" fires repairActiveTranscriptTail.
+  controller.applyLocalTranscriptEntryDelta({
+    delta: "z",
+    item_id: "agent-1",
+    revision: 7,
+    text_offset: 100,
+    thread_id: "thread-1",
+  });
+
+  // The repair fetch is fire-and-forget; flush the microtask queue so its
+  // continuation (merge + render) has run.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(
+    state.transcriptHydrationOrder,
+    ["older", "agent-1"],
+    "the retained id (not covered by the page) must keep its place above the repaired entry"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("agent-1").text,
+    "hello world, the full streamed message",
+    "the never-shorten rule must survive the repair — a shorter authoritative page must not win"
+  );
+  assert.deepEqual(
+    state.session.transcript.map((entry) => entry.item_id),
+    ["older", "agent-1"],
+    "the RENDERED transcript reflects the primitive's order, not just the window"
+  );
+  assert.equal(
+    state.session.transcript[1].text,
+    "hello world, the full streamed message",
+    "the RENDERED transcript carries the never-shortened text, not the fetched page's shorter body"
+  );
+});
