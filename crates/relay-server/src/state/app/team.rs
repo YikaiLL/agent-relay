@@ -740,6 +740,18 @@ over on resume"
     }
 
     #[cfg(test)]
+    pub(crate) fn team_stop_gate_waiter_arrivals(&self) -> u64 {
+        self.team_stop_gate_waiter_arrivals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn team_pause_pre_gate_arrivals(&self) -> u64 {
+        self.team_pause_pre_gate_arrivals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_team_liveness_window_ms(&self, ms: u64) {
         self.team_liveness_window_ms
             .store(ms, std::sync::atomic::Ordering::Relaxed);
@@ -956,6 +968,9 @@ over on resume"
         // A Resume can read Paused, claim the driver ticket, and queue at the
         // drive gate. Pause must decide whether it is a no-op only after any
         // earlier queued Resume has either started the run or been refused.
+        #[cfg(test)]
+        self.team_pause_pre_gate_arrivals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _gate = self.team_drive_gate.lock().await;
         let status = self.require_stoppable_team_run(&run_id).await?;
         // Idempotent: a second Pause on a run that already settled is the user
@@ -1259,11 +1274,26 @@ over on resume"
         // Stop that queued behind it must re-read `Running` after admission and
         // perform a real stop, not return a stale paused no-op.
         #[cfg(test)]
-        {
+        let _gate = {
             self.team_stop_pre_gate_arrivals
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(self.team_stop_pre_gate_barrier.lock().await);
-        }
+            let mut gate = std::pin::pin!(self.team_drive_gate.lock());
+            let mut recorded_waiter = false;
+            std::future::poll_fn(|cx| match std::future::Future::poll(gate.as_mut(), cx) {
+                std::task::Poll::Ready(guard) => std::task::Poll::Ready(guard),
+                std::task::Poll::Pending => {
+                    if !recorded_waiter {
+                        self.team_stop_gate_waiter_arrivals
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        recorded_waiter = true;
+                    }
+                    std::task::Poll::Pending
+                }
+            })
+            .await
+        };
+        #[cfg(not(test))]
         let _gate = self.team_drive_gate.lock().await;
 
         let status = self.require_stoppable_team_run(&run_id).await?;
@@ -3113,6 +3143,13 @@ impl relay_api::TeamPort for AppState {
             if updated {
                 relay.notify();
                 return true;
+            }
+            if existed {
+                // `update_team_run` restores the immutable backend but preserves
+                // every other field the mutation changed. A settled run refuses
+                // the failure below, so this notification is the only way that
+                // partial write reaches persistence and clients.
+                relay.notify();
             }
             existed
         };

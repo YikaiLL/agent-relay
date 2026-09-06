@@ -62,7 +62,7 @@ fn team_input(cwd: &str) -> crate::state::app::team::TeamStartRequest {
 
 fn cloud_backend() -> relay_api::orchestration::OrchestrationBackendRef {
     relay_api::orchestration::OrchestrationBackendRef::Cloud {
-        protocol_version: relay_api::orchestration::CURRENT_PROTOCOL_VERSION,
+        protocol_version: relay_api::orchestration::SupportedProtocolVersion::current(),
         driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
         cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
     }
@@ -78,6 +78,10 @@ struct ResumeAttemptDriver {
     finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
     finished_notify: std::sync::Arc<tokio::sync::Notify>,
     outcome: std::sync::Arc<Mutex<Option<relay_api::team::TeamTurnOutcome>>>,
+}
+struct ParkedTeamDriver {
+    entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    release: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
@@ -142,6 +146,18 @@ impl relay_api::TeamDriver for ResumeAttemptDriver {
         self.finished
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.finished_notify.notify_one();
+    }
+}
+
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for ParkedTeamDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, _port: std::sync::Arc<dyn relay_api::TeamPort>, _run_id: String) {
+        self.entered.store(true, Ordering::Relaxed);
+        self.release.notified().await;
     }
 }
 
@@ -226,6 +242,15 @@ async fn resume_team_run_refuses_non_embedded_backend_before_status_flip() {
     run.status = crate::state::TeamRunStatus::Paused;
     run.orchestration_backend = cloud_backend();
     app.relay.write().await.insert_team_run(run);
+
+    let pause_error = app
+        .pause_team_run(
+            Some("team-cloud-resume".to_string()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect_err("Pause must refuse a Cloud-pinned run in this build");
+    assert!(pause_error.contains("Cloud orchestration"), "{pause_error}");
 
     let error = app
         .resume_team_run(
@@ -318,7 +343,7 @@ async fn stop_on_a_paused_embedded_run_still_drains_unconfirmed_turns() {
     assert_eq!(run.in_flight_thread.as_deref(), Some("stale-mid-start"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn stop_revalidates_after_a_queued_resume_wins_the_drive_gate() {
     let (_repo, root) = init_team_repo().await;
     let (app, providers) = build_review_app(&root, &["codex"]).await;
@@ -378,8 +403,26 @@ async fn stop_revalidates_after_a_queued_resume_wins_the_drive_gate() {
     }));
 
     let driver_pre_gate = app.hold_team_gated_barrier().await;
+    let gate = app.team_drive_gate.lock().await;
     let stop_pre_gate = app.hold_team_stop_pre_gate_barrier().await;
     let stop_pre_gate_before = app.team_stop_pre_gate_arrivals();
+    let stop_waiter_before = app.team_stop_gate_waiter_arrivals();
+
+    let resume_task = {
+        let app = app.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            app.resume_team_run(Some(run_id), Some("device-1".to_string()))
+                .await
+        })
+    };
+    wait_until_condition("resume should queue at the held drive gate", || {
+        app.driving_team_runs
+            .lock()
+            .expect("drive set")
+            .contains(&run_id)
+    })
+    .await;
 
     let stop_task = {
         let app = app.clone();
@@ -394,16 +437,23 @@ async fn stop_revalidates_after_a_queued_resume_wins_the_drive_gate() {
     })
     .await;
 
-    let resumed = app
-        .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+    drop(stop_pre_gate);
+    wait_until_condition("stop should queue behind Resume at the drive gate", || {
+        app.team_stop_gate_waiter_arrivals() > stop_waiter_before
+    })
+    .await;
+    drop(gate);
+
+    let resumed = tokio::time::timeout(Duration::from_secs(5), resume_task)
         .await
+        .expect("resume should not hang behind Stop")
+        .expect("resume task should not panic")
         .expect("resume should win the gate first");
     assert_eq!(resumed, crate::state::TeamRunStatus::Running);
 
-    drop(stop_pre_gate);
-
-    let stopped = stop_task
+    let stopped = tokio::time::timeout(Duration::from_secs(5), stop_task)
         .await
+        .expect("Stop should not hang after gate admission")
         .expect("stop task should not panic")
         .expect("stop should re-read the resumed Running status and stop it");
     assert_eq!(stopped, crate::state::TeamRunStatus::Paused);
@@ -442,6 +492,89 @@ async fn stop_revalidates_after_a_queued_resume_wins_the_drive_gate() {
         "the resumed driver must never dispatch a provider turn after Stop settles"
     );
     wait_until_condition("the resumed driver's drive ticket should release after the refused turn", || {
+        !app.driving_team_runs
+            .lock()
+            .expect("drive set")
+            .contains(&run_id)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pause_revalidates_after_a_queued_resume_wins_the_drive_gate() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let run_id = "team-pause-after-resume".to_string();
+    let driver_entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release_driver = std::sync::Arc::new(tokio::sync::Notify::new());
+    let app = app.with_team_driver(std::sync::Arc::new(ParkedTeamDriver {
+        entered: driver_entered.clone(),
+        release: release_driver.clone(),
+    }));
+    let mut run = crate::state::TeamRun::new(
+        run_id.clone(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    app.relay.write().await.insert_team_run(run);
+
+    let gate = app.team_drive_gate.lock().await;
+    let pause_arrivals_before = app.team_pause_pre_gate_arrivals();
+    let resume_task = {
+        let app = app.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            app.resume_team_run(Some(run_id), Some("device-1".to_string()))
+                .await
+        })
+    };
+    wait_until_condition("resume should queue at the held drive gate", || {
+        app.driving_team_runs
+            .lock()
+            .expect("drive set")
+            .contains(&run_id)
+    })
+    .await;
+
+    let pause_task = {
+        let app = app.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            app.pause_team_run(Some(run_id), Some("device-1".to_string()))
+                .await
+        })
+    };
+    wait_until_condition("Pause should queue behind Resume at the drive gate", || {
+        app.team_pause_pre_gate_arrivals() > pause_arrivals_before
+    })
+    .await;
+    drop(gate);
+
+    let resumed = tokio::time::timeout(Duration::from_secs(5), resume_task)
+        .await
+        .expect("resume should not hang behind Pause")
+        .expect("resume task should not panic")
+        .expect("resume should win the gate first");
+    assert_eq!(resumed, crate::state::TeamRunStatus::Running);
+    let pause_status = tokio::time::timeout(Duration::from_secs(5), pause_task)
+        .await
+        .expect("Pause should not hang after gate admission")
+        .expect("pause task should not panic")
+        .expect("Pause should re-read the resumed Running status");
+    assert_eq!(pause_status, crate::state::TeamRunStatus::PausePending);
+
+    let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::PausePending);
+    assert!(run.pause_requested);
+
+    wait_until_condition("the resumed driver should start", || {
+        driver_entered.load(Ordering::Relaxed)
+    })
+    .await;
+    release_driver.notify_one();
+    wait_until_condition("the resumed driver should release its drive ticket", || {
         !app.driving_team_runs
             .lock()
             .expect("drive set")
@@ -809,6 +942,38 @@ async fn paused_restore_validation_blocks_missing_non_embedded_worktree() {
 }
 
 #[tokio::test]
+async fn paused_restore_validation_does_not_reseed_an_inert_run() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-cloud-dead-tl".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.tl_thread_id = "missing-cloud-tl".to_string();
+    run.orchestration_backend = cloud_backend();
+    app.relay.write().await.insert_team_run(run);
+
+    app.validate_paused_team_runs().await;
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-cloud-dead-tl")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Paused);
+    assert_eq!(run.tl_thread_id, "missing-cloud-tl");
+    assert!(
+        run.tl_reseed_reason.is_none(),
+        "a backend this build cannot execute must not schedule local TL recovery"
+    );
+}
+
+#[tokio::test]
 async fn spawned_team_driver_refuses_non_embedded_backend_without_driving() {
     let (_repo, root) = init_team_repo().await;
     let (app, _) = build_review_app(&root, &["codex"]).await;
@@ -956,6 +1121,58 @@ async fn team_port_update_run_records_rejected_backend_retargets() {
             .is_some_and(|error| error.contains("orchestration backend after execution began")),
         "the immutable-backend rejection should be recorded explicitly: {:?}",
         run.error
+    );
+}
+
+#[tokio::test]
+async fn rejected_backend_retarget_notifies_for_settled_runs_but_not_missing_ids() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let mut run = crate::state::TeamRun::new(
+        "team-paused-retarget".to_string(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    app.relay.write().await.insert_team_run(run);
+
+    let before_revision = app.snapshot().await.revision;
+    let updated = relay_api::TeamPort::update_run(
+        &app,
+        "team-paused-retarget",
+        Box::new(|run| {
+            run.orchestration_backend = cloud_backend();
+            run.phase = crate::state::TeamPhase::MrGate;
+        }),
+    )
+    .await;
+    assert!(!updated);
+    assert_ne!(app.snapshot().await.revision, before_revision);
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run("team-paused-retarget")
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Paused);
+    assert_eq!(run.phase, crate::state::TeamPhase::MrGate);
+    assert!(run.orchestration_backend.is_legacy_embedded());
+
+    let before_missing = app.snapshot().await.revision;
+    let updated = relay_api::TeamPort::update_run(
+        &app,
+        "team-does-not-exist",
+        Box::new(|run| run.phase = crate::state::TeamPhase::Finished),
+    )
+    .await;
+    assert!(!updated);
+    assert_eq!(
+        app.snapshot().await.revision,
+        before_missing,
+        "an unknown run id must not fabricate a state change"
     );
 }
 

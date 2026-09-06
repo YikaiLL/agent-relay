@@ -190,12 +190,21 @@ pub struct AppState {
     #[cfg(test)]
     team_gated_arrivals: Arc<std::sync::atomic::AtomicU64>,
     /// Test-only latch immediately before Stop/Cancel enters the drive gate.
-    /// Holding it lets a test prove another action won gate admission first,
-    /// without relying on observing a task before Tokio has enqueued its waiter.
+    /// The arrival count only proves that Stop reached this latch; the separate
+    /// waiter count below proves its gate future was actually polled pending.
     #[cfg(test)]
     team_stop_pre_gate_barrier: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     team_stop_pre_gate_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// Counts Stop/Cancel gate futures after they return `Poll::Pending`, which
+    /// makes mutex queue order directly observable to concurrency regressions.
+    #[cfg(test)]
+    team_stop_gate_waiter_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// Counts Pause calls immediately before they poll the drive-gate lock. The
+    /// corresponding regression is explicitly current-thread, so after another
+    /// task observes this count the uninterrupted poll has reached the lock.
+    #[cfg(test)]
+    team_pause_pre_gate_arrivals: Arc<std::sync::atomic::AtomicU64>,
     /// The third window: the driver's OWN git mutation of the worktree. Not a
     /// turn, so the turn latches miss it entirely — and a stop that returned here
     /// would release the tree while the relay was still staging into it.
@@ -405,6 +414,10 @@ impl AppState {
             #[cfg(test)]
             team_stop_pre_gate_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
+            team_stop_gate_waiter_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_pause_pre_gate_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
             team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             team_commit_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -577,6 +590,10 @@ impl AppState {
             team_stop_pre_gate_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             team_stop_pre_gate_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_stop_gate_waiter_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_pause_pre_gate_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]

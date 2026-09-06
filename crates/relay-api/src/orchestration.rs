@@ -60,6 +60,8 @@ pub enum ProtocolValueError {
         min: u32,
         max: u32,
     },
+    UnsupportedProtocolVersion(u32),
+    MalformedDriverProgress,
 }
 
 impl fmt::Display for ProtocolValueError {
@@ -89,6 +91,12 @@ impl fmt::Display for ProtocolValueError {
             ),
             Self::InvalidRange { min, max } => {
                 write!(f, "invalid protocol version range {min}-{max}")
+            }
+            Self::UnsupportedProtocolVersion(version) => {
+                write!(f, "unsupported orchestration protocol version {version}")
+            }
+            Self::MalformedDriverProgress => {
+                f.write_str("persisted driver progress is malformed and cannot be executed")
             }
         }
     }
@@ -124,18 +132,44 @@ fn validate_token(
     Ok(raw.to_string())
 }
 
+/// A protocol version this build can actually speak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SupportedProtocolVersion(u32);
+
+impl SupportedProtocolVersion {
+    pub fn new(version: u32) -> Result<Self, ProtocolValueError> {
+        if (MIN_PROTOCOL_VERSION..=CURRENT_PROTOCOL_VERSION).contains(&version) {
+            Ok(Self(version))
+        } else {
+            Err(ProtocolValueError::UnsupportedProtocolVersion(version))
+        }
+    }
+
+    pub const fn current() -> Self {
+        Self(CURRENT_PROTOCOL_VERSION)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SupportedProtocolVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let version = u32::deserialize(deserializer)?;
+        Self::new(version).map_err(de::Error::custom)
+    }
+}
+
 fn deserialize_supported_protocol_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let version = u32::deserialize(deserializer)?;
-    if (MIN_PROTOCOL_VERSION..=CURRENT_PROTOCOL_VERSION).contains(&version) {
-        Ok(version)
-    } else {
-        Err(de::Error::custom(format!(
-            "unsupported orchestration protocol version {version}"
-        )))
-    }
+    SupportedProtocolVersion::deserialize(deserializer).map(SupportedProtocolVersion::get)
 }
 
 struct LenientString(Option<String>);
@@ -235,6 +269,162 @@ impl<'de> Deserialize<'de> for LenientString {
         }
 
         deserializer.deserialize_any(LenientStringVisitor)
+    }
+}
+
+enum LenientNullableString {
+    Null,
+    Value(String),
+    Invalid,
+}
+
+impl<'de> Deserialize<'de> for LenientNullableString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct NullableStringVisitor;
+
+        impl<'de> Visitor<'de> for NullableStringVisitor {
+            type Value = LenientNullableString;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a nullable persisted string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(LenientNullableString::Value(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(LenientNullableString::Value(value))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(LenientNullableString::Null)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(LenientNullableString::Null)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                LenientNullableString::deserialize(deserializer)
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(LenientNullableString::Invalid)
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(LenientNullableString::Invalid)
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(LenientNullableString::Invalid)
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(LenientNullableString::Invalid)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(LenientNullableString::Invalid)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(LenientNullableString::Invalid)
+            }
+        }
+
+        deserializer.deserialize_any(NullableStringVisitor)
+    }
+}
+
+struct LenientBool(Option<bool>);
+
+impl<'de> Deserialize<'de> for LenientBool {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BoolVisitor;
+
+        impl<'de> Visitor<'de> for BoolVisitor {
+            type Value = LenientBool;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a persisted boolean")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(LenientBool(Some(value)))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(LenientBool(None))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(LenientBool(None))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                LenientBool::deserialize(deserializer)
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(LenientBool(None))
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(LenientBool(None))
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(LenientBool(None))
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(LenientBool(None))
+            }
+
+            fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+                Ok(LenientBool(None))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(LenientBool(None))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(LenientBool(None))
+            }
+        }
+
+        deserializer.deserialize_any(BoolVisitor)
     }
 }
 
@@ -628,13 +818,13 @@ pub enum OrchestrationBackendRef {
     /// Future hosted content-blind driver. It is inert until a later task adds a
     /// transport and executor.
     Cloud {
-        protocol_version: u32,
+        protocol_version: SupportedProtocolVersion,
         driver_version: DriverVersion,
         cloud_run_id: DriverRunId,
     },
     /// Future licensed local sidecar. It is inert until a later task adds IPC.
     LocalSidecar {
-        protocol_version: u32,
+        protocol_version: SupportedProtocolVersion,
         driver_version: DriverVersion,
     },
     /// A backend written by a newer build. The run record survives, but this
@@ -671,6 +861,19 @@ impl OrchestrationBackendRef {
 
     pub fn is_executable_by_current_build(&self) -> bool {
         matches!(self, Self::LegacyEmbedded)
+    }
+
+    pub fn supported_protocol_version(&self) -> Option<u32> {
+        match self {
+            Self::LegacyEmbedded => Some(CURRENT_PROTOCOL_VERSION),
+            Self::Cloud {
+                protocol_version, ..
+            }
+            | Self::LocalSidecar {
+                protocol_version, ..
+            } => Some(protocol_version.get()),
+            Self::UnknownNonExecuting { .. } => None,
+        }
     }
 
     pub fn unknown_non_executing() -> Self {
@@ -1018,7 +1221,9 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                         if unsupported_shape || original_kind.is_some() {
                             return Ok(unknown);
                         }
-                        let Some(protocol_version) = protocol_version else {
+                        let Some(protocol_version) = protocol_version
+                            .and_then(|version| SupportedProtocolVersion::new(version).ok())
+                        else {
                             return Ok(unknown);
                         };
                         let Some(driver_version) = driver_version
@@ -1043,7 +1248,9 @@ impl<'de> Deserialize<'de> for OrchestrationBackendRef {
                         if unsupported_shape || original_kind.is_some() || cloud_run_id.is_some() {
                             return Ok(unknown);
                         }
-                        let Some(protocol_version) = protocol_version else {
+                        let Some(protocol_version) = protocol_version
+                            .and_then(|version| SupportedProtocolVersion::new(version).ok())
+                        else {
                             return Ok(unknown);
                         };
                         let Some(driver_version) = driver_version
@@ -1081,6 +1288,28 @@ pub struct DriverProgress {
     pub last_command_seq: u64,
     pub last_event_seq: u64,
     pub in_flight_command_id: Option<CommandId>,
+    /// A known progress field was present but could not be decoded safely.
+    /// Persist this marker so a load/save cycle cannot turn corrupt progress
+    /// into a plausible all-zero cursor.
+    #[serde(default, skip_serializing_if = "is_false")]
+    malformed: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl DriverProgress {
+    pub fn is_malformed(&self) -> bool {
+        self.malformed
+    }
+
+    fn malformed() -> Self {
+        Self {
+            malformed: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for DriverProgress {
@@ -1093,6 +1322,7 @@ impl<'de> Deserialize<'de> for DriverProgress {
             LastCommandSeq,
             LastEventSeq,
             InFlightCommandId,
+            Malformed,
             Unknown,
         }
 
@@ -1107,6 +1337,7 @@ impl<'de> Deserialize<'de> for DriverProgress {
                     "last_command_seq" => Self::LastCommandSeq,
                     "last_event_seq" => Self::LastEventSeq,
                     "in_flight_command_id" => Self::InFlightCommandId,
+                    "malformed" => Self::Malformed,
                     _ => Self::Unknown,
                 })
             }
@@ -1125,56 +1356,56 @@ impl<'de> Deserialize<'de> for DriverProgress {
             where
                 E: de::Error,
             {
-                Ok(DriverProgress::default())
+                Ok(DriverProgress::malformed())
             }
 
             fn visit_none<E>(self) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(DriverProgress::default())
+                Ok(DriverProgress::malformed())
             }
 
             fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(DriverProgress::default())
+                Ok(DriverProgress::malformed())
             }
 
             fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(DriverProgress::default())
+                Ok(DriverProgress::malformed())
             }
 
             fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(DriverProgress::default())
+                Ok(DriverProgress::malformed())
             }
 
             fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(DriverProgress::default())
+                Ok(DriverProgress::malformed())
             }
 
             fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(DriverProgress::default())
+                Ok(DriverProgress::malformed())
             }
 
             fn visit_string<E>(self, _value: String) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                Ok(DriverProgress::default())
+                Ok(DriverProgress::malformed())
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -1182,7 +1413,7 @@ impl<'de> Deserialize<'de> for DriverProgress {
                 A: SeqAccess<'de>,
             {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(DriverProgress::default())
+                Ok(DriverProgress::malformed())
             }
 
             fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
@@ -1194,46 +1425,77 @@ impl<'de> Deserialize<'de> for DriverProgress {
                 let mut last_command_seq_seen = false;
                 let mut last_event_seq_seen = false;
                 let mut in_flight_command_id_seen = false;
+                let mut malformed_seen = false;
 
                 while let Some(field) = map.next_key()? {
                     match field {
                         Field::StateRevision => {
                             if state_revision_seen {
                                 let _: IgnoredAny = map.next_value()?;
+                                progress.malformed = true;
                                 continue;
                             }
                             state_revision_seen = true;
-                            progress.state_revision =
-                                map.next_value::<LenientU64>()?.0.unwrap_or_default();
+                            match map.next_value::<LenientU64>()?.0 {
+                                Some(value) => progress.state_revision = value,
+                                None => progress.malformed = true,
+                            }
                         }
                         Field::LastCommandSeq => {
                             if last_command_seq_seen {
                                 let _: IgnoredAny = map.next_value()?;
+                                progress.malformed = true;
                                 continue;
                             }
                             last_command_seq_seen = true;
-                            progress.last_command_seq =
-                                map.next_value::<LenientU64>()?.0.unwrap_or_default();
+                            match map.next_value::<LenientU64>()?.0 {
+                                Some(value) => progress.last_command_seq = value,
+                                None => progress.malformed = true,
+                            }
                         }
                         Field::LastEventSeq => {
                             if last_event_seq_seen {
                                 let _: IgnoredAny = map.next_value()?;
+                                progress.malformed = true;
                                 continue;
                             }
                             last_event_seq_seen = true;
-                            progress.last_event_seq =
-                                map.next_value::<LenientU64>()?.0.unwrap_or_default();
+                            match map.next_value::<LenientU64>()?.0 {
+                                Some(value) => progress.last_event_seq = value,
+                                None => progress.malformed = true,
+                            }
                         }
                         Field::InFlightCommandId => {
                             if in_flight_command_id_seen {
                                 let _: IgnoredAny = map.next_value()?;
+                                progress.malformed = true;
                                 continue;
                             }
                             in_flight_command_id_seen = true;
-                            progress.in_flight_command_id = map
-                                .next_value::<LenientString>()?
-                                .0
-                                .and_then(|raw| CommandId::new(raw).ok());
+                            match map.next_value::<LenientNullableString>()? {
+                                LenientNullableString::Null => {
+                                    progress.in_flight_command_id = None;
+                                }
+                                LenientNullableString::Value(raw) => match CommandId::new(raw) {
+                                    Ok(command_id) => {
+                                        progress.in_flight_command_id = Some(command_id)
+                                    }
+                                    Err(_) => progress.malformed = true,
+                                },
+                                LenientNullableString::Invalid => progress.malformed = true,
+                            }
+                        }
+                        Field::Malformed => {
+                            if malformed_seen {
+                                let _: IgnoredAny = map.next_value()?;
+                                progress.malformed = true;
+                                continue;
+                            }
+                            malformed_seen = true;
+                            match map.next_value::<LenientBool>()?.0 {
+                                Some(value) => progress.malformed |= value,
+                                None => progress.malformed = true,
+                            }
                         }
                         Field::Unknown => {
                             let _: IgnoredAny = map.next_value()?;
@@ -1478,13 +1740,19 @@ impl DriverCursor {
         run: &crate::team::TeamRun,
         artifacts: Vec<ArtifactRef>,
     ) -> Result<Self, ProtocolValueError> {
+        if run.driver_progress.is_malformed() {
+            return Err(ProtocolValueError::MalformedDriverProgress);
+        }
         let current = run.current_sub_task();
         let current_rounds_used = current
             .and_then(|index| run.sub_tasks.get(index))
             .map(|task| task.rounds_used)
             .unwrap_or(0);
         Ok(Self {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
+            protocol_version: run
+                .orchestration_backend
+                .supported_protocol_version()
+                .unwrap_or(CURRENT_PROTOCOL_VERSION),
             backend: run.orchestration_backend.kind(),
             status: DriverRunStatus::from_team_status(run.status),
             phase: DriverPhase::from_team_phase(run.phase),
@@ -2625,8 +2893,8 @@ pub fn negotiate_protocol(
     let local_max = local.max.min(CURRENT_PROTOCOL_VERSION);
     if local_min > local_max {
         return Err(ProtocolValueError::NoCompatibleProtocol {
-            local_min,
-            local_max,
+            local_min: local.min,
+            local_max: local.max,
             peer_min: peer.min,
             peer_max: peer.max,
         });
@@ -3371,10 +3639,15 @@ mod tests {
             ProtocolRange::new(2, 3).unwrap(),
             ProtocolRange::new(2, 3).unwrap(),
         );
-        assert!(matches!(
+        assert_eq!(
             refused_future_local,
-            Err(ProtocolValueError::NoCompatibleProtocol { .. })
-        ));
+            Err(ProtocolValueError::NoCompatibleProtocol {
+                local_min: 2,
+                local_max: 3,
+                peer_min: 2,
+                peer_max: 3,
+            })
+        );
 
         let invalid: Result<ProtocolRange, _> = serde_json::from_str(r#"{"min":3,"max":2}"#);
         assert!(invalid.is_err(), "invalid ranges must fail during decode");
@@ -3669,13 +3942,13 @@ mod tests {
         let mut samples = vec![
             serde_json::to_value(OrchestrationBackendRef::LegacyEmbedded).unwrap(),
             serde_json::to_value(OrchestrationBackendRef::Cloud {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
+                protocol_version: SupportedProtocolVersion::current(),
                 driver_version: DriverVersion::new("driver.1").unwrap(),
                 cloud_run_id: DriverRunId::new("cloud-run-1").unwrap(),
             })
             .unwrap(),
             serde_json::to_value(OrchestrationBackendRef::LocalSidecar {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
+                protocol_version: SupportedProtocolVersion::current(),
                 driver_version: DriverVersion::new("driver.1").unwrap(),
             })
             .unwrap(),
@@ -3814,7 +4087,7 @@ mod tests {
             ),
             (
                 OrchestrationBackendRef::Cloud {
-                    protocol_version: 1,
+                    protocol_version: SupportedProtocolVersion::current(),
                     driver_version: DriverVersion::new("driver.1").unwrap(),
                     cloud_run_id: DriverRunId::new("cloud-run-1").unwrap(),
                 },
@@ -3822,7 +4095,7 @@ mod tests {
             ),
             (
                 OrchestrationBackendRef::LocalSidecar {
-                    protocol_version: 1,
+                    protocol_version: SupportedProtocolVersion::current(),
                     driver_version: DriverVersion::new("driver.1").unwrap(),
                 },
                 r#"{"kind":"local_sidecar","protocol_version":1,"driver_version":"driver.1"}"#,
@@ -3912,6 +4185,34 @@ mod tests {
             OrchestrationBackendKind::UnknownNonExecuting
         );
         assert_eq!(duplicate_cloud_field.original_unknown_kind(), Some("cloud"));
+
+        for (wire, expected_kind, expected_version) in [
+            (
+                r#"{"kind":"cloud","protocol_version":2,"driver_version":"driver.2","cloud_run_id":"cloud-run-2"}"#,
+                "cloud",
+                2,
+            ),
+            (
+                r#"{"kind":"local_sidecar","protocol_version":0,"driver_version":"driver.0"}"#,
+                "local_sidecar",
+                0,
+            ),
+        ] {
+            let backend: OrchestrationBackendRef =
+                serde_json::from_str(wire).expect("unsupported versions degrade");
+            assert_eq!(
+                backend.kind(),
+                OrchestrationBackendKind::UnknownNonExecuting
+            );
+            assert_eq!(backend.original_unknown_kind(), Some(expected_kind));
+            assert!(matches!(
+                backend,
+                OrchestrationBackendRef::UnknownNonExecuting {
+                    protocol_version: Some(version),
+                    ..
+                } if version == expected_version
+            ));
+        }
 
         let extra_legacy: OrchestrationBackendRef =
             serde_json::from_str(r#"{"kind":"legacy_embedded","driver_version":"future"}"#)
@@ -4012,11 +4313,37 @@ mod tests {
             }"#,
         )
         .expect("malformed progress must not invalidate persisted state");
-        assert_eq!(malformed, DriverProgress::default());
+        assert_eq!(malformed.state_revision, 0);
+        assert_eq!(malformed.last_command_seq, 0);
+        assert_eq!(malformed.last_event_seq, 0);
+        assert!(malformed.in_flight_command_id.is_none());
+        assert!(malformed.is_malformed());
+        let persisted = serde_json::to_string(&malformed).expect("persist malformed marker");
+        assert!(persisted.contains(r#""malformed":true"#), "{persisted}");
+        let restored: DriverProgress =
+            serde_json::from_str(&persisted).expect("restore malformed marker");
+        assert!(restored.is_malformed());
 
         let whole_value_malformed: DriverProgress = serde_json::from_str(r#"["future-progress"]"#)
             .expect("future progress shape must not invalidate persisted state");
-        assert_eq!(whole_value_malformed, DriverProgress::default());
+        assert!(whole_value_malformed.is_malformed());
+
+        let float_counter: DriverProgress = serde_json::from_str(r#"{"state_revision":17.0}"#)
+            .expect("float counter must not invalidate persisted state");
+        assert!(float_counter.is_malformed());
+
+        let mut run = TeamRun::new(
+            "team-malformed-progress".to_string(),
+            TaskSpec::default(),
+            "/tmp/content-blind-test".to_string(),
+            "device-1".to_string(),
+        );
+        run.driver_progress = float_counter;
+        assert_eq!(
+            DriverCursor::from_team_run(&run, Vec::new()),
+            Err(ProtocolValueError::MalformedDriverProgress),
+            "malformed persisted counters must never become an executable zero cursor"
+        );
     }
 
     #[test]

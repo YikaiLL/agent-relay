@@ -2636,15 +2636,8 @@ impl RelayState {
         let mut terminal: Vec<(String, u64)> = self
             .team_runs
             .iter()
-            .filter(|(_, run)| run.status.is_terminal() || !run.is_executable_by_current_build())
-            .map(|(id, run)| {
-                let eviction_order = if run.is_executable_by_current_build() {
-                    run.updated_at
-                } else {
-                    run.requested_at
-                };
-                (id.clone(), eviction_order)
-            })
+            .filter(|(_, run)| run.status.is_terminal())
+            .map(|(id, run)| (id.clone(), run.updated_at))
             .collect();
         terminal.sort_by_key(|(_, updated_at)| *updated_at);
         for (id, _) in terminal {
@@ -5770,7 +5763,7 @@ mod tests {
 
     fn cloud_backend() -> relay_api::orchestration::OrchestrationBackendRef {
         relay_api::orchestration::OrchestrationBackendRef::Cloud {
-            protocol_version: relay_api::orchestration::CURRENT_PROTOCOL_VERSION,
+            protocol_version: relay_api::orchestration::SupportedProtocolVersion::current(),
             driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
             cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
         }
@@ -5882,7 +5875,7 @@ mod tests {
     }
 
     #[test]
-    fn team_run_retention_can_prune_inert_records_but_keeps_locally_live_ones() {
+    fn team_run_retention_never_prunes_non_terminal_runs_from_any_backend() {
         let mut relay = test_relay();
         for i in 0..=MAX_WORKFLOW_RUNS {
             let mut run = inert_team_run_with_status(&format!("future-{i}"), TeamRunStatus::Paused);
@@ -5892,12 +5885,12 @@ mod tests {
         }
         assert_eq!(
             relay.team_runs.len(),
-            MAX_WORKFLOW_RUNS,
-            "inert records are bounded by normal retention"
+            MAX_WORKFLOW_RUNS + 1,
+            "a newer backend's non-terminal records must survive this older build"
         );
         assert!(
-            !relay.team_runs.contains_key("future-0"),
-            "the oldest inert record should be evicted first"
+            relay.team_runs.contains_key("future-0"),
+            "an active run cannot be treated as disposable terminal history"
         );
 
         let mut relay = test_relay();
@@ -6407,6 +6400,14 @@ mod tests {
         assert_eq!(run.driver_progress.last_command_seq, 7);
         assert_eq!(run.driver_progress.last_event_seq, 0);
         assert!(run.driver_progress.in_flight_command_id.is_none());
+        assert!(run.driver_progress.is_malformed());
+
+        let rewritten = serde_json::to_value(&persisted).expect("rewrite persisted state");
+        assert_eq!(
+            rewritten["team_runs"]["team_future"]["driver_progress"]["malformed"],
+            serde_json::Value::Bool(true),
+            "a load/save cycle must retain the fail-closed progress marker"
+        );
 
         let mut restored = test_relay();
         restored.apply_persisted(&persisted);
@@ -6414,6 +6415,7 @@ mod tests {
         assert_eq!(restored_run.status, TeamRunStatus::Paused);
         assert!(restored_run.status.is_resumable());
         assert!(!restored_run.is_live_in_current_build());
+        assert!(restored_run.driver_progress.is_malformed());
         assert!(
             restored_run
                 .error
@@ -6430,7 +6432,7 @@ mod tests {
         relay.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
 
         let cloud = relay_api::orchestration::OrchestrationBackendRef::Cloud {
-            protocol_version: relay_api::orchestration::CURRENT_PROTOCOL_VERSION,
+            protocol_version: relay_api::orchestration::SupportedProtocolVersion::current(),
             driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
             cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
         };
@@ -6466,7 +6468,7 @@ mod tests {
         ));
 
         let cloud = relay_api::orchestration::OrchestrationBackendRef::Cloud {
-            protocol_version: relay_api::orchestration::CURRENT_PROTOCOL_VERSION,
+            protocol_version: relay_api::orchestration::SupportedProtocolVersion::current(),
             driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
             cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
         };

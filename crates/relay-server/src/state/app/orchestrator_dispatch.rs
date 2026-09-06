@@ -784,7 +784,7 @@ mod tests {
 
     fn cloud_backend() -> relay_api::orchestration::OrchestrationBackendRef {
         relay_api::orchestration::OrchestrationBackendRef::Cloud {
-            protocol_version: relay_api::orchestration::CURRENT_PROTOCOL_VERSION,
+            protocol_version: relay_api::orchestration::SupportedProtocolVersion::current(),
             driver_version: relay_api::orchestration::DriverVersion::new("driver.1").unwrap(),
             cloud_run_id: relay_api::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
         }

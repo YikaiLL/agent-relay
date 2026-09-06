@@ -89,14 +89,19 @@ to `LegacyEmbedded`. Explicit `null`, empty objects, malformed records, and
 future backend kinds restore as non-executing. The relay retains only bounded
 identity fields it already knows how to validate (`original_kind`,
 `protocol_version`, `driver_version`, `cloud_run_id`); unsupported future
-payload fields are dropped rather than preserved as arbitrary JSON.
+payload fields are dropped rather than preserved as arbitrary JSON. Identity
+values outside the current bounded token grammar are malformed, not opaque
+pass-through data, and are deliberately omitted so paths, URLs, or unbounded
+prose cannot enter the content-blind vocabulary.
 
 The current archival lifecycle for inert unsupported-backend runs is explicit:
 if a paused inert run loses its worktree, restore/validation changes it to a
 diagnostic `Blocked` state; executable blocked-run resolution refuses to resume
 that inert record in this build; explicit `Cancelled` archival is the supported
 current-build exit and releases local provider seats. All diagnostic prose and
-seat-release work stay local.
+seat-release work stay local. Retention prunes only terminal task history;
+non-terminal inert records remain durable because an older build cannot decide
+that a newer backend's active run is disposable.
 
 `sealwire-private` and private deployments:
 

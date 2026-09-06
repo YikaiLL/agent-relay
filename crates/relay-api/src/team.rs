@@ -866,6 +866,7 @@ impl TeamRun {
             || self.driver_progress.last_command_seq != 0
             || self.driver_progress.last_event_seq != 0
             || self.driver_progress.in_flight_command_id.is_some()
+            || self.driver_progress.is_malformed()
             || self.complex.is_some()
             || self.design_verdict.is_some()
             || self.mr_verdict.is_some()
@@ -1682,7 +1683,7 @@ mod tests {
 
         run.status = TeamRunStatus::Paused;
         run.orchestration_backend = OrchestrationBackendRef::Cloud {
-            protocol_version: crate::orchestration::CURRENT_PROTOCOL_VERSION,
+            protocol_version: crate::orchestration::SupportedProtocolVersion::current(),
             driver_version: crate::orchestration::DriverVersion::new("driver.1").unwrap(),
             cloud_run_id: crate::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
         };
@@ -1714,7 +1715,7 @@ mod tests {
             "device".to_string(),
         );
         let cloud = OrchestrationBackendRef::Cloud {
-            protocol_version: crate::orchestration::CURRENT_PROTOCOL_VERSION,
+            protocol_version: crate::orchestration::SupportedProtocolVersion::current(),
             driver_version: crate::orchestration::DriverVersion::new("driver.1").unwrap(),
             cloud_run_id: crate::orchestration::DriverRunId::new("cloud-run-1").unwrap(),
         };
@@ -1723,7 +1724,7 @@ mod tests {
 
         run.set_status(TeamRunStatus::Running);
         let sidecar = OrchestrationBackendRef::LocalSidecar {
-            protocol_version: crate::orchestration::CURRENT_PROTOCOL_VERSION,
+            protocol_version: crate::orchestration::SupportedProtocolVersion::current(),
             driver_version: crate::orchestration::DriverVersion::new("driver.2").unwrap(),
         };
         assert!(run.set_orchestration_backend(sidecar).is_err());
