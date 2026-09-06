@@ -319,6 +319,80 @@ test("a non-true onLoad result loads exactly one page per trigger", async () => 
   assert.equal(calls, 1, "undefined result should not start a prefetch loop");
 });
 
+test("dispose during an in-flight burst prevents a pending result from scheduling another load", async () => {
+  // disconnect() alone doesn't stop runPrefetchBurst's own promise chain: a
+  // `true` result arriving after dispose() would otherwise loop into another
+  // onLoad call from an instance nothing owns any more.
+  const { FakeObserver, instances } = makeFakeObserverFactory();
+  let calls = 0;
+  let release;
+  const dispose = createTranscriptHistoryLoader({
+    ObserverCtor: FakeObserver,
+    onLoad: () =>
+      new Promise((resolve) => {
+        calls += 1;
+        release = resolve;
+      }),
+    // Within the band, so an unguarded `true` result loops straight into a
+    // second onLoad call.
+    scrollElement: makeScrollEl({ scrollTop: 0 }),
+    sentinelElement: { id: "sentinel" },
+  });
+
+  await instances[0].trigger(true);
+  assert.equal(calls, 1, "the intersection starts the first load");
+
+  // Torn down (sentinel removed, or the component unmounting) while that
+  // first load is still in flight.
+  dispose();
+  assert.equal(instances[0].disconnected, true);
+
+  // The already-in-flight call finally resolves, reporting more pages.
+  release(true);
+  await flushBurst();
+  assert.equal(calls, 1, "a disposed loader must not act on a pending result by loading again");
+});
+
+test("a sentinel swap during an in-flight burst leaves only the replacement loader's observer alive", async () => {
+  const { FakeObserver, instances } = makeFakeObserverFactory();
+  const scrollEl = makeScrollEl({ scrollTop: 0 });
+  const sentinelA = { id: "A" };
+  scrollEl.setSentinel(sentinelA);
+  let calls = 0;
+  let release;
+
+  const { sync } = attachTranscriptHistoryLoader({
+    ObserverCtor: FakeObserver,
+    onLoad: () =>
+      new Promise((resolve) => {
+        calls += 1;
+        release = resolve;
+      }),
+    scrollElement: scrollEl,
+  });
+
+  sync();
+  await instances[0].trigger(true);
+  assert.equal(calls, 1, "the first sentinel's intersection starts a load");
+
+  // The branch swaps to a new sentinel while that load is still in flight:
+  // sync() tears down instances[0] and attaches a fresh loader to sentinelB.
+  const sentinelB = { id: "B" };
+  scrollEl.setSentinel(sentinelB);
+  sync();
+  assert.equal(instances.length, 2);
+  assert.equal(instances[0].disconnected, true);
+
+  // The old loader's in-flight call finally resolves, reporting more pages.
+  release(true);
+  await flushBurst();
+  assert.equal(calls, 1, "the disposed loader must not fire a second, overlapping load");
+
+  // The replacement loader is unaffected and still loads on its own intersection.
+  await instances[1].trigger(true);
+  assert.equal(calls, 2, "the replacement loader still loads normally");
+});
+
 test("returns a noop disposer when prerequisites are missing", () => {
   const { FakeObserver, instances } = makeFakeObserverFactory();
   const dispose = createTranscriptHistoryLoader({

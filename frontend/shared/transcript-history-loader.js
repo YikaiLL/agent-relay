@@ -49,6 +49,13 @@ export function createTranscriptHistoryLoader({
   // IntersectionObserver transition or a sync() poke after a re-render — clears
   // it, so a cursor that only appears after hydration still starts a burst.
   let awaitingExternalPoke = false;
+  // `disconnect()` alone doesn't stop an in-flight burst: `runPrefetchBurst`'s
+  // `await onLoad()` can still be pending when `dispose()` runs (sentinel
+  // removed/replaced, or the component unmounting), and its eventual `true`
+  // would otherwise loop into another onLoad call from a loader nothing owns
+  // any more — overlapping whatever loader replaced it. Checked after every
+  // await in the burst loop, and up front by anything that could restart one.
+  let disposed = false;
 
   const observer = new ObserverCtor(
     (entries) => {
@@ -68,7 +75,7 @@ export function createTranscriptHistoryLoader({
   );
 
   function scheduleBurst({ trusted = false } = {}) {
-    if (pending || reachedTop) {
+    if (disposed || pending || reachedTop) {
       return;
     }
     if (!trusted && !stillWithinPrefetchBand()) {
@@ -90,7 +97,7 @@ export function createTranscriptHistoryLoader({
         // to pull and room above the fold. This is what removes the "scroll to
         // the top, nothing loads until you wiggle" stall after the per-burst
         // cap or a band that short/collapsed pages did not fill.
-        if (!reachedTop && !awaitingExternalPoke && stillWithinPrefetchBand()) {
+        if (!disposed && !reachedTop && !awaitingExternalPoke && stillWithinPrefetchBand()) {
           scheduleBurst();
         }
       });
@@ -106,6 +113,12 @@ export function createTranscriptHistoryLoader({
     let loaded = 0;
     while (loaded < MAX_PREFETCH_PAGES_PER_BURST) {
       const result = await onLoad();
+      // dispose() can land while the call above was in flight (sentinel
+      // removed/replaced, or unmount) — a `true` result must not loop into
+      // another onLoad from a loader nothing owns any more.
+      if (disposed) {
+        return;
+      }
       if (result === false) {
         // A real page load reported no older pages remain — stop for good.
         reachedTop = true;
@@ -122,6 +135,9 @@ export function createTranscriptHistoryLoader({
       loaded += 1;
       // Let the prepend lay out (scroll anchoring) before measuring the band.
       await nextFrame();
+      if (disposed) {
+        return;
+      }
       if (!stillWithinPrefetchBand()) {
         return; // enough buffered above the fold; user scroll re-triggers
       }
@@ -151,6 +167,7 @@ export function createTranscriptHistoryLoader({
   observer.observe(sentinelElement);
 
   const dispose = () => {
+    disposed = true;
     observer.disconnect();
   };
   // Re-check after a render even when no IO transition occurs — used by the
@@ -158,7 +175,7 @@ export function createTranscriptHistoryLoader({
   // (e.g. the cursor appeared after hydration), so it's a no-op on every other
   // render.
   dispose.poke = () => {
-    if (!awaitingExternalPoke) {
+    if (disposed || !awaitingExternalPoke) {
       return;
     }
     awaitingExternalPoke = false;

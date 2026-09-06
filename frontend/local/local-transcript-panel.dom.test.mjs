@@ -353,3 +353,87 @@ test("sync() resumes a loader that backed off awaiting an external poke, on a sa
     delete global.IntersectionObserver;
   }
 });
+
+test("unmounting while a load is pending does not leak a duplicate onLoad call", async () => {
+  // AC2: disconnecting the observer on unmount is not enough — the loader's
+  // own in-flight burst (awaiting onLoad()) survives disconnect(), and a
+  // `true` result landing after unmount must not schedule another load.
+  const { instances } = installFakeIntersectionObserver();
+  const view = mount();
+  const onLoadCalls = [];
+  let release;
+  const onLoadOlderTranscript = () =>
+    new Promise((resolve) => {
+      onLoadCalls.push(true);
+      release = resolve;
+    });
+  try {
+    view.render({ entries: entriesFor(2), onLoadOlderTranscript });
+    assert.equal(instances.length, 1, "the entries branch attaches one observer");
+
+    instances[0].callback([{ isIntersecting: true }]);
+    await flushMicrotasks();
+    assert.equal(onLoadCalls.length, 1, "the intersection starts one load");
+
+    // Unmount while that load is still in flight.
+    view.unmount();
+
+    // The already-in-flight call finally resolves, reporting more pages.
+    release(true);
+    await flushMicrotasks();
+    assert.equal(
+      onLoadCalls.length,
+      1,
+      "a load result arriving after unmount must not schedule another load"
+    );
+  } finally {
+    delete global.IntersectionObserver;
+  }
+});
+
+test("a branch swap that removes the sentinel while a load is pending does not leak a duplicate onLoad call", async () => {
+  // Same AC2 leak as the unmount case above, but reached through sync()'s own
+  // teardown of a superseded sentinel (render-session.js drives this on every
+  // branch swap, not just unmount) rather than the panel's own cleanup.
+  const { instances } = installFakeIntersectionObserver();
+  const view = mount();
+  const onLoadCalls = [];
+  let release;
+  const onLoadOlderTranscript = () =>
+    new Promise((resolve) => {
+      onLoadCalls.push(true);
+      release = resolve;
+    });
+  try {
+    view.render({ entries: entriesFor(2), onLoadOlderTranscript });
+    assert.equal(instances.length, 1, "the entries branch attaches one observer");
+
+    instances[0].callback([{ isIntersecting: true }]);
+    await flushMicrotasks();
+    assert.equal(onLoadCalls.length, 1, "the intersection starts one load");
+
+    // The branch swaps away from entries (sentinel removed) while that load
+    // is still in flight — the panel's sync() disposes the old instance.
+    view.render({ viewingConversation: false, viewedThreadLocked: true, onLoadOlderTranscript });
+    assert.equal(instances.length, 1, "no new observer is attached without a sentinel");
+
+    // The already-in-flight call finally resolves, reporting more pages.
+    release(true);
+    await flushMicrotasks();
+    assert.equal(
+      onLoadCalls.length,
+      1,
+      "a load result arriving after the sentinel is removed must not schedule another load"
+    );
+
+    // The sentinel reappearing attaches an independent, unaffected loader.
+    view.render({ entries: entriesFor(3), onLoadOlderTranscript });
+    assert.equal(instances.length, 2, "the sentinel reappearing attaches a fresh observer");
+    instances[1].callback([{ isIntersecting: true }]);
+    await flushMicrotasks();
+    assert.equal(onLoadCalls.length, 2, "the replacement loader still loads normally");
+  } finally {
+    view.unmount();
+    delete global.IntersectionObserver;
+  }
+});
