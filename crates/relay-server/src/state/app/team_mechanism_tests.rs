@@ -273,6 +273,45 @@ async fn resume_team_run_refuses_non_embedded_backend_before_status_flip() {
 }
 
 #[tokio::test]
+async fn resume_team_run_allows_malformed_progress_on_legacy_backend() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _) = build_review_app(&root, &["codex"]).await;
+    let drove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = app.with_team_driver(std::sync::Arc::new(RecordingTeamDriver {
+        drove: drove.clone(),
+    }));
+    let run_id = "team-legacy-malformed-progress-resume".to_string();
+    let mut run = crate::state::TeamRun::new(
+        run_id.clone(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.status = crate::state::TeamRunStatus::Paused;
+    run.driver_progress = serde_json::from_str(r#"{"future_progress_field":1}"#)
+        .expect("unknown progress fields must decode fail-closed");
+    assert!(run.driver_progress.is_malformed());
+    app.relay.write().await.insert_team_run(run);
+
+    let status = app
+        .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect("legacy embedded runs may continue without consuming driver progress");
+
+    assert_eq!(status, crate::state::TeamRunStatus::Running);
+    let run =
+        wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Interrupted).await;
+    assert!(
+        run.driver_progress.is_malformed(),
+        "resuming the legacy driver must not clear a future progress marker"
+    );
+    assert!(
+        drove.load(std::sync::atomic::Ordering::Relaxed),
+        "malformed future progress must not block the legacy embedded driver"
+    );
+}
+
+#[tokio::test]
 async fn stop_on_an_already_paused_embedded_run_is_a_truthful_noop() {
     let (_repo, root) = init_team_repo().await;
     let (app, _) = build_review_app(&root, &["codex"]).await;
@@ -857,6 +896,84 @@ async fn mark_cancelled_archives_inert_blocked_run_and_releases_provider_seats()
             .map(|run| run.status),
         Some(crate::state::TeamRunStatus::Cancelled)
     );
+}
+
+#[tokio::test]
+async fn mark_cancelled_drains_malformed_legacy_run_and_releases_provider_seats() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let codex = providers.get("codex").unwrap().clone();
+    let run_id = "team-legacy-malformed-progress-cancel".to_string();
+    let mut run = crate::state::TeamRun::new(
+        run_id.clone(),
+        crate::state::TaskSpec::default(),
+        root,
+        "device-1".to_string(),
+    );
+    run.tl_provider = "codex".to_string();
+    run.dev_provider = "codex".to_string();
+    run.reviewer_provider = "codex".to_string();
+    run.status = crate::state::TeamRunStatus::Running;
+    run.driver_progress = serde_json::from_str(r#"{"future_progress_field":1}"#)
+        .expect("unknown progress fields must decode fail-closed");
+    assert!(run.driver_progress.is_malformed());
+    app.relay.write().await.insert_team_run(run);
+
+    let tl_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Tl,
+    )
+    .await
+    .expect("tl provider-backed thread");
+    let dev_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Dev,
+    )
+    .await
+    .expect("dev provider-backed thread");
+    let reviewer_thread = relay_api::TeamPort::start_thread(
+        &app,
+        &run_id,
+        relay_api::team::TeamRole::Reviewer,
+    )
+    .await
+    .expect("reviewer provider-backed thread");
+    let owned = vec![tl_thread.clone(), dev_thread.clone(), reviewer_thread.clone()];
+    {
+        let mut relay = app.relay.write().await;
+        relay.update_team_run(&run_id, |run| {
+            run.tl_thread_id = tl_thread;
+            run.phase = relay_api::team::TeamPhase::SubTasks;
+            run.sub_tasks.push(crate::state::SubTask {
+                id: "st-1".to_string(),
+                status: crate::state::SubTaskStatus::Pending,
+                dev_thread_id: Some(dev_thread),
+                reviewer_thread_id: Some(reviewer_thread),
+                ..Default::default()
+            });
+        });
+        relay.notify();
+    }
+
+    let status = app
+        .mark_team_run(
+            Some(run_id.clone()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect("malformed progress must not remove the legacy run's archival exit");
+
+    assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+    let released = wait_for_released_threads(&codex, &owned).await;
+    for thread_id in &owned {
+        assert!(
+            released.contains(thread_id),
+            "ordinary cancellation should release the legacy run's seat {thread_id}"
+        );
+    }
 }
 
 #[tokio::test]
