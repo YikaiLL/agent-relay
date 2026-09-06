@@ -3123,7 +3123,15 @@ function handleUnauthorized(message) {
 function seedDefaults(session) {
   void refreshProviderCatalogs(session);
   const activeProvider = session.provider || defaultProvider(state.providers);
-  const composerFallbackModels = state.providerModels[activeProvider] || [];
+  // A live snapshot still arrives while the user is browsing a different,
+  // client-local view-only thread. Seed the composer from what is rendered,
+  // not from the live provider, or each snapshot briefly replaces the viewed
+  // thread's friendly model name/catalogue before the deferred render repairs it.
+  const renderedSession = projectViewOnlySession(session, {
+    viewThreadId: state.viewThreadId,
+    viewOnlyThread: state.viewOnlyThread,
+  }) || session;
+  const renderedProvider = renderedSession.provider || activeProvider;
   const launchProvider = providerInput?.value || activeProvider;
   const launchModels = modelsForProvider(
     launchProvider,
@@ -3131,24 +3139,11 @@ function seedDefaults(session) {
     session.provider
   );
 
-  syncModelSuggestions(
-    messageModel,
-    session.available_models || [],
-    messageModel?.value || session.model,
-    true,
-    true,
-    composerFallbackModels
-  );
-
-  if (!state.defaultsSeeded) {
-    if (messageModel) {
-      messageModel.value = session.model || defaultModelForProvider(activeProvider);
-    }
-    state.defaultsSeeded = true;
-  }
-  // After both the option refresh and the seed assignment above — a direct
-  // `.value =` fires no change event, so the mark would otherwise lag a render.
-  syncComposerModelMark();
+  const seededModel = state.defaultsSeeded
+    ? messageModel?.value || renderedSession.model
+    : renderedSession.model || defaultModelForProvider(renderedProvider);
+  syncComposerModelForRenderedSession(renderedSession, seededModel);
+  state.defaultsSeeded = true;
 
   // Effort is no longer rendered in the composer (it lives in the settings
   // popover and persists via localStorage). If a stale messageEffort element
@@ -3252,17 +3247,18 @@ function syncComposerModelMark() {
   );
 }
 
-function syncComposerModelForRenderedSession(session) {
-  if (!messageModel || !session?.active_thread_id) {
+function syncComposerModelForRenderedSession(session, selectedModel = "") {
+  if (!messageModel || !session) {
     return;
   }
 
   const models = session.available_models || [];
   const fallbackModels = state.providerModels[session.provider] || [];
   const displayModels = models.length ? models : fallbackModels;
-  const currentModel = displayModels.some((model) => model.model === messageModel.value)
-    ? messageModel.value
-    : session.model || messageModel.value;
+  const requestedModel = selectedModel || messageModel.value;
+  const currentModel = displayModels.some((model) => model.model === requestedModel)
+    ? requestedModel
+    : session.model || requestedModel;
 
   // The rendered session may be a client-local view-only projection for a
   // provider different from the relay's live session. Use that projection's

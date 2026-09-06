@@ -224,5 +224,9 @@ test("an empty live catalog never snaps a viewed thread to the fallback default"
   );
 
   assert.equal(value, "codex-auto-review");
-  assert.equal(options[0].model, "codex-auto-review");
+  assert.deepEqual(
+    options.map((option) => option.model),
+    ["codex-auto-review", "gpt-5.1-codex"],
+    "the unknown viewed model stays selected alongside the cached same-provider catalog"
+  );
 });
