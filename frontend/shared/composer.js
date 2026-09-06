@@ -26,13 +26,27 @@ const h = React.createElement;
 export function buildModelSelectOptions(
   models = [],
   currentModelValue = "",
-  { allowForeign = true } = {}
+  { allowForeign = true, fallbackModels = [] } = {}
 ) {
-  const options = (models || []).filter((model) => !model.hidden);
+  // A session snapshot can briefly carry no catalogue while the provider is
+  // reconnecting or a viewed-thread refresh is being rebuilt. Both surfaces
+  // already hold the same provider's fetched catalogue; use it for that gap so
+  // the selected row keeps its real display name instead of flashing the raw
+  // wire id ("ChatGPT" -> "chatgpt", "Auto" -> "default[]", Claude's
+  // friendly alias -> "default"). A non-empty session catalogue remains
+  // authoritative because it also carries the live effort/default metadata.
+  const primaryModels = Array.isArray(models) ? models : [];
+  const fallbackCatalog = Array.isArray(fallbackModels) ? fallbackModels : [];
+  const catalog = primaryModels.length ? primaryModels : fallbackCatalog;
+  const options = catalog.filter((model) => !model.hidden);
   let value = currentModelValue;
   if (value && !options.some((model) => model.model === value)) {
-    if (allowForeign || options.length === 0) {
-      const current = (models || []).find((model) => model.model === value);
+    // An empty primary catalogue still means "not authoritative", even when
+    // the fallback contains other models. Preserve an unknown viewed-thread
+    // selection until its own catalogue arrives; snapping it to the cached
+    // provider default would change the model merely by opening the thread.
+    if (allowForeign || primaryModels.length === 0 || options.length === 0) {
+      const current = catalog.find((model) => model.model === value);
       options.unshift(current || { display_name: value, model: value });
     } else {
       value = options.find((model) => model.is_default)?.model || options[0]?.model || value;

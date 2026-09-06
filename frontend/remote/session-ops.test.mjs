@@ -4748,7 +4748,7 @@ test("sendHeartbeat dispatches a heartbeat when the current device holds control
 
   const sentPayloads = [];
   const { state, saveRemoteAuth } = await import("./state.js");
-  const { sendHeartbeat } = await import("./session-ops.js");
+  const { clearSessionRuntime, sendHeartbeat } = await import("./session-ops.js");
 
   seedRemoteAuth(state, saveRemoteAuth, {
     relayId: "relay-1",
@@ -4790,6 +4790,8 @@ test("sendHeartbeat dispatches a heartbeat when the current device holds control
   assert.equal(sentPayloads[0].request.type, "heartbeat");
   assert.equal(state.pendingActions.size, 0);
   await pending;
+  clearSessionRuntime();
+  state.socket = null;
 });
 
 test("applySessionSnapshot re-hydrates a long final message added after the first hydration", async () => {

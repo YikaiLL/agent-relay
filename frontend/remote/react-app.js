@@ -624,6 +624,7 @@ function RemoteApp() {
         composerEffort: remoteUi.composerEffort,
         composerErrors: currentState.composerErrors,
         composerModel: remoteUi.composerModel,
+        fallbackModels: remoteUi.providerModels[session.provider] || [],
         sendPending: remoteUi.sendPending,
         session,
         sessionView,

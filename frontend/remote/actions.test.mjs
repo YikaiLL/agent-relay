@@ -208,6 +208,50 @@ async function waitFor(predicate, timeoutMs = 1000) {
   throw new Error("timed out waiting for async browser state");
 }
 
+test("a fire-and-forget action cannot migrate to a replacement socket", async () => {
+  installBrowserStubs();
+  const oldSocketFrames = [];
+  const replacementSocketFrames = [];
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { dispatchRemoteActionWithoutReply } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    sessionClaim: "claim-token-1",
+    sessionClaimExpiresAt: Math.floor(Date.now() / 1000) + 300,
+  });
+  seedSocketState(state, {
+    socketConnected: true,
+    socketPeerId: "surface-peer-1",
+  });
+  state.socket = {
+    readyState: 1,
+    send(frameText) {
+      oldSocketFrames.push(frameText);
+    },
+  };
+
+  const pending = dispatchRemoteActionWithoutReply("heartbeat", { input: {} });
+  state.socket = {
+    readyState: 1,
+    send(frameText) {
+      replacementSocketFrames.push(frameText);
+    },
+  };
+
+  await assert.rejects(pending, /broker socket is not connected/);
+  assert.equal(oldSocketFrames.length, 0);
+  assert.equal(replacementSocketFrames.length, 0);
+  state.socket = null;
+});
+
 test("ensureRemoteClaim performs challenge-response without rotating payload secrets", async () => {
   const browser = installBrowserStubs();
   const sentPayloads = [];
@@ -1393,4 +1437,3 @@ test("a relay leaving suspends action deadlines rather than failing them", async
     "and the action must be kept so it can be resent under the same id"
   );
 });
-

@@ -2,6 +2,8 @@ import React from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 
+import { buildModelSelectOptions } from "./composer.js";
+
 const h = React.createElement;
 const rootsBySelect = new WeakMap();
 const renderStateBySelect = new WeakMap();
@@ -89,5 +91,38 @@ export function replaceSelectOptions(select, options = [], selectedValue = "") {
   }
   if (select.value !== selectedValue) {
     select.value = selectedValue;
+  }
+}
+
+// Imperative model-control path used by the local surface. Keeping it here
+// makes the exact DOM update independently testable, including the cached
+// same-provider catalogue used during an empty session snapshot.
+export function syncModelSuggestions(
+  select,
+  models,
+  selectedModel,
+  allowForeign = false,
+  replaceExisting = false,
+  fallbackModels = []
+) {
+  if (!select) {
+    return;
+  }
+
+  const { options, value: currentValue } = buildModelSelectOptions(
+    models,
+    selectedModel || select.value || "",
+    { allowForeign, fallbackModels }
+  );
+  const renderedOptions = options.map((model) => ({
+    label: model.display_name || model.model,
+    provider: model.provider || "",
+    value: model.model,
+  }));
+
+  if (replaceExisting) {
+    replaceSelectOptions(select, renderedOptions, currentValue);
+  } else {
+    renderSelectOptions(select, renderedOptions, currentValue);
   }
 }

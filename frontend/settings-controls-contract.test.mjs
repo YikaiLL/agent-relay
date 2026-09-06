@@ -171,3 +171,58 @@ test("buildModelSelectOptions (!allowForeign) snaps a value not in the catalog t
   assert.equal(value, "claude-default", "stale foreign id snaps to the provider default");
   assert.ok(!options.some((option) => option.model === "gpt-5.5"), "the foreign id is not surfaced");
 });
+
+// Repro for the conversation picker's visible label jitter. The provider
+// catalogue is already cached by both clients, but a transiently empty session
+// snapshot used to synthesize the selected option from its raw id. The next
+// full snapshot restored display_name, producing exactly these oscillations.
+for (const { provider, model, displayName } of [
+  { provider: "codex", model: "chatgpt", displayName: "ChatGPT" },
+  { provider: "cursor", model: "default[]", displayName: "Auto" },
+  {
+    provider: "claude_code",
+    model: "default",
+    displayName: "Default (recommended, Opus 5)",
+  },
+]) {
+  test(`${provider} keeps its friendly model label through an empty session catalog`, () => {
+    const fallbackModels = [{ model, display_name: displayName, is_default: true }];
+    const { options } = buildModelSelectOptions([], model, {
+      allowForeign: true,
+      fallbackModels,
+    });
+    const selected = options.find((option) => option.model === model);
+
+    assert.equal(selected?.display_name, displayName);
+    assert.notEqual(selected?.display_name, model, "must not flash the raw model id");
+  });
+}
+
+test("the live session catalog wins over a conflicting fallback label", () => {
+  const { options } = buildModelSelectOptions(
+    [{ model: "gpt-5", display_name: "Live name" }],
+    "gpt-5",
+    {
+      allowForeign: true,
+      fallbackModels: [{ model: "gpt-5", display_name: "Stale name" }],
+    }
+  );
+
+  assert.equal(options[0].display_name, "Live name");
+});
+
+test("an empty live catalog never snaps a viewed thread to the fallback default", () => {
+  const { options, value } = buildModelSelectOptions(
+    [],
+    "codex-auto-review",
+    {
+      allowForeign: false,
+      fallbackModels: [
+        { model: "gpt-5.1-codex", display_name: "GPT-5.1 Codex", is_default: true },
+      ],
+    }
+  );
+
+  assert.equal(value, "codex-auto-review");
+  assert.equal(options[0].model, "codex-auto-review");
+});

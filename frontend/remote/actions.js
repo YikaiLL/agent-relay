@@ -669,7 +669,8 @@ export async function dispatchRemoteActionWithoutReply(actionType, request) {
   if (!state.remoteAuth) {
     throw new Error("this browser is not paired yet");
   }
-  if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
+  const socket = state.socket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
     throw new Error("broker socket is not connected");
   }
   if (requiresSessionClaim(actionType) && !state.remoteAuth.sessionClaim) {
@@ -680,7 +681,8 @@ export async function dispatchRemoteActionWithoutReply(actionType, request) {
   sendBrokerFrame(
     requiresSessionClaim(actionType)
       ? await buildClaimedActionPayload(actionId, actionType, request)
-      : await buildDeviceActionPayload(actionId, actionType, request)
+      : await buildDeviceActionPayload(actionId, actionType, request),
+    socket
   );
 }
 
@@ -816,12 +818,16 @@ async function buildDeviceActionPayload(actionId, actionType, request) {
 /// Separate from `dispatchRemoteAction` so a resend can reproduce the request under its
 /// ORIGINAL action id — see `resendPendingActions`.
 async function sendRemoteActionFrame(actionId, actionType, request) {
+  const socket = state.socket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    throw new Error("broker socket is not connected");
+  }
   if (actionType === "claim_challenge") {
-    sendBrokerFrame(await buildClaimChallengePayload(actionId));
+    sendBrokerFrame(await buildClaimChallengePayload(actionId), socket);
     return;
   }
   if (actionType === "claim_device") {
-    sendBrokerFrame(await buildClaimDevicePayload(actionId, request));
+    sendBrokerFrame(await buildClaimDevicePayload(actionId, request), socket);
     return;
   }
   if (requiresSessionClaim(actionType) && !state.remoteAuth.sessionClaim) {
@@ -830,7 +836,8 @@ async function sendRemoteActionFrame(actionId, actionType, request) {
   sendBrokerFrame(
     requiresSessionClaim(actionType)
       ? await buildClaimedActionPayload(actionId, actionType, request)
-      : await buildDeviceActionPayload(actionId, actionType, request)
+      : await buildDeviceActionPayload(actionId, actionType, request),
+    socket
   );
 }
 

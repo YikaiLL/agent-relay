@@ -23,17 +23,24 @@ export function deriveSessionRuntime({
   // screen, and a late success elsewhere must not silence this one.
   composerErrors = null,
   composerModel = "",
+  fallbackModels = [],
   sendPending = false,
   session,
   sessionView,
 }) {
   const currentModelValue = composerModel || session?.model || "";
+  const sessionModels = session?.available_models || [];
+  // Keep the fetched same-provider catalogue on screen through a transiently
+  // empty session snapshot. This stabilizes both the model label and the effort
+  // choices derived from that model; the live session catalogue wins whenever
+  // it has entries.
+  const models = sessionModels.length ? sessionModels : fallbackModels;
   // The session's reasoning_effort is the source of truth. An empty composer
   // effort means "this surface hasn't overridden it" (e.g. you just opened the
   // session on another device), so fall back to the session value instead of
   // the model default — otherwise a high session silently shows/sends medium.
   const currentEffortValue = resolveReasoningEffortValue(
-    session?.available_models || [],
+    models,
     currentModelValue,
     composerEffort || session?.reasoning_effort || ""
   );
@@ -45,12 +52,12 @@ export function deriveSessionRuntime({
     currentModelValue,
     errorMessage: threadError(composerErrors, session?.active_thread_id),
     effortOptions: buildReasoningEffortOptions(
-      session?.available_models || [],
+      models,
       currentModelValue,
       currentEffortValue
     ),
     messagePlaceholder: sessionView.messagePlaceholder,
-    models: session?.available_models || [],
+    models,
     sendDisabled: Boolean(session?.active_turn_id),
     sendPending,
     session,

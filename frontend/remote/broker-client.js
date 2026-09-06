@@ -406,12 +406,16 @@ export function closeBrokerSocket(resetConnectionState = true) {
   }
 }
 
-export function sendBrokerFrame(payload) {
-  if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
+export function sendBrokerFrame(payload, expectedSocket = state.socket) {
+  if (
+    !expectedSocket
+    || expectedSocket !== state.socket
+    || expectedSocket.readyState !== WebSocket.OPEN
+  ) {
     throw new Error("broker socket is not connected");
   }
 
-  state.socket.send(
+  expectedSocket.send(
     JSON.stringify({
       type: "publish",
       protocol_version: BROKER_PROTOCOL_VERSION,

@@ -237,6 +237,7 @@ import { threadAttention } from "./shared/thread-attention.js";
 import { isWorkflowInProgressForThread } from "./shared/workflow-state.js";
 import {
   buildViewOnlyPin,
+  projectViewOnlySession,
 } from "./local/view-only-thread.js";
 import { createWatchedThreadsSync } from "./local/watched-threads.js";
 import { ClientLog } from "./shared/client-log.js";
@@ -284,9 +285,8 @@ import {
 } from "./shared/last-used-settings.js";
 import {
   renderSelectOptions,
-  replaceSelectOptions,
+  syncModelSuggestions,
 } from "./shared/select-options.js";
-import { buildModelSelectOptions } from "./shared/composer.js";
 import {
   buildReasoningEffortOptions,
   resolveReasoningEffortValue,
@@ -3123,6 +3123,7 @@ function handleUnauthorized(message) {
 function seedDefaults(session) {
   void refreshProviderCatalogs(session);
   const activeProvider = session.provider || defaultProvider(state.providers);
+  const composerFallbackModels = state.providerModels[activeProvider] || [];
   const launchProvider = providerInput?.value || activeProvider;
   const launchModels = modelsForProvider(
     launchProvider,
@@ -3135,7 +3136,8 @@ function seedDefaults(session) {
     session.available_models || [],
     messageModel?.value || session.model,
     true,
-    true
+    true,
+    composerFallbackModels
   );
 
   if (!state.defaultsSeeded) {
@@ -3169,6 +3171,7 @@ function seedDefaults(session) {
 }
 
 async function refreshProviderCatalogs(session) {
+  let catalogsChanged = false;
   try {
     const launchDraft = readLocalUiState(state.localUiStore).sessionDraft || {};
     const liveProviderInput = document.getElementById("provider-input") || providerInput;
@@ -3188,7 +3191,9 @@ async function refreshProviderCatalogs(session) {
       const response = await apiFetch(`/api/providers/${encodeURIComponent(provider)}/models`);
       const payload = await response.json();
       if (response.ok && payload.ok) {
-        state.providerModels[provider] = payload.data || [];
+        const models = payload.data || [];
+        state.providerModels[provider] = models;
+        catalogsChanged ||= models.length > 0;
       }
     }));
     // The merged Model pill is built from these catalogues. Opening the dialog
@@ -3212,41 +3217,23 @@ async function refreshProviderCatalogs(session) {
     );
   } catch (error) {
     logLine(`Provider model refresh failed: ${error.message}`);
-  }
-}
-
-function syncModelSuggestions(
-  select,
-  models,
-  selectedModel,
-  allowForeign = false,
-  replaceExisting = false
-) {
-  if (!select) {
     return;
   }
 
-  // Drop hidden models + keep the current selection representable (snapping a
-  // stale foreign value to the provider default when !allowForeign). Shared with
-  // the composer/dialog pickers via buildModelOptions, so the filtering rule has
-  // a single tested definition.
-  const { options, value: currentValue } = buildModelSelectOptions(
-    models,
-    selectedModel || select.value || "",
-    { allowForeign }
-  );
-
-  const renderedOptions = options.map((model) => ({
-    label: model.display_name || model.model,
-    // Carried onto the <option> so a picker's logo slot can resolve the vendor
-    // from the DOM alone (this surface renders options outside React).
-    provider: model.provider || "",
-    value: model.model,
-  }));
-  if (replaceExisting) {
-    replaceSelectOptions(select, renderedOptions, currentValue);
-  } else {
-    renderSelectOptions(select, renderedOptions, currentValue);
+  // The initial snapshot can arrive before any provider catalogue. Refresh
+  // only the model control once the fetch fills that cache; a full session
+  // repaint would unnecessarily settle transcript work and rerender dialogs.
+  if (catalogsChanged && state.session?.active_thread_id) {
+    try {
+      syncComposerModelForRenderedSession(
+        projectViewOnlySession(state.session, {
+          viewThreadId: state.viewThreadId,
+          viewOnlyThread: state.viewOnlyThread,
+        })
+      );
+    } catch (error) {
+      logLine(`Composer model refresh failed: ${error.message}`);
+    }
   }
 }
 
@@ -3271,7 +3258,9 @@ function syncComposerModelForRenderedSession(session) {
   }
 
   const models = session.available_models || [];
-  const currentModel = models.some((model) => model.model === messageModel.value)
+  const fallbackModels = state.providerModels[session.provider] || [];
+  const displayModels = models.length ? models : fallbackModels;
+  const currentModel = displayModels.some((model) => model.model === messageModel.value)
     ? messageModel.value
     : session.model || messageModel.value;
 
@@ -3285,7 +3274,8 @@ function syncComposerModelForRenderedSession(session) {
     models,
     currentModel,
     !session.view_only,
-    true
+    true,
+    fallbackModels
   );
   syncComposerModelMark();
 }

@@ -131,6 +131,37 @@ test("deriveSessionRuntime uses the session's model on a fresh surface", () => {
   assert.equal(runtime.currentModelValue, "gpt-5-codex");
 });
 
+test("deriveSessionRuntime keeps the fetched provider catalog during an empty snapshot", () => {
+  const fallbackModels = [
+    {
+      model: "default[]",
+      display_name: "Auto",
+      supported_reasoning_efforts: ["medium", "high"],
+      default_reasoning_effort: "medium",
+    },
+  ];
+  const runtime = deriveSessionRuntime({
+    composerEffort: "",
+    fallbackModels,
+    session: {
+      active_thread_id: "thread-cursor",
+      available_models: [],
+      model: "default[]",
+      reasoning_effort: "high",
+    },
+    sessionView: { composerDisabled: false, currentApprovalId: null, messagePlaceholder: "" },
+  });
+
+  assert.equal(runtime.models, fallbackModels);
+  assert.equal(runtime.models[0].display_name, "Auto");
+  assert.equal(runtime.currentEffortValue, "high");
+  assert.deepEqual(
+    runtime.effortOptions.map((option) => option.value),
+    ["medium", "high"],
+    "effort choices must come from the fallback model instead of the generic defaults",
+  );
+});
+
 test("deriveSessionRuntime respects an explicit composer effort override", () => {
   // The session-default fallback must not clobber a deliberate per-message
   // choice: if the surface picked low, sending should stay low even on a high
