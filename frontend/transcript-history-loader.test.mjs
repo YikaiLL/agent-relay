@@ -319,6 +319,80 @@ test("a non-true onLoad result loads exactly one page per trigger", async () => 
   assert.equal(calls, 1, "undefined result should not start a prefetch loop");
 });
 
+test("dispose during an in-flight burst prevents a pending result from scheduling another load", async () => {
+  // disconnect() alone doesn't stop runPrefetchBurst's own promise chain: a
+  // `true` result arriving after dispose() would otherwise loop into another
+  // onLoad call from an instance nothing owns any more.
+  const { FakeObserver, instances } = makeFakeObserverFactory();
+  let calls = 0;
+  let release;
+  const dispose = createTranscriptHistoryLoader({
+    ObserverCtor: FakeObserver,
+    onLoad: () =>
+      new Promise((resolve) => {
+        calls += 1;
+        release = resolve;
+      }),
+    // Within the band, so an unguarded `true` result loops straight into a
+    // second onLoad call.
+    scrollElement: makeScrollEl({ scrollTop: 0 }),
+    sentinelElement: { id: "sentinel" },
+  });
+
+  await instances[0].trigger(true);
+  assert.equal(calls, 1, "the intersection starts the first load");
+
+  // Torn down (sentinel removed, or the component unmounting) while that
+  // first load is still in flight.
+  dispose();
+  assert.equal(instances[0].disconnected, true);
+
+  // The already-in-flight call finally resolves, reporting more pages.
+  release(true);
+  await flushBurst();
+  assert.equal(calls, 1, "a disposed loader must not act on a pending result by loading again");
+});
+
+test("a sentinel swap during an in-flight burst leaves only the replacement loader's observer alive", async () => {
+  const { FakeObserver, instances } = makeFakeObserverFactory();
+  const scrollEl = makeScrollEl({ scrollTop: 0 });
+  const sentinelA = { id: "A" };
+  scrollEl.setSentinel(sentinelA);
+  let calls = 0;
+  let release;
+
+  const { sync } = attachTranscriptHistoryLoader({
+    ObserverCtor: FakeObserver,
+    onLoad: () =>
+      new Promise((resolve) => {
+        calls += 1;
+        release = resolve;
+      }),
+    scrollElement: scrollEl,
+  });
+
+  sync();
+  await instances[0].trigger(true);
+  assert.equal(calls, 1, "the first sentinel's intersection starts a load");
+
+  // The branch swaps to a new sentinel while that load is still in flight:
+  // sync() tears down instances[0] and attaches a fresh loader to sentinelB.
+  const sentinelB = { id: "B" };
+  scrollEl.setSentinel(sentinelB);
+  sync();
+  assert.equal(instances.length, 2);
+  assert.equal(instances[0].disconnected, true);
+
+  // The old loader's in-flight call finally resolves, reporting more pages.
+  release(true);
+  await flushBurst();
+  assert.equal(calls, 1, "the disposed loader must not fire a second, overlapping load");
+
+  // The replacement loader is unaffected and still loads on its own intersection.
+  await instances[1].trigger(true);
+  assert.equal(calls, 2, "the replacement loader still loads normally");
+});
+
 test("returns a noop disposer when prerequisites are missing", () => {
   const { FakeObserver, instances } = makeFakeObserverFactory();
   const dispose = createTranscriptHistoryLoader({
@@ -436,4 +510,250 @@ test("scroll fallback fires onLoad when IntersectionObserver is unavailable", as
 
   dispose();
   delete globalThis.requestAnimationFrame;
+});
+
+// --- scroll fallback lifecycle (no requestAnimationFrame) ------------------
+//
+// Node has no global requestAnimationFrame, so these exercise the real
+// setTimeout(cb, 16) branch. The bug they pin: dispose() only ever tried
+// cancelAnimationFrame, which cannot cancel a setTimeout, so a frame queued
+// before teardown still fired and called onLoad afterwards.
+
+// Long enough for the fallback's own 16ms timer to have fired if it were
+// still live.
+const flushFallbackFrame = () => new Promise((resolve) => setTimeout(resolve, 40));
+
+function makeFallbackScrollEl({ scrollTop = 0 } = {}) {
+  const listeners = new Set();
+  return {
+    scrollTop,
+    addEventListener: (_type, handler) => listeners.add(handler),
+    removeEventListener: (_type, handler) => listeners.delete(handler),
+    // Only handlers still registered fire — a detached loader that forgot to
+    // remove its listener would be caught here too.
+    emitScroll() {
+      for (const handler of [...listeners]) {
+        handler();
+      }
+    },
+    listenerCount: () => listeners.size,
+  };
+}
+
+test("scroll fallback: detach cancels a frame queued before teardown so onLoad never fires", async () => {
+  assert.equal(
+    typeof globalThis.requestAnimationFrame,
+    "undefined",
+    "precondition: this test must exercise the setTimeout branch"
+  );
+  const scrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+  let calls = 0;
+
+  const dispose = createTranscriptHistoryLoader({
+    ObserverCtor: null,
+    onLoad: () => {
+      calls += 1;
+    },
+    scrollElement: scrollEl,
+    sentinelElement: { id: "sentinel" },
+  });
+
+  // A scroll queues the fallback frame, which is still pending 16ms out.
+  scrollEl.emitScroll();
+  assert.equal(calls, 0, "the frame has not run yet");
+
+  // Torn down (unmount, or the sentinel being replaced) before it runs.
+  dispose();
+  assert.equal(scrollEl.listenerCount(), 0, "detach removes its scroll listener");
+
+  await flushFallbackFrame();
+  assert.equal(calls, 0, "a frame queued before detach must not call onLoad afterwards");
+});
+
+test("scroll fallback: a replacement loader does not overlap the detached one", async () => {
+  assert.equal(
+    typeof globalThis.requestAnimationFrame,
+    "undefined",
+    "precondition: this test must exercise the setTimeout branch"
+  );
+  const scrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+  const calls = [];
+
+  const disposeFirst = createTranscriptHistoryLoader({
+    ObserverCtor: null,
+    onLoad: () => {
+      calls.push("first");
+    },
+    scrollElement: scrollEl,
+    sentinelElement: { id: "A" },
+  });
+
+  // The first loader has a frame in flight when its sentinel is replaced.
+  scrollEl.emitScroll();
+  disposeFirst();
+
+  const disposeSecond = createTranscriptHistoryLoader({
+    ObserverCtor: null,
+    onLoad: () => {
+      calls.push("second");
+    },
+    scrollElement: scrollEl,
+    sentinelElement: { id: "B" },
+  });
+  assert.equal(scrollEl.listenerCount(), 1, "only the replacement loader is listening");
+
+  scrollEl.emitScroll();
+  await flushFallbackFrame();
+
+  assert.deepEqual(
+    calls,
+    ["second"],
+    "only the replacement loader may load; the detached one's queued frame must stay silent"
+  );
+
+  disposeSecond();
+});
+
+test("scroll fallback: a frame that survives cancellation is still suppressed by detach", async () => {
+  // Environments that hand out a scheduler with no matching canceller (a
+  // partial rAF polyfill) cannot be cleaned up by cancelling, so the callback
+  // itself has to check whether it is still owned.
+  const scrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+  let calls = 0;
+  let queuedFrame = null;
+  globalThis.requestAnimationFrame = (cb) => {
+    queuedFrame = cb;
+    return 1;
+  };
+
+  try {
+    const dispose = createTranscriptHistoryLoader({
+      ObserverCtor: null,
+      onLoad: () => {
+        calls += 1;
+      },
+      scrollElement: scrollEl,
+      sentinelElement: { id: "sentinel" },
+    });
+
+    scrollEl.emitScroll();
+    assert.equal(typeof queuedFrame, "function", "a frame is queued and uncancellable");
+
+    dispose();
+    // The environment runs it anyway — nothing could have cancelled it.
+    queuedFrame();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(calls, 0, "a detached fallback's callback must not call onLoad");
+  } finally {
+    delete globalThis.requestAnimationFrame;
+  }
+});
+
+test("scroll fallback: detach cancels via the canceller matching how the frame was scheduled", async () => {
+  // The original teardown always reached for cancelAnimationFrame, which
+  // cannot cancel a setTimeout handle. Assert each branch hands its OWN handle
+  // to its OWN canceller, rather than only observing that onLoad stayed quiet.
+  const rafCancelled = [];
+  const timeoutCancelled = [];
+  const realClearTimeout = globalThis.clearTimeout;
+  globalThis.clearTimeout = (handle) => {
+    timeoutCancelled.push(handle);
+    return realClearTimeout(handle);
+  };
+
+  try {
+    // --- rAF available: cancelAnimationFrame gets the rAF handle ---
+    globalThis.requestAnimationFrame = () => 4242;
+    globalThis.cancelAnimationFrame = (handle) => rafCancelled.push(handle);
+    const rafScrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+    const disposeRaf = createTranscriptHistoryLoader({
+      ObserverCtor: null,
+      onLoad: () => {},
+      scrollElement: rafScrollEl,
+      sentinelElement: { id: "raf" },
+    });
+    rafScrollEl.emitScroll();
+    disposeRaf();
+    assert.deepEqual(rafCancelled, [4242], "the rAF handle goes to cancelAnimationFrame");
+    assert.deepEqual(timeoutCancelled, [], "clearTimeout is not used for a rAF handle");
+
+    // --- rAF absent: clearTimeout gets the timeout handle ---
+    delete globalThis.requestAnimationFrame;
+    delete globalThis.cancelAnimationFrame;
+    const timeoutScrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+    const disposeTimeout = createTranscriptHistoryLoader({
+      ObserverCtor: null,
+      onLoad: () => {},
+      scrollElement: timeoutScrollEl,
+      sentinelElement: { id: "timeout" },
+    });
+    timeoutScrollEl.emitScroll();
+    disposeTimeout();
+    assert.equal(timeoutCancelled.length, 1, "the timeout handle goes to clearTimeout");
+    assert.deepEqual(rafCancelled, [4242], "no extra cancelAnimationFrame call");
+  } finally {
+    globalThis.clearTimeout = realClearTimeout;
+    delete globalThis.requestAnimationFrame;
+    delete globalThis.cancelAnimationFrame;
+  }
+});
+
+// --- detach inside the queued-microtask window ------------------------------
+//
+// Both async paths check `disposed` and then queue a microtask before reaching
+// onLoad. detach() landing inside that window still has to suppress the call.
+
+test("observer path: detach after the intersection queues its burst, before the burst runs, suppresses onLoad", async () => {
+  const { FakeObserver, instances } = makeFakeObserverFactory();
+  let calls = 0;
+  const dispose = createTranscriptHistoryLoader({
+    ObserverCtor: FakeObserver,
+    onLoad: () => {
+      calls += 1;
+      return true;
+    },
+    scrollElement: makeScrollEl({ scrollTop: 0 }),
+    sentinelElement: { id: "sentinel" },
+  });
+
+  // Fire the callback WITHOUT awaiting: scheduleBurst has queued
+  // runPrefetchBurst as a microtask that has not run yet.
+  instances[0].callback([{ isIntersecting: true }]);
+  dispose();
+
+  await flushBurst();
+  assert.equal(calls, 0, "a burst queued before detach must not reach onLoad");
+});
+
+test("scroll fallback: detach after the frame runs, before its queued microtask, suppresses onLoad", async () => {
+  const scrollEl = makeFallbackScrollEl({ scrollTop: 0 });
+  let calls = 0;
+  let queuedFrame = null;
+  globalThis.requestAnimationFrame = (cb) => {
+    queuedFrame = cb;
+    return 1;
+  };
+
+  try {
+    const dispose = createTranscriptHistoryLoader({
+      ObserverCtor: null,
+      onLoad: () => {
+        calls += 1;
+      },
+      scrollElement: scrollEl,
+      sentinelElement: { id: "sentinel" },
+    });
+
+    scrollEl.emitScroll();
+    // The frame body runs and queues Promise.then(onLoad) — but that microtask
+    // has not run yet.
+    queuedFrame();
+    dispose();
+
+    await flushBurst();
+    assert.equal(calls, 0, "a microtask queued before detach must not reach onLoad");
+  } finally {
+    delete globalThis.requestAnimationFrame;
+  }
 });

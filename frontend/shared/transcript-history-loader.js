@@ -49,6 +49,13 @@ export function createTranscriptHistoryLoader({
   // IntersectionObserver transition or a sync() poke after a re-render — clears
   // it, so a cursor that only appears after hydration still starts a burst.
   let awaitingExternalPoke = false;
+  // `disconnect()` alone doesn't stop a burst: it can be queued as a microtask
+  // or awaiting `onLoad()` when `dispose()` runs (sentinel removed/replaced, or
+  // the component unmounting), and would then keep calling onLoad from a loader
+  // nothing owns any more — overlapping whatever loader replaced it. Checked
+  // immediately before every onLoad call, after every await, and up front by
+  // anything that could start a burst.
+  let disposed = false;
 
   const observer = new ObserverCtor(
     (entries) => {
@@ -68,7 +75,7 @@ export function createTranscriptHistoryLoader({
   );
 
   function scheduleBurst({ trusted = false } = {}) {
-    if (pending || reachedTop) {
+    if (disposed || pending || reachedTop) {
       return;
     }
     if (!trusted && !stillWithinPrefetchBand()) {
@@ -90,7 +97,7 @@ export function createTranscriptHistoryLoader({
         // to pull and room above the fold. This is what removes the "scroll to
         // the top, nothing loads until you wiggle" stall after the per-burst
         // cap or a band that short/collapsed pages did not fill.
-        if (!reachedTop && !awaitingExternalPoke && stillWithinPrefetchBand()) {
+        if (!disposed && !reachedTop && !awaitingExternalPoke && stillWithinPrefetchBand()) {
           scheduleBurst();
         }
       });
@@ -105,7 +112,20 @@ export function createTranscriptHistoryLoader({
     const startScrollTop = readScrollTop();
     let loaded = 0;
     while (loaded < MAX_PREFETCH_PAGES_PER_BURST) {
+      // Immediately before the call, every iteration. scheduleBurst's own
+      // `disposed` check happens a microtask earlier, so dispose() can land
+      // between that check and this first onLoad — and on later iterations it
+      // can land during either await below.
+      if (disposed) {
+        return;
+      }
       const result = await onLoad();
+      // dispose() can land while the call above was in flight (sentinel
+      // removed/replaced, or unmount) — a `true` result must not loop into
+      // another onLoad from a loader nothing owns any more.
+      if (disposed) {
+        return;
+      }
       if (result === false) {
         // A real page load reported no older pages remain — stop for good.
         reachedTop = true;
@@ -151,6 +171,7 @@ export function createTranscriptHistoryLoader({
   observer.observe(sentinelElement);
 
   const dispose = () => {
+    disposed = true;
     observer.disconnect();
   };
   // Re-check after a render even when no IO transition occurs — used by the
@@ -158,7 +179,7 @@ export function createTranscriptHistoryLoader({
   // (e.g. the cursor appeared after hydration), so it's a no-op on every other
   // render.
   dispose.poke = () => {
-    if (!awaitingExternalPoke) {
+    if (disposed || !awaitingExternalPoke) {
       return;
     }
     awaitingExternalPoke = false;
@@ -187,35 +208,56 @@ function nextFrame() {
 
 function attachScrollFallback({ scrollElement, onLoad }) {
   let pending = false;
-  let rafHandle = null;
+  let frameHandle = null;
+  // Cancelling has to match how the frame was scheduled: the setTimeout branch
+  // below needs clearTimeout, and the old teardown only ever tried
+  // cancelAnimationFrame — so without rAF a detached fallback's callback still
+  // fired and called onLoad, overlapping whatever loader replaced it.
+  let cancelFrame = null;
+  // Belt-and-braces for the environments that supply a scheduler but no
+  // matching canceller: an already-queued callback still has to stay silent
+  // once this fallback is detached.
+  let disposed = false;
+  // Resolved per schedule, not once at attach, so this keeps the original
+  // behaviour in an environment that gains rAF after the listener is bound.
+  function scheduleFrame(cb) {
+    if (typeof requestAnimationFrame === "function") {
+      cancelFrame = typeof cancelAnimationFrame === "function" ? cancelAnimationFrame : null;
+      return requestAnimationFrame(cb);
+    }
+    cancelFrame = clearTimeout;
+    return setTimeout(cb, 16);
+  }
   const handler = () => {
-    if (rafHandle != null) {
+    if (disposed || frameHandle != null) {
       return;
     }
-    rafHandle = (typeof requestAnimationFrame === "function"
-      ? requestAnimationFrame
-      : (cb) => setTimeout(cb, 16))(() => {
-        rafHandle = null;
-        if (pending) {
-          return;
-        }
-        if ((scrollElement.scrollTop || 0) > 80) {
-          return;
-        }
-        pending = true;
-        Promise.resolve()
-          .then(() => onLoad())
-          .catch(() => {})
-          .finally(() => {
-            pending = false;
-          });
-      });
+    frameHandle = scheduleFrame(() => {
+      frameHandle = null;
+      if (disposed || pending) {
+        return;
+      }
+      if ((scrollElement.scrollTop || 0) > 80) {
+        return;
+      }
+      pending = true;
+      Promise.resolve()
+        // Re-checked here, not just above: dispose() can land between this
+        // frame body and the microtask it queues.
+        .then(() => (disposed ? undefined : onLoad()))
+        .catch(() => {})
+        .finally(() => {
+          pending = false;
+        });
+    });
   };
   scrollElement.addEventListener("scroll", handler, { passive: true });
   return () => {
+    disposed = true;
     scrollElement.removeEventListener("scroll", handler);
-    if (rafHandle != null && typeof cancelAnimationFrame === "function") {
-      cancelAnimationFrame(rafHandle);
+    if (frameHandle != null) {
+      cancelFrame?.(frameHandle);
+      frameHandle = null;
     }
   };
 }

@@ -215,13 +215,13 @@ import {
   ensureNotificationPermission,
   isDocumentForeground,
 } from "../shared/thread-notify.js";
-import { TranscriptPane } from "../shared/transcript-pane.js";
 import {
   captureTranscriptScrollSnapshot,
   readTranscriptScrollPosition,
   rememberTranscriptScrollPosition,
   restoreTranscriptScrollPosition,
 } from "../shared/transcript-scroll.js";
+import { LocalTranscriptPanel } from "./local-transcript-panel.js";
 
 const h = React.createElement;
 const reactRoots = new WeakMap();
@@ -245,11 +245,6 @@ function renderReactContent(element, content) {
   });
 }
 
-// Fires after every conversation render so the IntersectionObserver wiring
-// in app.js can re-attach when the React tree swaps the transcript branch
-// (entries ↔ empty ↔ ready). Set via `setTranscriptHistorySync` once at boot.
-let transcriptHistorySync = null;
-
 function renderConversationContent(content) {
   if (!transcript) {
     return;
@@ -264,14 +259,6 @@ function renderConversationContent(content) {
   flushSync(() => {
     transcriptRoot.render(content);
   });
-
-  if (typeof transcriptHistorySync === "function") {
-    transcriptHistorySync();
-  }
-}
-
-function setTranscriptHistorySync(handler) {
-  transcriptHistorySync = typeof handler === "function" ? handler : null;
 }
 
 // transcriptOptions carries a few collection fields (readLocalUiState
@@ -375,6 +362,10 @@ export function createSessionRenderer({
   brokerStatusLabel,
   pairedDeviceCountLabel,
   ensureConversationTranscript,
+  // Passed straight through to LocalTranscriptPanel's history loader — it
+  // closes over app.js's late-bound `controller`/`loadOlderViewOnlyTranscript`,
+  // the same late-binding as resumeSession/scheduleControllerHeartbeat above.
+  loadOlderTranscript,
   syncComposerModel,
   updateSessionSettings,
   requestReview,
@@ -1515,115 +1506,90 @@ export function createSessionRenderer({
     void state.controller?.submitAskUserQuestionAnswer?.(requestId, answers);
   }
 
+  // Hoisted once per renderer instance for the same reason as
+  // handleEnsureFileChangeDetail above: LocalTranscriptPanel only calls this
+  // on the entries branch, so its own identity must stay stable there.
+  // renderTranscript refreshes the pending input right before that branch's
+  // render, so the call still returns THIS render's data.
+  let pendingTranscriptOptionsInput = null;
+  function getTranscriptOptions() {
+    return (state.localTranscriptOptionsCache = stableTranscriptOptions(
+      state.localTranscriptOptionsCache || null,
+      pendingTranscriptOptionsInput
+    ));
+  }
+
+  // Hoisted once per renderer instance for the same reason as
+  // getTranscriptOptions above: the panel's layout effect closes over this
+  // prop identity for the component's whole lifetime, so a fresh function
+  // every render would defeat the point of passing it as a prop rather than
+  // an inline callback. renderTranscript stages which commit (if any) applies
+  // to THIS render into `pendingScrollCommit` right before calling this.
+  let pendingScrollCommit = null;
+  function onAfterTranscriptCommit(scrollElement) {
+    pendingScrollCommit?.(scrollElement);
+  }
+
   function renderTranscript(session, approval) {
     const viewingConversation = isViewingConversation(session);
     const entries = session.transcript || [];
-    const localUi = readLocalUiState(state.localUiStore);
-    const transcriptDetailEntries = buildExpandedTranscriptDetailEntries(state, {
-      expandedItemIds: localUi.transcriptExpandedItemIds,
-      threadId: session?.active_thread_id || null,
-      autoDetailItemIds: collectFileChangeDetailItemIds(entries),
-    });
+    const activeThreadId = session.active_thread_id || null;
 
+    // Gated on !viewingConversation like the original branches below, so the
+    // common "viewing a live conversation" path skips these lookups entirely.
+    let viewedThreadWorkflowLocked = false;
+    let viewedThreadLocked = false;
+    let viewingDifferentThread = false;
+    let requestedSessionLabel = "";
+    let activeThreadLabel = "";
     if (!viewingConversation) {
-      const activeThread = resolveActiveThread(session.active_thread_id);
-      const requestedThread =
-        resolveActiveThread(state.viewThreadId) ||
-        findVisible(state.viewThreadId);
-
+      viewedThreadWorkflowLocked = isWorkflowInProgressForThread(session, state.viewThreadId);
       // Review/Code Flow briefly hands the active thread to hidden owned work. If
       // the user is sitting on the owned parent, keep the page calm instead of
       // flashing the "attached to a different session" message.
-      if (
-        isReviewInProgressForThread(session, state.viewThreadId) ||
-        isWorkflowInProgressForThread(session, state.viewThreadId)
-      ) {
-        const workflowLocked = isWorkflowInProgressForThread(session, state.viewThreadId);
-        renderConversationContent(
-          h(ConversationEmptyState, {
-            badge: workflowLocked ? "Code Flow" : "Review",
-            className: "thread-empty-ready",
-            copy: workflowLocked
-              ? "Code Flow owns this conversation. Its progress and result show up in the Reviewer panel."
-              : "Another agent is reviewing this conversation. Its progress and result show up in the Reviewer panel, and the review is posted back here when it finishes.",
-            title: workflowLocked ? "Code Flow in progress" : "Review in progress",
-          })
-        );
-        return;
-      }
+      viewedThreadLocked =
+        isReviewInProgressForThread(session, state.viewThreadId) || viewedThreadWorkflowLocked;
+      viewingDifferentThread =
+        Boolean(state.viewThreadId) && state.viewThreadId !== session.active_thread_id;
 
-      if (state.viewThreadId && state.viewThreadId !== session.active_thread_id) {
-        renderConversationContent(
-          h(ConversationEmptyState, {
-            actions: [
-              {
-                attrs: { "data-go-console-home": "true" },
-                label: "Back to console",
-              },
-            ],
-            copy: "This saved session is loading.",
-            details: [
-              `Requested session: ${
-                requestedThread
-                  ? requestedThread.name || requestedThread.preview || shortId(requestedThread.id)
-                  : shortId(state.viewThreadId)
-              }`,
-            ],
-            title: "Loading session",
-          })
-        );
-        return;
-      }
-
-      if (session.active_thread_id) {
-        const threadLabel =
-          activeThread?.name || activeThread?.preview || shortId(session.active_thread_id);
-        renderConversationContent(
-          h(ConversationEmptyState, {
-            actions: [
-              {
-                attrs: { "data-open-thread-id": session.active_thread_id },
-                label: "Open live conversation",
-              },
-            ],
-            badge: "Live",
-            className: "thread-empty-ready",
-            copy: "A live session is running, but the conversation stays behind its own session page so the local home does not default into chat.",
-            details: [`Current session: ${threadLabel}`],
-            title: "Relay console home",
-          })
-        );
-        return;
-      }
+      const activeThread = resolveActiveThread(session.active_thread_id);
+      const requestedThread =
+        resolveActiveThread(state.viewThreadId) || findVisible(state.viewThreadId);
+      requestedSessionLabel = requestedThread
+        ? requestedThread.name || requestedThread.preview || shortId(requestedThread.id)
+        : shortId(state.viewThreadId);
+      activeThreadLabel =
+        activeThread?.name || activeThread?.preview || shortId(session.active_thread_id);
     }
 
-    // A view-only thread whose transcript hasn't loaded yet — calm placeholder
-    // instead of the live "send the first prompt" ready-state. The review flavor
-    // keeps its reviewer-panel wording; a plain saved thread must not be mislabeled
-    // "Review in progress".
-    if (!entries.length && session.view_only) {
-      const reviewView = Boolean(state.viewOnlyThread?.review);
-      renderConversationContent(
-        h(ConversationEmptyState, {
-          badge: reviewView ? "Review" : "Read-only",
-          className: "thread-empty-ready",
-          copy: reviewView
-            ? "Loading this session's conversation. Another agent is reviewing it — its progress shows in the Reviewer panel."
-            : "Loading this saved session's conversation…",
-          title: reviewView ? "Review in progress" : "Read-only view",
-        })
-      );
-      return;
-    }
+    // LocalTranscriptPanel re-derives the same dispatch from these same
+    // booleans (see there for the full six-branch order); mirrored here only
+    // far enough to know whether the scroll-bookkeeping half below applies.
+    const exitsViaOverviewBranches =
+      !viewingConversation &&
+      (viewedThreadLocked || viewingDifferentThread || Boolean(activeThreadId));
+    const viewOnlyEmpty = !exitsViaOverviewBranches && !entries.length && Boolean(session.view_only);
+    const viewOnlyReviewView = viewOnlyEmpty ? Boolean(state.viewOnlyThread?.review) : false;
+    const emptyReady = !exitsViaOverviewBranches && !viewOnlyEmpty && !entries.length && !approval;
+    const showsEntries = !exitsViaOverviewBranches && !viewOnlyEmpty && !emptyReady;
 
-    if (!entries.length && !approval) {
+    // The pre-render half of scroll bookkeeping has to run here, before the
+    // swap: React mutates the DOM before any cleanup runs, so a layout effect
+    // would only ever see the new thread's already-clamped scrollTop. The
+    // post-commit half is staged as a closure below into `pendingScrollCommit`
+    // (reset first, in case neither branch below applies to this render), and
+    // the panel calls the STABLE onAfterTranscriptCommit dispatcher above from
+    // a layout effect once the commit lands.
+    pendingScrollCommit = null;
+
+    if (emptyReady) {
       // Leaving another thread for this empty one: retain its reading offset
       // BEFORE rendering the empty state — the swap shrinks the transcript
       // and the browser clamps the live scrollTop, so reading it afterwards
       // would retain a clamped (often zero) offset instead of the reader's
       // place. Mirrors the ordering and bounded-eviction cleanup of the
       // non-empty thread-switch path below.
-      const emptyThreadId = session?.active_thread_id || null;
+      const emptyThreadId = activeThreadId;
       const previousEmptySnapshot = state.localTranscriptScrollSnapshot || null;
       if (
         previousEmptySnapshot?.activeThreadId
@@ -1642,20 +1608,6 @@ export function createSessionRenderer({
         }
       }
 
-      renderConversationContent(
-        h(TranscriptPane, {
-          canWrite: canCurrentDeviceWrite(session),
-          emptyContent: session.active_thread_id ? null : buildStandbyEmptyContent(),
-          readyState: session.active_thread_id
-            ? {
-              readyCopy: `${providerLabel(session?.provider) || "The agent"} is connected. Send the first prompt below when you're ready.`,
-              session,
-              shortId,
-              waitingCopy: "This session is open, but another device currently has control. Take over to send the first prompt from here.",
-            }
-            : null,
-        })
-      );
       // Record the (empty) scroll snapshot for this genuinely-empty ready
       // thread. Without it, the FIRST entries would classify as "first view of
       // a thread" (jump-bottom, which briefly makes the follower sticky)
@@ -1663,47 +1615,130 @@ export function createSessionRenderer({
       // anchor exactly like every later send. Deliberately NOT done for the
       // loading/view-only branches above: their entries arrive as loaded
       // history and must keep landing via jump-bottom.
-      state.localTranscriptScrollSnapshot = captureTranscriptScrollSnapshot({
-        entries: [],
-        scrollElement: transcript,
-        threadId: emptyThreadId,
-      });
-      return;
+      pendingScrollCommit = (scrollElement) => {
+        state.localTranscriptScrollSnapshot = captureTranscriptScrollSnapshot({
+          entries: [],
+          scrollElement,
+          threadId: emptyThreadId,
+        });
+      };
+    } else if (showsEntries) {
+      const previousSnapshot = state.localTranscriptScrollSnapshot || null;
+      const localThreadId = activeThreadId;
+      if (!state.localTranscriptScrollAnchors) {
+        state.localTranscriptScrollAnchors = new Map();
+      }
+      if (!state.localTranscriptScrollPositions) {
+        state.localTranscriptScrollPositions = new Map();
+      }
+      let restoredScrollPosition = null;
+      if (
+        previousSnapshot?.activeThreadId
+        && previousSnapshot.activeThreadId !== localThreadId
+      ) {
+        const evictedThreadId = rememberTranscriptScrollPosition(
+          state.localTranscriptScrollPositions,
+          previousSnapshot.activeThreadId,
+          transcript
+        );
+        if (evictedThreadId) {
+          state.localTranscriptScrollAnchors.delete(evictedThreadId);
+        }
+        restoredScrollPosition = readTranscriptScrollPosition(
+          state.localTranscriptScrollPositions,
+          localThreadId
+        );
+      }
+      const anchorsForThread =
+        state.localTranscriptScrollAnchors.get(localThreadId) || new Set();
+
+      pendingScrollCommit = (scrollElement) => {
+        const action = restoreTranscriptScrollPosition({
+          alreadyAnchoredUserIds: anchorsForThread,
+          nextEntries: entries,
+          nextThreadId: localThreadId,
+          // An approval / AskUser question is not a transcript entry, so it needs its
+          // own trigger to be brought into view when it arrives (it renders last, at
+          // the bottom). Fire-once, keyed on the request ids — plural because a
+          // second question can arrive while the first is still outstanding.
+          pendingInputRequestIds: findPendingInputRequestIds(session, localThreadId),
+          previousSnapshot,
+          restoredScrollPosition,
+          scrollElement,
+        });
+        // Record what this action handled. New-message actions use this to avoid
+        // re-jumping mid-stream; thread-transition actions use it to establish the
+        // loaded transcript as a baseline so the next snapshot cannot mistake
+        // retained history for a newly-sent message. One Set serves both kinds —
+        // request ids are namespaced, so they cannot collide with item ids.
+        const handledScrollIds = [
+          action?.userEntryId,
+          ...(action?.inputRequestIds || []),
+        ].filter(Boolean);
+        if (handledScrollIds.length) {
+          for (const handledId of handledScrollIds) {
+            anchorsForThread.add(handledId);
+          }
+          state.localTranscriptScrollAnchors.set(localThreadId, anchorsForThread);
+        }
+        state.localTranscriptScrollSnapshot = captureTranscriptScrollSnapshot({
+          entries,
+          scrollElement,
+          threadId: localThreadId,
+        });
+      };
     }
 
-    const previousSnapshot = state.localTranscriptScrollSnapshot || null;
-    const localThreadId = session?.active_thread_id || null;
-    if (!state.localTranscriptScrollAnchors) {
-      state.localTranscriptScrollAnchors = new Map();
+    if (showsEntries) {
+      const localUi = readLocalUiState(state.localUiStore);
+      pendingTranscriptOptionsInput = {
+        currentCwd: session?.current_cwd || state.selectedCwd || "",
+        detailEntries: buildExpandedTranscriptDetailEntries(state, {
+          expandedItemIds: localUi.transcriptExpandedItemIds,
+          threadId: activeThreadId,
+          autoDetailItemIds: collectFileChangeDetailItemIds(entries),
+        }),
+        // Hide rollback/reapply on a read-only view-only thread (the apply
+        // endpoint resolves the item against the relay's REAL active thread, so
+        // acting from a saved-thread view would mutate the wrong/live thread),
+        // and while the active thread is itself under review.
+        enableFileChangeActions:
+          !session.view_only &&
+          !isReviewInProgressForThread(session, session.active_thread_id) &&
+          !isWorkflowInProgressForThread(session, session.active_thread_id),
+        expandedKeys: localUi.transcriptExpandedItemIds,
+        loadingItemIds: localUi.transcriptLoadingItemIds,
+        // Enables the per-message "Fork from here" affordance on turn-final
+        // agent messages. Saved/view-only threads included: forking reads a
+        // thread's history into a NEW session, it never writes to the thread
+        // you are looking at.
+        canFork: canForkInSession(session),
+        // Stamps each agent message with the mark of whoever wrote it. Read off
+        // the session being VIEWED (a read-only projection carries its own
+        // provider), so a saved codex thread never renders under Claude's logo.
+        provider: session?.provider || "",
+        onEnsureFileChangeDetail: handleEnsureFileChangeDetail,
+        // Suppress the answer entry while the active thread is owned by
+        // review/workflow; these orchestrators are non-interactive.
+        pendingAskUserQuestions: isReviewInProgressForThread(
+          session,
+          session.active_thread_id
+        ) || isWorkflowInProgressForThread(session, session.active_thread_id)
+          ? []
+          : session?.pending_ask_user_questions || [],
+        onSubmitAskUserAnswers: handleSubmitAskUserAnswers,
+        askUserSubmittingRequestId: localUi.askUserSubmittingRequestId || "",
+        askUserErrors: localUi.askUserErrors instanceof Map ? localUi.askUserErrors : new Map(),
+      };
     }
-    if (!state.localTranscriptScrollPositions) {
-      state.localTranscriptScrollPositions = new Map();
-    }
-    let restoredScrollPosition = null;
-    if (
-      previousSnapshot?.activeThreadId
-      && previousSnapshot.activeThreadId !== localThreadId
-    ) {
-      const evictedThreadId = rememberTranscriptScrollPosition(
-        state.localTranscriptScrollPositions,
-        previousSnapshot.activeThreadId,
-        transcript
-      );
-      if (evictedThreadId) {
-        state.localTranscriptScrollAnchors.delete(evictedThreadId);
-      }
-      restoredScrollPosition = readTranscriptScrollPosition(
-        state.localTranscriptScrollPositions,
-        localThreadId
-      );
-    }
-    const anchorsForThread =
-      state.localTranscriptScrollAnchors.get(localThreadId) || new Set();
 
     renderConversationContent(
-      h(TranscriptPane, {
+      h(LocalTranscriptPanel, {
+        activeThreadId,
+        activeThreadLabel,
         approval,
-        canWrite: canComposeThread({
+        entries,
+        entriesCanWrite: canComposeThread({
           activeTurnId: session.active_turn_id,
           hasActiveSession: Boolean(session.active_thread_id),
           hasControllerLease: canCurrentDeviceWrite(session),
@@ -1711,82 +1746,25 @@ export function createSessionRenderer({
             isReviewInProgressForThread(session, session.active_thread_id) ||
             isWorkflowInProgressForThread(session, session.active_thread_id),
         }),
-        entries,
+        getStandbyEmptyContent: buildStandbyEmptyContent,
+        getTranscriptOptions,
         hydrationLoading: shouldShowTranscriptLoading(session, state),
-        transcriptOptions: (state.localTranscriptOptionsCache = stableTranscriptOptions(
-          state.localTranscriptOptionsCache || null,
-          {
-            currentCwd: session?.current_cwd || state.selectedCwd || "",
-            detailEntries: transcriptDetailEntries,
-            // Hide rollback/reapply on a read-only view-only thread (the apply
-            // endpoint resolves the item against the relay's REAL active thread, so
-            // acting from a saved-thread view would mutate the wrong/live thread),
-            // and while the active thread is itself under review.
-            enableFileChangeActions:
-              !session.view_only &&
-              !isReviewInProgressForThread(session, session.active_thread_id) &&
-              !isWorkflowInProgressForThread(session, session.active_thread_id),
-            expandedKeys: localUi.transcriptExpandedItemIds,
-            loadingItemIds: localUi.transcriptLoadingItemIds,
-            // Enables the per-message "Fork from here" affordance on turn-final
-            // agent messages. Saved/view-only threads included: forking reads a
-            // thread's history into a NEW session, it never writes to the thread
-            // you are looking at.
-            canFork: canForkInSession(session),
-            // Stamps each agent message with the mark of whoever wrote it. Read off
-            // the session being VIEWED (a read-only projection carries its own
-            // provider), so a saved codex thread never renders under Claude's logo.
-            provider: session?.provider || "",
-            onEnsureFileChangeDetail: handleEnsureFileChangeDetail,
-            // Suppress the answer entry while the active thread is owned by
-            // review/workflow; these orchestrators are non-interactive.
-            pendingAskUserQuestions: isReviewInProgressForThread(
-              session,
-              session.active_thread_id
-            ) || isWorkflowInProgressForThread(session, session.active_thread_id)
-              ? []
-              : session?.pending_ask_user_questions || [],
-            onSubmitAskUserAnswers: handleSubmitAskUserAnswers,
-            askUserSubmittingRequestId: localUi.askUserSubmittingRequestId || "",
-            askUserErrors: localUi.askUserErrors instanceof Map ? localUi.askUserErrors : new Map(),
-          }
-        )),
+        onAfterTranscriptCommit,
+        onLoadOlderTranscript: loadOlderTranscript,
+        readyCopy: `${providerLabel(session?.provider) || "The agent"} is connected. Send the first prompt below when you're ready.`,
+        requestedSessionLabel,
+        scrollElement: transcript,
+        session,
+        shortId,
+        standbyCanWrite: canCurrentDeviceWrite(session),
+        viewOnly: Boolean(session.view_only),
+        viewOnlyReviewView,
+        viewedThreadLocked,
+        viewedThreadWorkflowLocked,
+        viewingConversation,
+        viewingDifferentThread,
       })
     );
-
-    const action = restoreTranscriptScrollPosition({
-      alreadyAnchoredUserIds: anchorsForThread,
-      nextEntries: entries,
-      nextThreadId: localThreadId,
-      // An approval / AskUser question is not a transcript entry, so it needs its
-      // own trigger to be brought into view when it arrives (it renders last, at
-      // the bottom). Fire-once, keyed on the request ids — plural because a
-      // second question can arrive while the first is still outstanding.
-      pendingInputRequestIds: findPendingInputRequestIds(session, localThreadId),
-      previousSnapshot,
-      restoredScrollPosition,
-      scrollElement: transcript,
-    });
-    // Record what this action handled. New-message actions use this to avoid
-    // re-jumping mid-stream; thread-transition actions use it to establish the
-    // loaded transcript as a baseline so the next snapshot cannot mistake
-    // retained history for a newly-sent message. One Set serves both kinds —
-    // request ids are namespaced, so they cannot collide with item ids.
-    const handledScrollIds = [
-      action?.userEntryId,
-      ...(action?.inputRequestIds || []),
-    ].filter(Boolean);
-    if (handledScrollIds.length) {
-      for (const handledId of handledScrollIds) {
-        anchorsForThread.add(handledId);
-      }
-      state.localTranscriptScrollAnchors.set(localThreadId, anchorsForThread);
-    }
-    state.localTranscriptScrollSnapshot = captureTranscriptScrollSnapshot({
-      entries,
-      scrollElement: transcript,
-      threadId: localThreadId,
-    });
   }
 
   function renderThreads() {
@@ -3445,7 +3423,6 @@ export function createSessionRenderer({
     renderThreads,
     restoreThreadHistoryScroll,
     runViewTransition,
-    setTranscriptHistorySync,
     syncThreadHistoryScroll,
     syncThreadSelection,
   };
