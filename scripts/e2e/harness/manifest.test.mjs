@@ -104,6 +104,16 @@ test("workflow e2e npm commands reference package scripts", async () => {
   }
 });
 
+test("npm test installs its rendered-geometry browser through pretest", async () => {
+  const packageJson = JSON.parse(await fs.readFile(path.join(ROOT, "package.json"), "utf8"));
+
+  assert.equal(
+    packageJson.scripts?.pretest,
+    "npm run test:browser:install:ci",
+    "every npm test caller should get the Playwright browser without workflow-specific setup"
+  );
+});
+
 function assertCoverage(manifest, suiteName, expectedCoverage) {
   const coverage = suiteCoverage(manifest, suiteName);
   for (const entry of expectedCoverage) {

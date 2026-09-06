@@ -64,9 +64,6 @@ jobs:
       - name: Unit tests
         run: npm test
 
-      - name: Install Playwright
-        run: npm run test:browser:install:ci
-
       - name: Build relay-server
         run: cargo build -p relay-server
 
