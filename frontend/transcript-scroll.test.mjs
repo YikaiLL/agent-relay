@@ -14,7 +14,6 @@ import {
   rememberTranscriptScrollPosition,
   restoreTranscriptScrollPosition,
   retargetRemoteTranscriptScroll,
-  retargetTranscriptScrollThread,
 } from "./shared/transcript-scroll.js";
 
 function userEntry(id) {
@@ -484,65 +483,11 @@ test("LATEST_USER_MESSAGE_ATTR is the documented data attribute name", () => {
 });
 
 // --- deferred-thread promotion (claude-pending-* -> real id) -----------------
-
-test("retargetTranscriptScrollThread rekeys snapshot, positions and anchors", () => {
-  const { target } = makeScrollElement();
-  const state = {
-    localTranscriptScrollSnapshot: captureTranscriptScrollSnapshot({
-      entries: [],
-      scrollElement: target,
-      threadId: "claude-pending-7",
-    }),
-    localTranscriptScrollPositions: new Map([["claude-pending-7", 480]]),
-    localTranscriptScrollAnchors: new Map([["claude-pending-7", new Set(["u1"])]]),
-  };
-  assert.equal(
-    retargetTranscriptScrollThread(state, "claude-pending-7", "real-thread-9"),
-    true
-  );
-  assert.equal(state.localTranscriptScrollSnapshot.activeThreadId, "real-thread-9");
-  assert.equal(state.localTranscriptScrollPositions.get("real-thread-9"), 480);
-  assert.equal(state.localTranscriptScrollPositions.has("claude-pending-7"), false);
-  assert.ok(state.localTranscriptScrollAnchors.get("real-thread-9").has("u1"));
-  assert.equal(state.localTranscriptScrollAnchors.has("claude-pending-7"), false);
-});
-
-test("retargetTranscriptScrollThread is a safe no-op for unrelated or missing state", () => {
-  assert.equal(retargetTranscriptScrollThread(null, "a", "b"), false);
-  assert.equal(retargetTranscriptScrollThread({}, "a", "b"), false);
-  const state = {
-    localTranscriptScrollSnapshot: { activeThreadId: "other" },
-    localTranscriptScrollPositions: new Map([["other", 10]]),
-  };
-  assert.equal(retargetTranscriptScrollThread(state, "a", "b"), false);
-  assert.equal(state.localTranscriptScrollSnapshot.activeThreadId, "other");
-  assert.equal(retargetTranscriptScrollThread(state, "a", "a"), false);
-});
-
-test("first send after pending->real promotion classifies as a new user message (jump-bottom + userEntryId)", () => {
-  // A deferred Claude session records its empty snapshot under the synthetic
-  // `claude-pending-*` id; the first send promotes the thread to its real id.
-  // After retargeting, the first entries must classify as a new user message
-  // — a bottom-follow jump-bottom carrying userEntryId (fire-once) — NOT as a
-  // plain thread switch, whose jump-bottom carries no userEntryId.
-  const { target } = makeScrollElement();
-  const state = {
-    localTranscriptScrollSnapshot: captureTranscriptScrollSnapshot({
-      entries: [],
-      scrollElement: target,
-      threadId: "claude-pending-42",
-    }),
-  };
-  retargetTranscriptScrollThread(state, "claude-pending-42", "real-42");
-  const action = decideTranscriptScrollAction({
-    nextEntries: [userEntry("u1")],
-    nextThreadId: "real-42",
-    previousSnapshot: state.localTranscriptScrollSnapshot,
-    scrollElement: target,
-  });
-  assert.equal(action.kind, "jump-bottom");
-  assert.equal(action.userEntryId, "u1");
-});
+//
+// Local's flavor of this promotion rekey (retargetTranscriptScrollThread) has
+// moved onto the shared engine's `retarget` operation — see
+// shared/transcript-scroll-bookkeeping.test.mjs for that coverage. Remote's
+// flavor stays here until its own sub-task moves it.
 
 test("retargetRemoteTranscriptScroll rekeys pane refs across a pending promotion", () => {
   const anchoredUserIds = new Map([["relay-1:claude-pending-3", new Set(["u1"])]]);

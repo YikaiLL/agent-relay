@@ -1,0 +1,463 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { MAX_RETAINED_TRANSCRIPT_SCROLL_THREADS } from "./transcript-scroll.js";
+import { createTranscriptScrollBookkeeping } from "./transcript-scroll-bookkeeping.js";
+
+function userEntry(id) {
+  return { item_id: id, kind: "user_text", status: "completed", tool: null, turn_id: id };
+}
+function agentEntry(id) {
+  return { item_id: id, kind: "agent_text", status: "completed", tool: null, turn_id: id };
+}
+
+// Plain duck-typed geometry — no getters, no DOM. The engine only ever reads
+// scrollTop/scrollHeight/clientHeight off whatever it's handed.
+function makeScrollElement({ clientHeight = 400, scrollHeight = 2000, scrollTop = 0 } = {}) {
+  return { clientHeight, scrollHeight, scrollTop };
+}
+
+// Drives the engine the way an adapter hook does for one render: on a thread
+// switch, remember the leaving key's geometry and read the arriving key's
+// restore intent BEFORE deciding; then apply and commit. `leavingGeometry`
+// lets a test give the leaving thread's pre-swap geometry separately from the
+// arriving thread's own scrollElement, since a real pane's DOM node reports
+// different numbers before and after the swap.
+function render(engine, { key, threadId, entries, scrollElement, leavingGeometry, pendingInputRequestIds = [] }) {
+  const previous = engine.getSnapshot();
+  let restoredScrollPosition = null;
+  if (previous?.activeThreadId && previous.activeThreadId !== threadId) {
+    engine.rememberView(previous.scrollKey, leavingGeometry || scrollElement);
+    restoredScrollPosition = engine.readRestoreIntent(key);
+  }
+  const action = engine.applyRestore({
+    key,
+    nextEntries: entries,
+    nextThreadId: threadId,
+    pendingInputRequestIds,
+    restoredScrollPosition,
+    scrollElement,
+  });
+  engine.commitSnapshot({ key, threadId, entries, scrollElement });
+  return action;
+}
+
+// --- first render ------------------------------------------------------
+
+test("first render of a thread jumps to the bottom and commits the snapshot", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  assert.equal(engine.getSnapshot(), null);
+
+  const action = render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [userEntry("u1"), agentEntry("a1")],
+    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
+  });
+
+  assert.equal(action.kind, "jump-bottom");
+  assert.equal(action.scrollTop, 1600);
+  assert.equal(engine.getSnapshot().activeThreadId, "thread-1");
+  assert.equal(engine.getSnapshot().scrollKey, "thread-1");
+});
+
+// --- switch away and back ------------------------------------------------
+
+test("switching away and back restores the retained thread's exact offset", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [userEntry("u1")],
+    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
+  });
+
+  render(engine, {
+    key: "thread-2",
+    threadId: "thread-2",
+    entries: [userEntry("u2")],
+    scrollElement: makeScrollElement({ scrollHeight: 1000, clientHeight: 400 }),
+    // thread-1's geometry the instant the reader left it, mid-history.
+    leavingGeometry: makeScrollElement({ scrollHeight: 2000, clientHeight: 400, scrollTop: 300 }),
+  });
+
+  const action = render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [userEntry("u1")],
+    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
+    leavingGeometry: makeScrollElement({ scrollHeight: 1000, clientHeight: 400 }),
+  });
+
+  assert.equal(action.kind, "restore-thread");
+  assert.equal(action.scrollTop, 300);
+});
+
+// --- mid-history restore --------------------------------------------------
+
+test("mid-history restore lands on the exact retained offset regardless of the new render's live geometry", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [userEntry("u1")],
+    scrollElement: makeScrollElement({ scrollHeight: 5000, clientHeight: 400 }),
+  });
+
+  render(engine, {
+    key: "thread-2",
+    threadId: "thread-2",
+    entries: [userEntry("u2")],
+    scrollElement: makeScrollElement({ scrollHeight: 1000, clientHeight: 400 }),
+    leavingGeometry: makeScrollElement({ scrollHeight: 5000, clientHeight: 400, scrollTop: 1200 }),
+  });
+
+  const action = render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [userEntry("u1")],
+    // The thread grew hugely while hidden -- restore-thread must not derive
+    // its target from this.
+    scrollElement: makeScrollElement({ scrollHeight: 9000, clientHeight: 400 }),
+    leavingGeometry: makeScrollElement({ scrollHeight: 1000, clientHeight: 400 }),
+  });
+
+  assert.equal(action.kind, "restore-thread");
+  assert.equal(action.scrollTop, 1200);
+});
+
+// --- bottom-follow intent --------------------------------------------------
+
+test("switching back to a bottom-following thread follows its grown tail, not a stale pixel offset", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [userEntry("u1")],
+    scrollElement: makeScrollElement({ scrollHeight: 3000, clientHeight: 400 }),
+  });
+
+  render(engine, {
+    key: "thread-2",
+    threadId: "thread-2",
+    entries: [userEntry("u2")],
+    scrollElement: makeScrollElement({ scrollHeight: 1000, clientHeight: 400 }),
+    // The reader was pinned at the very bottom when they left.
+    leavingGeometry: makeScrollElement({ scrollHeight: 3000, clientHeight: 400, scrollTop: 2600 }),
+  });
+
+  const action = render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [userEntry("u1")],
+    // Grew by 4,000px while hidden.
+    scrollElement: makeScrollElement({ scrollHeight: 7000, clientHeight: 400 }),
+    leavingGeometry: makeScrollElement({ scrollHeight: 1000, clientHeight: 400 }),
+  });
+
+  assert.equal(action.kind, "jump-bottom");
+  assert.equal(action.scrollTop, 6600);
+});
+
+// --- older-history prepend --------------------------------------------------
+
+test("older transcript prepended in the same thread anchors the viewport so the reader keeps their place", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [userEntry("u1"), agentEntry("a1")],
+    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
+  });
+
+  const action = render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [agentEntry("older-1"), agentEntry("older-2"), userEntry("u1"), agentEntry("a1")],
+    scrollElement: makeScrollElement({ scrollHeight: 3500, clientHeight: 400, scrollTop: 500 }),
+  });
+
+  assert.equal(action.kind, "anchor-prepend");
+  assert.equal(action.scrollTop, 3500 - 2000 + 500);
+});
+
+// --- first message from an empty thread -------------------------------------
+
+test("a first message on a thread whose empty snapshot is already committed is a new message, not a restore", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  // An unrelated thread leaves retained history behind, to prove the empty
+  // commit below -- not a switch-back into it -- is what the first message
+  // actually reads.
+  render(engine, {
+    key: "decoy",
+    threadId: "decoy",
+    entries: [userEntry("d1")],
+    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400, scrollTop: 900 }),
+  });
+
+  // The empty thread commits its own (empty) snapshot under its own key,
+  // mirroring Local's "empty-ready" mode.
+  engine.commitSnapshot({
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [],
+    scrollElement: makeScrollElement({ scrollHeight: 400, clientHeight: 400 }),
+  });
+
+  const action = render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [userEntry("u1")],
+    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
+  });
+
+  assert.equal(action.kind, "jump-bottom");
+  assert.equal(action.userEntryId, "u1");
+});
+
+// --- pending approval/AskUser claimed exactly once --------------------------
+
+test("a pending input request is claimed exactly once, then leaves the reader alone", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  const entries = [userEntry("u1"), agentEntry("a1")];
+  render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries,
+    scrollElement: makeScrollElement({ scrollHeight: 2600, clientHeight: 400 }),
+  });
+
+  const scrollElement = makeScrollElement({ scrollHeight: 2600, clientHeight: 400, scrollTop: 800 });
+  const first = engine.applyRestore({
+    key: "thread-1",
+    nextEntries: entries,
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: ["approval:req-1"],
+    restoredScrollPosition: null,
+    scrollElement,
+  });
+  assert.equal(first.kind, "input-required");
+  assert.deepEqual(first.inputRequestIds, ["approval:req-1"]);
+  assert.ok(engine.anchorsFor("thread-1").has("approval:req-1"));
+  engine.commitSnapshot({ key: "thread-1", threadId: "thread-1", entries, scrollElement });
+
+  const second = engine.applyRestore({
+    key: "thread-1",
+    nextEntries: entries,
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: ["approval:req-1"],
+    restoredScrollPosition: null,
+    scrollElement,
+  });
+  assert.equal(second.kind, "preserve", "the same request must not re-fire once claimed");
+});
+
+// --- LRU eviction drops the evicted key's anchors ---------------------------
+
+test("bounded LRU eviction drops the evicted key's anchors along with its retained position", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  const threadCount = MAX_RETAINED_TRANSCRIPT_SCROLL_THREADS + 2;
+  let previousScrollElement = null;
+
+  for (let index = 0; index < threadCount; index += 1) {
+    const key = `thread-${index}`;
+    const scrollElement = makeScrollElement({ scrollHeight: 1000, clientHeight: 400, scrollTop: index * 5 });
+    render(engine, {
+      key,
+      threadId: key,
+      entries: [userEntry(`u-${index}`)],
+      scrollElement,
+      leavingGeometry: previousScrollElement,
+    });
+    previousScrollElement = scrollElement;
+  }
+
+  assert.equal(engine.readRestoreIntent("thread-0"), null, "the least-recently-used key was evicted");
+  assert.equal(engine.anchorsFor("thread-0").size, 0, "its anchors were dropped together with its position");
+  assert.ok(engine.anchorsFor("thread-1").has("u-1"), "a retained key keeps its own anchors");
+});
+
+// --- reset -------------------------------------------------------------
+
+test("reset clears the snapshot, retained positions, and anchors", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  render(engine, {
+    key: "thread-1",
+    threadId: "thread-1",
+    entries: [userEntry("u1")],
+    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
+  });
+  render(engine, {
+    key: "thread-2",
+    threadId: "thread-2",
+    entries: [userEntry("u2")],
+    scrollElement: makeScrollElement({ scrollHeight: 1000, clientHeight: 400 }),
+    leavingGeometry: makeScrollElement({ scrollHeight: 2000, clientHeight: 400, scrollTop: 300 }),
+  });
+  assert.notEqual(engine.getSnapshot(), null);
+  assert.notEqual(engine.readRestoreIntent("thread-1"), null);
+  assert.ok(engine.anchorsFor("thread-2").has("u2"));
+
+  engine.reset();
+
+  assert.equal(engine.getSnapshot(), null);
+  assert.equal(engine.readRestoreIntent("thread-1"), null);
+  assert.equal(engine.anchorsFor("thread-2").size, 0);
+});
+
+// --- retarget / promotion (claude-pending-* -> real id) ---------------------
+
+test("retarget rekeys the snapshot, retained position, and anchors together", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  const scrollElement = makeScrollElement({ scrollHeight: 2000, clientHeight: 400 });
+
+  engine.commitSnapshot({ key: "claude-pending-7", threadId: "claude-pending-7", entries: [], scrollElement });
+  engine.rememberView("claude-pending-7", scrollElement);
+  engine.applyRestore({
+    key: "claude-pending-7",
+    nextEntries: [userEntry("u1")],
+    nextThreadId: "claude-pending-7",
+    pendingInputRequestIds: [],
+    restoredScrollPosition: null,
+    scrollElement,
+  });
+
+  assert.equal(
+    engine.retarget({
+      fromKey: "claude-pending-7",
+      toKey: "real-thread-9",
+      fromThreadId: "claude-pending-7",
+      toThreadId: "real-thread-9",
+    }),
+    true
+  );
+
+  assert.equal(engine.getSnapshot().activeThreadId, "real-thread-9");
+  assert.equal(engine.getSnapshot().scrollKey, "real-thread-9");
+  assert.equal(engine.readRestoreIntent("claude-pending-7"), null);
+  assert.notEqual(engine.readRestoreIntent("real-thread-9"), null);
+  assert.equal(engine.anchorsFor("claude-pending-7").size, 0);
+  assert.ok(engine.anchorsFor("real-thread-9").has("u1"));
+});
+
+test("retarget is a safe no-op when the keys are missing, unrelated, or identical", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  assert.equal(
+    engine.retarget({ fromKey: "a", toKey: "b", fromThreadId: "a", toThreadId: "b" }),
+    false,
+    "nothing retained yet"
+  );
+
+  engine.commitSnapshot({ key: "other", threadId: "other", entries: [], scrollElement: makeScrollElement() });
+  engine.rememberView("other", makeScrollElement({ scrollTop: 10 }));
+
+  assert.equal(
+    engine.retarget({ fromKey: "a", toKey: "b", fromThreadId: "a", toThreadId: "b" }),
+    false,
+    "unrelated key"
+  );
+  assert.equal(engine.getSnapshot().activeThreadId, "other");
+
+  assert.equal(
+    engine.retarget({ fromKey: "a", toKey: "a", fromThreadId: "a", toThreadId: "a" }),
+    false,
+    "identical from/to key"
+  );
+});
+
+test("retarget does not corrupt another key's snapshot when thread ids collide", () => {
+  // Two distinct scroll keys can carry the same underlying thread id (e.g. a
+  // reconnect that reuses a thread id under a different relay). The engine's
+  // single retained snapshot belongs to whichever key committed it last
+  // (here "keyB") -- retargeting an unrelated "keyA" that happens to share
+  // the same thread id must not rewrite keyB's snapshot out from under it.
+  const engine = createTranscriptScrollBookkeeping();
+  const sharedThreadId = "shared-thread";
+
+  engine.commitSnapshot({
+    key: "keyB",
+    threadId: sharedThreadId,
+    entries: [],
+    scrollElement: makeScrollElement({ scrollHeight: 1000, clientHeight: 400 }),
+  });
+
+  // keyA retains its own, unrelated position and anchor under the same
+  // thread id.
+  engine.rememberView("keyA", makeScrollElement({ scrollHeight: 2000, clientHeight: 400, scrollTop: 500 }));
+  engine.applyRestore({
+    key: "keyA",
+    nextEntries: [userEntry("ua1")],
+    nextThreadId: sharedThreadId,
+    pendingInputRequestIds: [],
+    restoredScrollPosition: null,
+    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
+  });
+
+  const changed = engine.retarget({
+    fromKey: "keyA",
+    toKey: "keyC",
+    fromThreadId: sharedThreadId,
+    toThreadId: "promoted-thread",
+  });
+
+  assert.equal(changed, true, "keyA's own retained position/anchors still moved");
+  assert.equal(engine.getSnapshot().activeThreadId, sharedThreadId, "keyB's snapshot thread id is untouched");
+  assert.equal(engine.getSnapshot().scrollKey, "keyB", "keyB's snapshot key is untouched");
+  assert.equal(engine.readRestoreIntent("keyA"), null);
+  assert.notEqual(engine.readRestoreIntent("keyC"), null);
+  assert.equal(engine.anchorsFor("keyA").size, 0);
+  assert.ok(engine.anchorsFor("keyC").has("ua1"));
+});
+
+test("first send after a pending-to-real promotion classifies as a new user message, not a thread switch", () => {
+  // A deferred Claude session records its empty snapshot under the synthetic
+  // `claude-pending-*` id; the first send promotes the thread to its real id.
+  // After retargeting, the first entries must classify as a new user message
+  // -- a bottom-follow jump-bottom carrying userEntryId (fire-once).
+  const engine = createTranscriptScrollBookkeeping();
+  const scrollElement = makeScrollElement({ scrollHeight: 2000, clientHeight: 400 });
+  engine.commitSnapshot({ key: "claude-pending-42", threadId: "claude-pending-42", entries: [], scrollElement });
+
+  engine.retarget({
+    fromKey: "claude-pending-42",
+    toKey: "real-42",
+    fromThreadId: "claude-pending-42",
+    toThreadId: "real-42",
+  });
+
+  const action = engine.applyRestore({
+    key: "real-42",
+    nextEntries: [userEntry("u1")],
+    nextThreadId: "real-42",
+    pendingInputRequestIds: [],
+    restoredScrollPosition: null,
+    scrollElement,
+  });
+
+  assert.equal(action.kind, "jump-bottom");
+  assert.equal(action.userEntryId, "u1");
+});
+
+// --- isolation between two distinct keys ------------------------------------
+
+test("two distinct keys retain fully independent positions and anchors", () => {
+  const engine = createTranscriptScrollBookkeeping();
+
+  engine.rememberView("a", makeScrollElement({ scrollHeight: 2000, clientHeight: 400, scrollTop: 300 }));
+  engine.rememberView("b", makeScrollElement({ scrollHeight: 5000, clientHeight: 400, scrollTop: 4600 }));
+
+  assert.deepEqual(engine.readRestoreIntent("a"), { followBottom: false, scrollTop: 300 });
+  assert.deepEqual(engine.readRestoreIntent("b"), { followBottom: true, scrollTop: 4600 });
+
+  engine.applyRestore({
+    key: "a",
+    nextEntries: [userEntry("ua1")],
+    nextThreadId: "a",
+    pendingInputRequestIds: [],
+    restoredScrollPosition: null,
+    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
+  });
+
+  assert.ok(engine.anchorsFor("a").has("ua1"));
+  assert.equal(engine.anchorsFor("b").size, 0, "claiming an anchor for one key must not leak into another");
+});
