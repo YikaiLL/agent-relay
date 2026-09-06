@@ -3817,32 +3817,38 @@ async fn a_stop_racing_the_atomic_refusal_cannot_land_between_its_decision_and_i
         "the refusal should have reached its decided-but-not-committed latch by now"
     );
 
-    let stop_task = {
+    let stop_update_task = {
         let app = app.clone();
         let run_id = run_id.clone();
         tokio::spawn(async move {
-            app.force_stop_team_run(Some(run_id), Some("device-1".to_string()))
-                .await
+            relay_api::TeamPort::update_run(
+                &app,
+                &run_id,
+                Box::new(|run| run.request_stop("driver-stop")),
+            )
+            .await
         })
     };
     // Give the spawned stop every chance to run if it somehow could; it must
     // not, because it cannot even acquire the lock the parked refusal holds.
     sleep(Duration::from_millis(50)).await;
     assert!(
-        !stop_task.is_finished(),
+        !stop_update_task.is_finished(),
         "a driver-side stop update cannot complete while the refusal it raced \
 still holds the write lock its `request_stop` mutation requires"
     );
 
     drop(latch);
 
-    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
-    let stop_result = stop_task.await.expect("the stop task must not panic");
+    let stop_updated = tokio::time::timeout(Duration::from_secs(5), stop_update_task)
+        .await
+        .expect("the driver-side stop update should finish after the refusal releases")
+        .expect("the stop update task must not panic");
     assert!(
-        stop_result.is_ok(),
-        "a stop that only gets to run after the refusal already committed \
-must be a graceful no-op, not an error: {stop_result:?}"
+        stop_updated,
+        "the driver-side stop update must still find the run after the refusal commits"
     );
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Paused).await;
 
     // The refusal's own decision — made and committed atomically before the
     // stop could interleave — is what must have stuck: `Boundary`, not

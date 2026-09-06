@@ -103,7 +103,11 @@ fields, and unknown fields set a durable `malformed` marker even though the
 unsupported value itself is dropped. `LegacyEmbedded` does not consume driver
 progress and may continue locally, but a malformed progress record cannot
 change backend or produce a driver cursor. An unknown backend cannot produce a
-driver cursor at all.
+driver cursor at all. This build has no override that clears a malformed marker:
+the operator may continue the legacy run or use the explicit `mark_cancelled`
+archival escape, which records `Cancelled` and releases local provider seats.
+Any future migration must validate the retained counters before adding an
+explicit recovery path.
 
 The current archival lifecycle for inert unsupported-backend runs is explicit:
 if a paused inert run loses its worktree, restore/validation changes it to a

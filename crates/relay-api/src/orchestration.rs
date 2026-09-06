@@ -69,7 +69,7 @@ pub enum ProtocolValueError {
     },
     UnsupportedProtocolVersion(u32),
     MalformedDriverProgress,
-    NonExecutingBackend,
+    UnknownBackend,
 }
 
 impl fmt::Display for ProtocolValueError {
@@ -115,8 +115,8 @@ impl fmt::Display for ProtocolValueError {
             Self::MalformedDriverProgress => {
                 f.write_str("persisted driver progress is malformed and cannot be executed")
             }
-            Self::NonExecutingBackend => {
-                f.write_str("the orchestration backend is non-executing in this build")
+            Self::UnknownBackend => {
+                f.write_str("this build does not understand the orchestration backend")
             }
         }
     }
@@ -1308,9 +1308,9 @@ pub struct DriverProgress {
     pub last_command_seq: u64,
     pub last_event_seq: u64,
     pub in_flight_command_id: Option<CommandId>,
-    /// A known progress field was present but could not be decoded safely.
-    /// Persist this marker so a load/save cycle cannot turn corrupt progress
-    /// into a plausible all-zero cursor.
+    /// Progress contained an unknown or duplicate field, or a known field that
+    /// could not be decoded safely. Persist this marker so a load/save cycle
+    /// cannot turn truncated or corrupt progress into a plausible clean cursor.
     #[serde(default, skip_serializing_if = "is_false")]
     malformed: bool,
 }
@@ -1767,7 +1767,7 @@ impl DriverCursor {
         let protocol_version = run
             .orchestration_backend
             .supported_protocol_version()
-            .ok_or(ProtocolValueError::NonExecutingBackend)?;
+            .ok_or(ProtocolValueError::UnknownBackend)?;
         let current = run.current_sub_task();
         let current_rounds_used = current
             .and_then(|index| run.sub_tasks.get(index))
@@ -4312,7 +4312,7 @@ mod tests {
 
     #[test]
     fn persisted_driver_progress_keeps_valid_identity_and_drops_bad_shapes() {
-        let valid: DriverProgress = serde_json::from_str(
+        let future_shaped: DriverProgress = serde_json::from_str(
             r#"{
                 "state_revision":42,
                 "last_command_seq":7,
@@ -4322,17 +4322,30 @@ mod tests {
             }"#,
         )
         .expect("valid progress plus future fields must decode");
-        assert_eq!(valid.state_revision, 42);
-        assert_eq!(valid.last_command_seq, 7);
-        assert_eq!(valid.last_event_seq, 6);
+        assert_eq!(future_shaped.state_revision, 42);
+        assert_eq!(future_shaped.last_command_seq, 7);
+        assert_eq!(future_shaped.last_event_seq, 6);
         assert_eq!(
-            valid.in_flight_command_id.as_ref().map(|id| id.as_str()),
+            future_shaped
+                .in_flight_command_id
+                .as_ref()
+                .map(|id| id.as_str()),
             Some("cmd-future")
         );
         assert!(
-            valid.is_malformed(),
+            future_shaped.is_malformed(),
             "a newer progress field must leave a durable fail-closed marker"
         );
+        let future_persisted =
+            serde_json::to_string(&future_shaped).expect("persist future-shaped progress marker");
+        assert!(
+            future_persisted.contains(r#""malformed":true"#),
+            "{future_persisted}"
+        );
+        assert!(!future_persisted.contains("future_progress_field"));
+        let future_restored: DriverProgress =
+            serde_json::from_str(&future_persisted).expect("restore future-shaped progress marker");
+        assert!(future_restored.is_malformed());
 
         let clean: DriverProgress = serde_json::from_str(
             r#"{
@@ -4394,8 +4407,19 @@ mod tests {
         run.orchestration_backend = OrchestrationBackendRef::unknown_non_executing();
         assert_eq!(
             DriverCursor::from_team_run(&run, Vec::new()),
-            Err(ProtocolValueError::NonExecutingBackend),
+            Err(ProtocolValueError::UnknownBackend),
             "an inert backend must not produce an executable-looking cursor"
+        );
+        assert_eq!(
+            ProtocolValueError::UnknownBackend.to_string(),
+            "this build does not understand the orchestration backend"
+        );
+
+        run.driver_progress = DriverProgress::malformed();
+        assert_eq!(
+            DriverCursor::from_team_run(&run, Vec::new()),
+            Err(ProtocolValueError::MalformedDriverProgress),
+            "malformed progress remains the primary recovery diagnostic"
         );
     }
 
