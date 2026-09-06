@@ -1,21 +1,14 @@
 import { useLayoutEffect, useRef } from "react";
 
 import { findPendingInputRequestIds } from "../shared/thread-attention.js";
+import { createTranscriptScrollBookkeeping } from "../shared/transcript-scroll-bookkeeping.js";
 import { setRemoteTranscriptElement } from "./ui-refs.js";
-import {
-  captureTranscriptScrollSnapshot,
-  readTranscriptScrollPosition,
-  rememberTranscriptScrollPosition,
-  restoreTranscriptScrollPosition,
-  retargetRemoteTranscriptScroll,
-} from "./transcript-scroll.js";
 
-// Per-thread scroll bookkeeping for the remote transcript pane.
-//
-// Owns the two retained maps (restoration intent + already-anchored user
-// entries), decides the scroll action for each render, and keeps the retained
-// entry for the CURRENTLY RENDERED thread fresh (on scroll and on every
-// render) so a switch away and back lands the reader where they left off.
+// Per-thread scroll bookkeeping for the remote transcript pane, built on the
+// engine shared with the local pane (transcript-scroll-bookkeeping.js). Its
+// scroll key is relay-scoped (`relayId:threadId`, since one pane shows
+// threads from whichever relay is active); everything else here is this
+// surface's own lifecycle timing.
 //
 // Lives in its own module because the ordering it has to respect — React
 // commits child DOM mutations BEFORE running a parent's layout-effect cleanup —
@@ -28,12 +21,11 @@ export function useRemoteTranscriptScrollBookkeeping({
   threadId,
   transcriptRef,
 }) {
-  const previousRenderRef = useRef({
-    activeThreadId: null,
-    entries: [],
-  });
-  const anchoredUserIdsRef = useRef(new Map()); // threadId -> Set<userId>
-  const scrollPositionsRef = useRef(new Map()); // relayId:threadId -> restoration intent
+  const engineRef = useRef(null);
+  if (!engineRef.current) {
+    engineRef.current = createTranscriptScrollBookkeeping();
+  }
+  const engine = engineRef.current;
   const renderedScrollKeyRef = useRef(null);
 
   const remoteThreadId = threadId || null;
@@ -52,14 +44,19 @@ export function useRemoteTranscriptScrollBookkeeping({
     const transcript = transcriptRef.current;
     setRemoteTranscriptElement(transcript);
     if (!transcript) {
-      previousRenderRef.current = {
-        activeThreadId: remoteThreadId,
+      // No scrollKey (pass key: null): the next run reads that as "no
+      // previous key" via the scrollKey-guarded checks below, since there is
+      // no scroll element to file one against.
+      engine.commitSnapshot({
+        key: null,
+        threadId: remoteThreadId,
         entries,
-      };
+        scrollElement: null,
+      });
       return undefined;
     }
 
-    const previous = previousRenderRef.current;
+    const previous = engine.getSnapshot();
 
     // Deferred-Claude promotion (send path sets the one-shot alias): same
     // logical thread under a new public id — rekey the retained bookkeeping
@@ -71,12 +68,9 @@ export function useRemoteTranscriptScrollBookkeeping({
       && previous?.activeThreadId === promotion.from
       && remoteThreadId === promotion.to
     ) {
-      retargetRemoteTranscriptScroll({
-        anchoredUserIds: anchoredUserIdsRef.current,
-        scrollPositions: scrollPositionsRef.current,
-        snapshot: previous,
-        fromScrollKey: `${currentState.activeRelayId || "-"}:${promotion.from}`,
-        toScrollKey: remoteScrollKey,
+      engine.retarget({
+        fromKey: `${currentState.activeRelayId || "-"}:${promotion.from}`,
+        toKey: remoteScrollKey,
         fromThreadId: promotion.from,
         toThreadId: remoteThreadId,
       });
@@ -92,25 +86,14 @@ export function useRemoteTranscriptScrollBookkeeping({
       // thread against its own DOM. Do not overwrite it here using the newly
       // rendered thread's geometry; that can turn a history-reading offset into
       // a false bottom-follow marker (or vice versa).
-      if (!scrollPositionsRef.current.has(previous.scrollKey)) {
-        const evictedScrollKey = rememberTranscriptScrollPosition(
-          scrollPositionsRef.current,
-          previous.scrollKey,
-          previous
-        );
-        if (evictedScrollKey) {
-          anchoredUserIdsRef.current.delete(evictedScrollKey);
-        }
+      if (!engine.hasPosition(previous.scrollKey)) {
+        engine.rememberView(previous.scrollKey, previous);
       }
-      restoredScrollPosition = readTranscriptScrollPosition(
-        scrollPositionsRef.current,
-        remoteScrollKey
-      );
+      restoredScrollPosition = engine.readRestoreIntent(remoteScrollKey);
     }
-    const anchorsForThread =
-      anchoredUserIdsRef.current.get(remoteScrollKey) || new Set();
-    const action = restoreTranscriptScrollPosition({
-      alreadyAnchoredUserIds: anchorsForThread,
+
+    engine.applyRestore({
+      key: remoteScrollKey,
       nextEntries: entries,
       nextThreadId: remoteThreadId,
       // An approval / AskUser question is not a transcript entry, so it needs its
@@ -118,25 +101,9 @@ export function useRemoteTranscriptScrollBookkeeping({
       // the bottom). Fire-once, keyed on the request ids — plural because a
       // second question can arrive while the first is still outstanding.
       pendingInputRequestIds: findPendingInputRequestIds(session, remoteThreadId),
-      previousSnapshot: previous,
       restoredScrollPosition,
       scrollElement: transcript,
     });
-    // Record what this action handled. New-message actions use this to avoid
-    // re-jumping mid-stream; thread-transition actions use it to establish the
-    // loaded transcript as a baseline so the next snapshot cannot mistake
-    // retained history for a newly-sent message. One Set serves both kinds —
-    // request ids are namespaced, so they cannot collide with item ids.
-    const handledScrollIds = [
-      action?.userEntryId,
-      ...(action?.inputRequestIds || []),
-    ].filter(Boolean);
-    if (handledScrollIds.length) {
-      for (const handledId of handledScrollIds) {
-        anchorsForThread.add(handledId);
-      }
-      anchoredUserIdsRef.current.set(remoteScrollKey, anchorsForThread);
-    }
 
     const rememberCurrentPosition = () => {
       // Only the thread currently in the DOM may write its own geometry. On a
@@ -149,26 +116,17 @@ export function useRemoteTranscriptScrollBookkeeping({
       if (renderedScrollKeyRef.current !== remoteScrollKey) {
         return;
       }
-      const evictedScrollKey = rememberTranscriptScrollPosition(
-        scrollPositionsRef.current,
-        remoteScrollKey,
-        transcript
-      );
-      if (evictedScrollKey) {
-        anchoredUserIdsRef.current.delete(evictedScrollKey);
-      }
+      engine.rememberView(remoteScrollKey, transcript);
     };
     rememberCurrentPosition();
     transcript.addEventListener("scroll", rememberCurrentPosition, { passive: true });
 
-    previousRenderRef.current = {
-      ...captureTranscriptScrollSnapshot({
-        entries,
-        scrollElement: transcript,
-        threadId: remoteThreadId,
-      }),
-      scrollKey: remoteScrollKey,
-    };
+    engine.commitSnapshot({
+      key: remoteScrollKey,
+      threadId: remoteThreadId,
+      entries,
+      scrollElement: transcript,
+    });
     return () => {
       rememberCurrentPosition();
       transcript.removeEventListener("scroll", rememberCurrentPosition);

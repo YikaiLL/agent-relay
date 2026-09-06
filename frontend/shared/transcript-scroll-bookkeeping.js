@@ -36,6 +36,13 @@ export function createTranscriptScrollBookkeeping() {
     return readTranscriptScrollPosition(positions, key);
   }
 
+  // A plain existence check, deliberately not `readRestoreIntent`: that read
+  // also refreshes LRU recency, which would touch a leaving key's position
+  // even on the "don't overwrite it" path that only wants to know it exists.
+  function hasPosition(key) {
+    return positions.has(key);
+  }
+
   function applyRestore({
     key,
     nextEntries,
@@ -121,6 +128,7 @@ export function createTranscriptScrollBookkeeping() {
     applyRestore,
     commitSnapshot,
     getSnapshot: () => previousSnapshot,
+    hasPosition,
     readRestoreIntent,
     rememberView,
     reset,

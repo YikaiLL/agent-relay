@@ -12,6 +12,5 @@ export {
   readTranscriptScrollPosition,
   rememberTranscriptScrollPosition,
   restoreTranscriptScrollPosition,
-  retargetRemoteTranscriptScroll,
   transcriptEntryIdentity,
 } from "../shared/transcript-scroll.js";

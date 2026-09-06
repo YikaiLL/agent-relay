@@ -13,7 +13,6 @@ import {
   readTranscriptScrollPosition,
   rememberTranscriptScrollPosition,
   restoreTranscriptScrollPosition,
-  retargetRemoteTranscriptScroll,
 } from "./shared/transcript-scroll.js";
 
 function userEntry(id) {
@@ -484,82 +483,10 @@ test("LATEST_USER_MESSAGE_ATTR is the documented data attribute name", () => {
 
 // --- deferred-thread promotion (claude-pending-* -> real id) -----------------
 //
-// Local's flavor of this promotion rekey (retargetTranscriptScrollThread) has
-// moved onto the shared engine's `retarget` operation — see
-// shared/transcript-scroll-bookkeeping.test.mjs for that coverage. Remote's
-// flavor stays here until its own sub-task moves it.
-
-test("retargetRemoteTranscriptScroll rekeys pane refs across a pending promotion", () => {
-  const anchoredUserIds = new Map([["relay-1:claude-pending-3", new Set(["u1"])]]);
-  const scrollPositions = new Map([["relay-1:claude-pending-3", 640]]);
-  const snapshot = {
-    activeThreadId: "claude-pending-3",
-    entries: [],
-    scrollKey: "relay-1:claude-pending-3",
-  };
-  assert.equal(
-    retargetRemoteTranscriptScroll({
-      anchoredUserIds,
-      scrollPositions,
-      snapshot,
-      fromScrollKey: "relay-1:claude-pending-3",
-      toScrollKey: "relay-1:real-3",
-      fromThreadId: "claude-pending-3",
-      toThreadId: "real-3",
-    }),
-    true
-  );
-  assert.equal(snapshot.activeThreadId, "real-3");
-  assert.equal(snapshot.scrollKey, "relay-1:real-3");
-  assert.equal(scrollPositions.get("relay-1:real-3"), 640);
-  assert.equal(scrollPositions.has("relay-1:claude-pending-3"), false);
-  assert.ok(anchoredUserIds.get("relay-1:real-3").has("u1"));
-});
-
-test("remote promotion rekey keeps the first send classified as a new user message", () => {
-  const { target } = makeScrollElement();
-  const snapshot = {
-    ...captureTranscriptScrollSnapshot({
-      entries: [],
-      scrollElement: target,
-      threadId: "claude-pending-9",
-    }),
-    scrollKey: "relay-1:claude-pending-9",
-  };
-  retargetRemoteTranscriptScroll({
-    anchoredUserIds: new Map(),
-    scrollPositions: new Map(),
-    snapshot,
-    fromScrollKey: "relay-1:claude-pending-9",
-    toScrollKey: "relay-1:real-9",
-    fromThreadId: "claude-pending-9",
-    toThreadId: "real-9",
-  });
-  const action = decideTranscriptScrollAction({
-    nextEntries: [userEntry("u1")],
-    nextThreadId: "real-9",
-    previousSnapshot: snapshot,
-    scrollElement: target,
-  });
-  assert.equal(action.kind, "jump-bottom");
-  assert.equal(action.userEntryId, "u1");
-});
-
-test("retargetRemoteTranscriptScroll is a safe no-op when nothing matches", () => {
-  assert.equal(
-    retargetRemoteTranscriptScroll({
-      anchoredUserIds: new Map(),
-      scrollPositions: new Map(),
-      snapshot: { activeThreadId: "other", scrollKey: "r:other" },
-      fromScrollKey: "r:a",
-      toScrollKey: "r:b",
-      fromThreadId: "a",
-      toThreadId: "b",
-    }),
-    false
-  );
-  assert.equal(retargetRemoteTranscriptScroll(null), false);
-});
+// Both surfaces' flavors of this promotion rekey now live on the shared
+// engine's `retarget` operation — see shared/transcript-scroll-bookkeeping.test.mjs
+// for that coverage (Local's own key equals its thread id; Remote's is
+// relay-scoped, `relayId:threadId`).
 
 // --- input required (Bug B) -------------------------------------------------
 //

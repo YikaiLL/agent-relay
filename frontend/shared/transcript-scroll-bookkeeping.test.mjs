@@ -461,3 +461,165 @@ test("two distinct keys retain fully independent positions and anchors", () => {
   assert.ok(engine.anchorsFor("a").has("ua1"));
   assert.equal(engine.anchorsFor("b").size, 0, "claiming an anchor for one key must not leak into another");
 });
+
+test("two keys that share a thread id under different relays stay isolated", () => {
+  // Remote's scroll key is relay-scoped (`relayId:threadId`), so the same
+  // underlying thread id can appear under two different keys at once -- e.g.
+  // the reader has panes open on two relays that happen to be looking at
+  // threads with the same id.
+  const engine = createTranscriptScrollBookkeeping();
+  const sharedThreadId = "shared-thread";
+
+  engine.rememberView(
+    "relay-1:shared-thread",
+    makeScrollElement({ scrollHeight: 2000, clientHeight: 400, scrollTop: 300 })
+  );
+  engine.rememberView(
+    "relay-2:shared-thread",
+    makeScrollElement({ scrollHeight: 5000, clientHeight: 400, scrollTop: 4600 })
+  );
+
+  assert.deepEqual(engine.readRestoreIntent("relay-1:shared-thread"), {
+    followBottom: false,
+    scrollTop: 300,
+  });
+  assert.deepEqual(engine.readRestoreIntent("relay-2:shared-thread"), {
+    followBottom: true,
+    scrollTop: 4600,
+  });
+
+  engine.applyRestore({
+    key: "relay-1:shared-thread",
+    nextEntries: [userEntry("u1")],
+    nextThreadId: sharedThreadId,
+    pendingInputRequestIds: [],
+    restoredScrollPosition: null,
+    scrollElement: makeScrollElement({ scrollHeight: 2000, clientHeight: 400 }),
+  });
+
+  assert.ok(engine.anchorsFor("relay-1:shared-thread").has("u1"));
+  assert.equal(
+    engine.anchorsFor("relay-2:shared-thread").size,
+    0,
+    "the same thread id under a different relay must not see the other relay's anchor"
+  );
+});
+
+// --- retarget across relay-scoped keys (Remote's flavor of promotion) ------
+
+test("retarget across relay-scoped keys rekeys positions, anchors, and the snapshot together", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  const scrollElement = makeScrollElement({ scrollHeight: 2000, clientHeight: 400 });
+
+  engine.commitSnapshot({
+    key: "relay-1:claude-pending-3",
+    threadId: "claude-pending-3",
+    entries: [],
+    scrollElement,
+  });
+  engine.rememberView("relay-1:claude-pending-3", scrollElement);
+  engine.applyRestore({
+    key: "relay-1:claude-pending-3",
+    nextEntries: [userEntry("u1")],
+    nextThreadId: "claude-pending-3",
+    pendingInputRequestIds: [],
+    restoredScrollPosition: null,
+    scrollElement,
+  });
+
+  assert.equal(
+    engine.retarget({
+      fromKey: "relay-1:claude-pending-3",
+      toKey: "relay-1:real-3",
+      fromThreadId: "claude-pending-3",
+      toThreadId: "real-3",
+    }),
+    true
+  );
+
+  assert.equal(engine.getSnapshot().activeThreadId, "real-3");
+  assert.equal(engine.getSnapshot().scrollKey, "relay-1:real-3");
+  assert.equal(engine.readRestoreIntent("relay-1:claude-pending-3"), null);
+  assert.notEqual(engine.readRestoreIntent("relay-1:real-3"), null);
+  assert.equal(engine.anchorsFor("relay-1:claude-pending-3").size, 0);
+  assert.ok(engine.anchorsFor("relay-1:real-3").has("u1"));
+});
+
+test("first send after a relay-scoped promotion classifies as a new user message, not a thread switch", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  const scrollElement = makeScrollElement({ scrollHeight: 2000, clientHeight: 400 });
+  engine.commitSnapshot({
+    key: "relay-1:claude-pending-9",
+    threadId: "claude-pending-9",
+    entries: [],
+    scrollElement,
+  });
+
+  engine.retarget({
+    fromKey: "relay-1:claude-pending-9",
+    toKey: "relay-1:real-9",
+    fromThreadId: "claude-pending-9",
+    toThreadId: "real-9",
+  });
+
+  const action = engine.applyRestore({
+    key: "relay-1:real-9",
+    nextEntries: [userEntry("u1")],
+    nextThreadId: "real-9",
+    pendingInputRequestIds: [],
+    restoredScrollPosition: null,
+    scrollElement,
+  });
+
+  assert.equal(action.kind, "jump-bottom");
+  assert.equal(action.userEntryId, "u1");
+});
+
+test("retarget across relay-scoped keys is a safe no-op when nothing matches", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  engine.commitSnapshot({
+    key: "relay-1:other",
+    threadId: "other",
+    entries: [],
+    scrollElement: makeScrollElement(),
+  });
+
+  assert.equal(
+    engine.retarget({
+      fromKey: "relay-1:a",
+      toKey: "relay-1:b",
+      fromThreadId: "a",
+      toThreadId: "b",
+    }),
+    false
+  );
+  assert.equal(engine.getSnapshot().activeThreadId, "other");
+  assert.equal(engine.getSnapshot().scrollKey, "relay-1:other");
+});
+
+// --- hasPosition -------------------------------------------------------
+
+test("hasPosition is a pure existence check that does not refresh LRU recency", () => {
+  const engine = createTranscriptScrollBookkeeping();
+  engine.rememberView("a", makeScrollElement({ scrollTop: 10 }));
+  engine.rememberView("b", makeScrollElement({ scrollTop: 20 }));
+
+  assert.equal(engine.hasPosition("a"), true);
+  assert.equal(engine.hasPosition("missing"), false);
+
+  // Repeated checks must not move "a" to most-recently-used: fill up to
+  // capacity without touching it any other way.
+  engine.hasPosition("a");
+  engine.hasPosition("a");
+  for (let index = 0; index < MAX_RETAINED_TRANSCRIPT_SCROLL_THREADS - 2; index += 1) {
+    engine.rememberView(`filler-${index}`, makeScrollElement({ scrollTop: index }));
+  }
+  assert.equal(engine.hasPosition("a"), true, "at capacity, but not yet evicted");
+
+  // One more distinct key pushes past capacity. "a" is the least-recently-used
+  // entry (inserted first, never refreshed by hasPosition), so it is the one
+  // evicted -- proving hasPosition's reads above did not refresh it.
+  engine.rememberView("tiebreaker", makeScrollElement({ scrollTop: 99 }));
+  assert.equal(engine.hasPosition("a"), false, "the untouched-by-hasPosition key was evicted first");
+  assert.equal(engine.hasPosition("b"), true);
+});

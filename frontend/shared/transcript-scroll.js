@@ -36,54 +36,6 @@ export const TRANSCRIPT_BOTTOM_FOLLOW_THRESHOLD_PX = 4;
 // distinguish from user scrolling.
 export const TRANSCRIPT_SCROLL_ACTION_EVENT = "transcript-scroll-action";
 
-// Rekey the remote pane's retained bookkeeping when a thread's public id
-// changes while remaining the same logical thread — the deferred-Claude
-// case, where a synthetic `claude-pending-*` id is promoted to the real
-// session id on the first send. The remote pane keys its retained maps by
-// `relayId:threadId` scroll keys and keeps its previous-render snapshot in a
-// ref, so both the keys and the snapshot need rebinding. Returns true if
-// anything was rekeyed. (Local's flavor of this now lives on the shared
-// engine's `retarget` operation — see transcript-scroll-bookkeeping.js.)
-export function retargetRemoteTranscriptScroll(options) {
-  const {
-    anchoredUserIds,
-    scrollPositions,
-    snapshot,
-    fromScrollKey,
-    toScrollKey,
-    fromThreadId,
-    toThreadId,
-  } = options || {};
-  if (
-    !fromScrollKey
-    || !toScrollKey
-    || !fromThreadId
-    || !toThreadId
-    || fromScrollKey === toScrollKey
-  ) {
-    return false;
-  }
-  let changed = false;
-  if (snapshot?.activeThreadId === fromThreadId) {
-    snapshot.activeThreadId = toThreadId;
-    if (snapshot.scrollKey === fromScrollKey) {
-      snapshot.scrollKey = toScrollKey;
-    }
-    changed = true;
-  }
-  if (scrollPositions instanceof Map && scrollPositions.has(fromScrollKey)) {
-    scrollPositions.set(toScrollKey, scrollPositions.get(fromScrollKey));
-    scrollPositions.delete(fromScrollKey);
-    changed = true;
-  }
-  if (anchoredUserIds instanceof Map && anchoredUserIds.has(fromScrollKey)) {
-    anchoredUserIds.set(toScrollKey, anchoredUserIds.get(fromScrollKey));
-    anchoredUserIds.delete(fromScrollKey);
-    changed = true;
-  }
-  return changed;
-}
-
 export function rememberTranscriptScrollPosition(cache, threadId, scrollElement) {
   if (!(cache instanceof Map) || !threadId || !scrollElement) {
     return null;
